@@ -328,6 +328,12 @@ impl AsyncFlushMessage for XudpMessageStream {
 
         while !this.write_buffer.is_empty() {
             let n = ready!(Pin::new(&mut this.inner_stream).poll_write(cx, &this.write_buffer))?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "XUDP inner stream wrote zero bytes for non-empty buffered output",
+                )));
+            }
             this.write_buffer.advance(n);
         }
 
@@ -648,6 +654,136 @@ mod tests {
 
     impl AsyncStream for PendingOnceWriter {}
 
+    /// Mock writer with a fixed write-call budget.
+    ///
+    /// After the scripted steps are exhausted, the next call returns an injected
+    /// error. This keeps the zero-progress regression tests from looping forever
+    /// when the WriteZero guard is absent.
+    struct BudgetedWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+        calls: Arc<Mutex<WriterCalls>>,
+        write_budget: usize,
+        steps: VecDeque<WriteStep>,
+    }
+
+    /// Test-side views into a `BudgetedWriter` that stays inside the stream.
+    struct BudgetedWriterHandles {
+        output: Arc<Mutex<Vec<u8>>>,
+        calls: Arc<Mutex<WriterCalls>>,
+    }
+
+    enum WriteStep {
+        /// Accept at most this many bytes from the offered buffer.
+        WriteBytes(usize),
+        /// Report Ok(0), the zero-progress behavior under test.
+        WriteZero,
+    }
+
+    #[derive(Default)]
+    struct WriterCalls {
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl AsyncRead for BudgetedWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for BudgetedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.writes += 1;
+            let call_index = calls.writes;
+            drop(calls);
+
+            match self.steps.pop_front() {
+                Some(WriteStep::WriteBytes(count)) => {
+                    let n = count.min(buf.len());
+                    self.output.lock().unwrap().extend_from_slice(&buf[..n]);
+                    return Poll::Ready(Ok(n));
+                }
+                Some(WriteStep::WriteZero) => return Poll::Ready(Ok(0)),
+                None => {}
+            }
+
+            if call_index > self.write_budget {
+                return Poll::Ready(Err(io::Error::other(
+                    "BudgetedWriter write-call budget exceeded",
+                )));
+            }
+
+            self.output.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.calls.lock().unwrap().flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for BudgetedWriter {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for BudgetedWriter {}
+
+    fn budgeted_writer(
+        write_budget: usize,
+        steps: Vec<WriteStep>,
+    ) -> (BudgetedWriter, BudgetedWriterHandles) {
+        let handles = BudgetedWriterHandles {
+            output: Arc::new(Mutex::new(Vec::new())),
+            calls: Arc::new(Mutex::new(WriterCalls::default())),
+        };
+        let writer = BudgetedWriter {
+            output: Arc::clone(&handles.output),
+            calls: Arc::clone(&handles.calls),
+            write_budget,
+            steps: VecDeque::from(steps),
+        };
+        (writer, handles)
+    }
+
+    fn stream_with_buffered_response(writer: BudgetedWriter) -> (XudpMessageStream, Vec<u8>) {
+        let mut stream = XudpMessageStream::new(Box::new(writer));
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 53);
+        stream.start_wire_session(10, destination.clone());
+        let route_id = stream
+            .get_or_create_route(10, &destination)
+            .unwrap()
+            .unwrap();
+        let source = "127.0.0.1:53".parse().unwrap();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write_session_message(&mut cx, route_id, b"x", &source),
+            Poll::Ready(Ok(()))
+        ));
+        let frame = stream.write_buffer.to_vec();
+        (stream, frame)
+    }
+
     #[test]
     fn buffered_response_is_accepted_once_when_output_blocks() {
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -790,5 +926,67 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn flush_reports_write_zero_when_first_write_makes_no_progress() {
+        let (writer, handles) = budgeted_writer(1, vec![WriteStep::WriteZero]);
+        let (mut stream, frame) = stream_with_buffered_response(writer);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let error = match Pin::new(&mut stream).poll_flush_message(&mut cx) {
+            Poll::Ready(Err(error)) => error,
+            other => panic!("expected WriteZero error, got {:?}", other),
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(handles.calls.lock().unwrap().writes, 1);
+        assert_eq!(handles.calls.lock().unwrap().flushes, 0);
+        assert!(handles.output.lock().unwrap().is_empty());
+        assert_eq!(&stream.write_buffer[..], &frame[..]);
+    }
+
+    #[test]
+    fn flush_reports_write_zero_after_partial_progress_and_keeps_remaining_buffer() {
+        let partial = 5;
+        let (writer, handles) = budgeted_writer(
+            2,
+            vec![WriteStep::WriteBytes(partial), WriteStep::WriteZero],
+        );
+        let (mut stream, frame) = stream_with_buffered_response(writer);
+        assert!(
+            frame.len() > partial,
+            "fixture frame must exceed partial write"
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let error = match Pin::new(&mut stream).poll_flush_message(&mut cx) {
+            Poll::Ready(Err(error)) => error,
+            other => panic!("expected WriteZero error, got {:?}", other),
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(handles.calls.lock().unwrap().writes, 2);
+        assert_eq!(handles.calls.lock().unwrap().flushes, 0);
+        assert_eq!(&handles.output.lock().unwrap()[..], &frame[..partial]);
+        assert_eq!(&stream.write_buffer[..], &frame[partial..]);
+    }
+
+    #[test]
+    fn flush_with_empty_buffer_skips_writes_and_flushes_inner() {
+        let (writer, handles) = budgeted_writer(0, Vec::new());
+        let mut stream = XudpMessageStream::new(Box::new(writer));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut stream).poll_flush_message(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(handles.calls.lock().unwrap().writes, 0);
+        assert_eq!(handles.calls.lock().unwrap().flushes, 1);
+        assert!(handles.output.lock().unwrap().is_empty());
     }
 }
