@@ -330,19 +330,18 @@ mod tests {
                 .unwrap();
             Ok(())
         }));
+        // Building this DNS group resolves the upstream hostname through the bootstrap
+        // server, which creates an owned-runtime outbound UDP socket. That socket is
+        // protected, so startup blocks in the old protector until the test releases it.
         let old_config = format!(
             r#"
+- dns_group: bootstrap-dns
+  dns_servers:
+    - url: tls://dns.google
+      bootstrap_url: udp://127.0.0.1:9
 - device_fd: {}
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain:
-        - address: "127.0.0.1:9"
-          transport: quic
-          quic_settings:
-            verify: false
-          protocol:
-            type: socks
+  dns:
+    servers: bootstrap-dns
 "#,
             old_fd.as_raw_fd(),
         );

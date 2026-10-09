@@ -17,6 +17,7 @@ use common::test_servers::{
 
 const TEST_SIZES: &[usize] = &[1024, 10 * 1024, 100 * 1024, 1024 * 1024, 10 * 1024 * 1024];
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+const TEST_UUID: &str = "b85798ef-e9dc-46a4-9a87-8da4499d36d0";
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -54,6 +55,36 @@ async fn tls_client(
     Ok(connector
         .connect(server_name, TcpStream::connect(address).await?)
         .await?)
+}
+
+/// Send a VLESS TCP CONNECT request and consume the two-byte response header.
+async fn vless_connect_tcp(
+    stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    destination: std::net::SocketAddr,
+) -> TestResult {
+    let uuid = common::vless::parse_uuid(TEST_UUID)?;
+    let mut request = Vec::with_capacity(22);
+    request.push(0); // version
+    request.extend_from_slice(&uuid);
+    request.push(0); // addon length
+    request.push(1); // command: TCP CONNECT
+    request.extend_from_slice(&destination.port().to_be_bytes());
+    match destination.ip() {
+        std::net::IpAddr::V4(v4) => {
+            request.push(1);
+            request.extend_from_slice(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            request.push(3);
+            request.extend_from_slice(&v6.octets());
+        }
+    }
+    stream.write_all(&request).await?;
+
+    let mut response_header = [0u8; 2];
+    stream.read_exact(&mut response_header).await?;
+    assert_eq!(response_header, [0, 0]);
+    Ok(())
 }
 
 async fn benchmark_stream<S>(stream: S, size: usize) -> TestResult<BenchmarkResult>
@@ -103,18 +134,19 @@ async fn benchmark_shoes(size: usize) -> TestResult<BenchmarkResult> {
         cert: {}
         key: {}
         protocol:
-          type: portforward
-          target: "{}"
+          type: vless
+          user_id: "{TEST_UUID}"
 "#,
         AsRef::<Path>::as_ref(&cert_path).display(),
         AsRef::<Path>::as_ref(&key_path).display(),
-        echo.local_addr(),
     );
     let (_shoes, _config) = start_shoes_server(&config)?;
     ports.wait_for_all_ports().await?;
 
     let address = format!("{proxy_ip}:{proxy_port}").parse()?;
-    benchmark_stream(tls_client(address, &cert_path).await?, size).await
+    let mut stream = tls_client(address, &cert_path).await?;
+    vless_connect_tcp(&mut stream, echo.local_addr()).await?;
+    benchmark_stream(stream, size).await
 }
 
 async fn benchmark_tokio_rustls(size: usize) -> TestResult<BenchmarkResult> {

@@ -18,7 +18,6 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
-use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
@@ -281,20 +280,6 @@ where
             )
             .await
         }
-        TcpServerSetupResult::MultiDirectionalUdp {
-            stream: server_stream,
-            need_initial_flush,
-            proxy_selector,
-        } => {
-            // Per-destination routing: each packet is routed based on its destination
-            run_udp_routing(
-                ServerStream::Targeted(server_stream),
-                proxy_selector,
-                resolver,
-                need_initial_flush,
-            )
-            .await
-        }
         TcpServerSetupResult::SessionBasedUdp {
             stream: server_stream,
             need_initial_flush,
@@ -389,12 +374,12 @@ pub async fn start_servers(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
         )),
-        Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
+        Config::Server(server_config) => start_configured_servers(server_config, resolver).await,
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
 }
 
-async fn start_tcp_or_quic_servers(
+async fn start_configured_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
@@ -402,17 +387,6 @@ async fn start_tcp_or_quic_servers(
 
     match config.transport {
         Transport::Tcp => match start_tcp_servers(config.clone(), resolver).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
-        Transport::Quic => match start_quic_servers(config.clone(), resolver).await {
             Ok(handles) => {
                 join_handles.extend(handles);
             }

@@ -134,14 +134,6 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
         Self::with_input(io, session, input)
     }
 
-    pub fn alpn_protocol(&self) -> Option<&[u8]> {
-        self.session.alpn_protocol()
-    }
-
-    pub fn is_reality(&self) -> bool {
-        self.session.is_reality()
-    }
-
     pub fn is_server(&self) -> bool {
         self.session.is_server()
     }

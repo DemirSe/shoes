@@ -14,12 +14,50 @@
 /// - system - Native system resolver
 use shoes_test_support as common;
 
-use common::test_fixture::start_shoes_server;
+use common::test_fixture::{ProcessGuard, start_shoes_server, start_singbox_server};
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
 
 const TEST_UUID: &str = "b85798ef-e9dc-46a4-9a87-8da4499d36d0";
+
+/// Start a stock sing-box HTTP-proxy entry that forwards through a shoes VLESS front.
+///
+/// The retired shoes HTTP/SOCKS proxy fronts are replaced by this stock-client entry;
+/// the DNS transport, chain, bootstrap, fallback, and timeout behavior under test
+/// still runs inside the shoes server.
+fn start_singbox_vless_entry(
+    entry_ip: &str,
+    entry_port: u16,
+    front_ip: &str,
+    front_port: u16,
+) -> std::io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
+    let config = format!(
+        r#"{{
+  "log": {{ "level": "debug" }},
+  "inbounds": [
+    {{
+      "type": "http",
+      "tag": "http-in",
+      "listen": "{}",
+      "listen_port": {}
+    }}
+  ],
+  "outbounds": [
+    {{
+      "type": "vless",
+      "tag": "vless-out",
+      "server": "{}",
+      "server_port": {},
+      "uuid": "{}"
+    }}
+  ],
+  "route": {{ "final": "vless-out" }}
+}}"#,
+        entry_ip, entry_port, front_ip, front_port, TEST_UUID
+    );
+    start_singbox_server(&config)
+}
 
 /// Test DNS resolution through VLESS server using TCP DNS
 ///
@@ -33,6 +71,7 @@ async fn test_dns_through_vless_tcp() -> Result<(), Box<dyn std::error::Error>> 
 
     let mut port_helper = common::port_helper::PortHelper::new();
     let (vless_ip, vless_port) = port_helper.get_listener_port();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!(
         "[TEST] Using ports: VLESS={}, HTTP Proxy={}",
@@ -44,7 +83,7 @@ async fn test_dns_through_vless_tcp() -> Result<(), Box<dyn std::error::Error>> 
 
     // shoes config with:
     // 1. VLESS+TLS server (acts as DNS proxy tunnel)
-    // 2. HTTP proxy server with dns_group that routes DNS through VLESS
+    // 2. VLESS front server with dns_group that routes DNS through VLESS
     let shoes_config = format!(
         r#"
 # VLESS+TLS server that forwards DNS queries to upstream
@@ -77,12 +116,13 @@ async fn test_dns_through_vless_tcp() -> Result<(), Box<dyn std::error::Error>> 
     - url: tcp://8.8.8.8
       client_chain: vless-dns-tunnel
 
-# HTTP proxy server using the proxied DNS
+# VLESS front server using the proxied DNS
 - address: "{}:{}"
   dns:
     servers: proxied-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
         vless_ip,
         vless_port,
@@ -92,13 +132,16 @@ async fn test_dns_through_vless_tcp() -> Result<(), Box<dyn std::error::Error>> 
         vless_ip,
         vless_port,
         TEST_UUID,
-        http_proxy_ip,
-        http_proxy_port
+        front_ip,
+        front_port,
+        TEST_UUID
     );
 
     // Start shoes server
     eprintln!("[DEBUG] Starting shoes server with DNS config...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     // Additional wait for DNS setup
@@ -156,6 +199,7 @@ async fn test_dns_through_vless_dot() -> Result<(), Box<dyn std::error::Error>> 
 
     let mut port_helper = common::port_helper::PortHelper::new();
     let (vless_ip, vless_port) = port_helper.get_listener_port();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!(
         "[TEST] Using ports: VLESS={}, HTTP Proxy={}",
@@ -198,12 +242,13 @@ async fn test_dns_through_vless_dot() -> Result<(), Box<dyn std::error::Error>> 
       client_chain: vless-dns-tunnel
       server_name: dns.google
 
-# HTTP proxy server using the proxied DNS
+# VLESS front server using the proxied DNS
 - address: "{}:{}"
   dns:
     servers: proxied-dot-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
         vless_ip,
         vless_port,
@@ -213,13 +258,16 @@ async fn test_dns_through_vless_dot() -> Result<(), Box<dyn std::error::Error>> 
         vless_ip,
         vless_port,
         TEST_UUID,
-        http_proxy_ip,
-        http_proxy_port
+        front_ip,
+        front_port,
+        TEST_UUID
     );
 
     // Start shoes server
     eprintln!("[DEBUG] Starting shoes server with DoT DNS config...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(500)).await;
@@ -275,6 +323,7 @@ async fn test_dns_through_vless_dot() -> Result<(), Box<dyn std::error::Error>> 
 #[tokio::test]
 async fn test_dns_h3_direct() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -287,18 +336,21 @@ async fn test_dns_h3_direct() -> Result<(), Box<dyn std::error::Error>> {
     - url: h3://dns.google/dns-query
       bootstrap_url: udp://8.8.8.8
 
-# HTTP proxy server using H3 DNS
+# VLESS front server using H3 DNS
 - address: "{}:{}"
   dns:
     servers: h3-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with H3 DNS...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(500)).await;
@@ -347,6 +399,7 @@ async fn test_dns_h3_direct() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_dns_h3_cloudflare() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -358,18 +411,21 @@ async fn test_dns_h3_cloudflare() -> Result<(), Box<dyn std::error::Error>> {
     - url: h3://cloudflare-dns.com/dns-query
       bootstrap_url: udp://1.1.1.1
 
-# HTTP proxy server using Cloudflare H3 DNS
+# VLESS front server using Cloudflare H3 DNS
 - address: "{}:{}"
   dns:
     servers: h3-cloudflare
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with Cloudflare H3 DNS...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(500)).await;
@@ -423,6 +479,7 @@ async fn test_dns_through_vless_doh() -> Result<(), Box<dyn std::error::Error>> 
 
     let mut port_helper = common::port_helper::PortHelper::new();
     let (vless_ip, vless_port) = port_helper.get_listener_port();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!(
         "[TEST] Using ports: VLESS={}, HTTP Proxy={}",
@@ -464,12 +521,13 @@ async fn test_dns_through_vless_doh() -> Result<(), Box<dyn std::error::Error>> 
     - url: https://1.1.1.1/dns-query
       client_chain: vless-dns-tunnel
 
-# HTTP proxy server using DoH DNS
+# VLESS front server using DoH DNS
 - address: "{}:{}"
   dns:
     servers: proxied-doh
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
         vless_ip,
         vless_port,
@@ -479,12 +537,15 @@ async fn test_dns_through_vless_doh() -> Result<(), Box<dyn std::error::Error>> 
         vless_ip,
         vless_port,
         TEST_UUID,
-        http_proxy_ip,
-        http_proxy_port
+        front_ip,
+        front_port,
+        TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with DoH DNS config...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(500)).await;
@@ -535,6 +596,7 @@ async fn test_dns_through_vless_multiple_servers() -> Result<(), Box<dyn std::er
 
     let mut port_helper = common::port_helper::PortHelper::new();
     let (vless_ip, vless_port) = port_helper.get_listener_port();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!(
         "[TEST] Using ports: VLESS={}, HTTP Proxy={}",
@@ -578,12 +640,13 @@ async fn test_dns_through_vless_multiple_servers() -> Result<(), Box<dyn std::er
     - url: tcp://1.1.1.1
       client_chain: vless-dns-tunnel
 
-# HTTP proxy using multi-DNS
+# VLESS front using multi-DNS
 - address: "{}:{}"
   dns:
     servers: multi-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
         vless_ip,
         vless_port,
@@ -593,12 +656,15 @@ async fn test_dns_through_vless_multiple_servers() -> Result<(), Box<dyn std::er
         vless_ip,
         vless_port,
         TEST_UUID,
-        http_proxy_ip,
-        http_proxy_port
+        front_ip,
+        front_port,
+        TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with multiple DNS servers...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(500)).await;
@@ -648,6 +714,7 @@ async fn test_dns_through_vless_multiple_servers() -> Result<(), Box<dyn std::er
 #[tokio::test]
 async fn test_dns_udp_direct() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -660,18 +727,21 @@ async fn test_dns_udp_direct() -> Result<(), Box<dyn std::error::Error>> {
     - url: udp://8.8.8.8
       ip_strategy: ipv4_only
 
-# HTTP proxy server using UDP DNS
+# VLESS front server using UDP DNS
 - address: "{}:{}"
   dns:
     servers: udp-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with UDP DNS...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -716,6 +786,7 @@ async fn test_dns_udp_direct() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_dns_tcp_direct() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -726,18 +797,21 @@ async fn test_dns_tcp_direct() -> Result<(), Box<dyn std::error::Error>> {
   dns_servers:
     - url: tcp://8.8.8.8
 
-# HTTP proxy server using TCP DNS
+# VLESS front server using TCP DNS
 - address: "{}:{}"
   dns:
     servers: tcp-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with TCP DNS...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -771,6 +845,7 @@ async fn test_dns_tcp_direct() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_dns_dot_direct() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -782,18 +857,21 @@ async fn test_dns_dot_direct() -> Result<(), Box<dyn std::error::Error>> {
     - url: tls://8.8.8.8
       server_name: dns.google
 
-# HTTP proxy server using DoT DNS
+# VLESS front server using DoT DNS
 - address: "{}:{}"
   dns:
     servers: dot-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with DoT DNS...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -827,6 +905,7 @@ async fn test_dns_dot_direct() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_dns_doh_direct() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -837,18 +916,21 @@ async fn test_dns_doh_direct() -> Result<(), Box<dyn std::error::Error>> {
   dns_servers:
     - url: https://1.1.1.1/dns-query
 
-# HTTP proxy server using DoH DNS
+# VLESS front server using DoH DNS
 - address: "{}:{}"
   dns:
     servers: doh-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with DoH DNS...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -882,6 +964,7 @@ async fn test_dns_doh_direct() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_dns_system_resolver() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -892,18 +975,21 @@ async fn test_dns_system_resolver() -> Result<(), Box<dyn std::error::Error>> {
   dns_servers:
     - url: system
 
-# HTTP proxy server using system DNS
+# VLESS front server using system DNS
 - address: "{}:{}"
   dns:
     servers: system-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with system DNS...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -938,6 +1024,7 @@ async fn test_dns_system_resolver() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_dns_mixed_protocols() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -955,18 +1042,21 @@ async fn test_dns_mixed_protocols() -> Result<(), Box<dyn std::error::Error>> {
       server_name: dns.google
       ip_strategy: ipv4_only
 
-# HTTP proxy server using mixed DNS
+# VLESS front server using mixed DNS
 - address: "{}:{}"
   dns:
     servers: mixed-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with mixed DNS protocols...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -1010,6 +1100,7 @@ async fn test_dns_mixed_protocols() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_dns_with_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -1021,18 +1112,21 @@ async fn test_dns_with_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
     - url: tls://dns.google
       bootstrap_url: udp://1.1.1.1
 
-# HTTP proxy server using bootstrapped DNS
+# VLESS front server using bootstrapped DNS
 - address: "{}:{}"
   dns:
     servers: bootstrapped-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with bootstrapped DNS...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -1071,6 +1165,7 @@ async fn test_dns_with_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_dns_doh_with_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -1082,18 +1177,21 @@ async fn test_dns_doh_with_bootstrap() -> Result<(), Box<dyn std::error::Error>>
     - url: https://cloudflare-dns.com/dns-query
       bootstrap_url: tcp://8.8.8.8
 
-# HTTP proxy server using bootstrapped DoH
+# VLESS front server using bootstrapped DoH
 - address: "{}:{}"
   dns:
     servers: bootstrapped-doh
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with bootstrapped DoH...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -1121,32 +1219,34 @@ async fn test_dns_doh_with_bootstrap() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// Test DNS with 2-hop client chain (SOCKS5 -> VLESS)
+/// Test DNS with 2-hop client chain (VLESS -> VLESS+TLS)
 ///
 /// This test validates that DNS queries can traverse a multi-hop proxy chain.
-/// Traffic flows: DNS query -> SOCKS5 proxy -> VLESS proxy -> upstream DNS
+/// Traffic flows: DNS query -> VLESS proxy -> VLESS+TLS proxy -> upstream DNS
 #[tokio::test]
 async fn test_dns_two_hop_chain() -> Result<(), Box<dyn std::error::Error>> {
     use common::test_servers::generate_test_cert;
 
     let mut port_helper = common::port_helper::PortHelper::new();
-    let (socks_ip, socks_port) = port_helper.get_listener_port();
+    let (hop1_ip, hop1_port) = port_helper.get_listener_port();
     let (vless_ip, vless_port) = port_helper.get_listener_port();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!(
-        "[TEST] Using ports: SOCKS5={}, VLESS={}, HTTP Proxy={}",
-        socks_port, vless_port, http_proxy_port
+        "[TEST] Using ports: VLESS hop1={}, VLESS+TLS hop2={}, front={}, HTTP Proxy={}",
+        hop1_port, vless_port, front_port, http_proxy_port
     );
 
     let (vless_cert, vless_key) = generate_test_cert()?;
 
-    // Config with 2-hop chain: SOCKS5 -> VLESS+TLS
+    // Config with 2-hop chain: VLESS -> VLESS+TLS
     let shoes_config = format!(
         r#"
-# Hop 1: SOCKS5 server (entry point)
+# Hop 1: VLESS server (entry point)
 - address: "{}:{}"
   protocol:
-    type: socks
+    type: vless
+    user_id: "{}"
 
 # Hop 2: VLESS+TLS server (exit point)
 - address: "{}:{}"
@@ -1160,15 +1260,16 @@ async fn test_dns_two_hop_chain() -> Result<(), Box<dyn std::error::Error>> {
           type: vless
           user_id: "{}"
 
-# Client group for first hop (SOCKS5)
-- client_group: socks-hop
+# Client group for first hop (VLESS)
+- client_group: vless-entry-hop
   client_proxies:
     - address: "{}:{}"
       protocol:
-        type: socks
+        type: vless
+        user_id: "{}"
 
 # Client group for second hop (VLESS+TLS)
-- client_group: vless-hop
+- client_group: vless-tls-hop
   client_proxies:
     - address: "{}:{}"
       protocol:
@@ -1179,43 +1280,49 @@ async fn test_dns_two_hop_chain() -> Result<(), Box<dyn std::error::Error>> {
           type: vless
           user_id: "{}"
 
-# DNS group with 2-hop chain: SOCKS5 -> VLESS -> upstream DNS
+# DNS group with 2-hop chain: VLESS -> VLESS+TLS -> upstream DNS
 - dns_group: two-hop-dns
   dns_servers:
     - url: tcp://8.8.8.8
       client_chain:
-        chain: [socks-hop, vless-hop]
+        chain: [vless-entry-hop, vless-tls-hop]
 
-# HTTP proxy server using 2-hop DNS
+# VLESS front server using 2-hop DNS
 - address: "{}:{}"
   dns:
     servers: two-hop-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        socks_ip,
-        socks_port,
+        hop1_ip,
+        hop1_port,
+        TEST_UUID,
         vless_ip,
         vless_port,
         AsRef::<Path>::as_ref(&vless_cert).to_str().unwrap(),
         AsRef::<Path>::as_ref(&vless_key).to_str().unwrap(),
         TEST_UUID,
-        socks_ip,
-        socks_port,
+        hop1_ip,
+        hop1_port,
+        TEST_UUID,
         vless_ip,
         vless_port,
         TEST_UUID,
-        http_proxy_ip,
-        http_proxy_port
+        front_ip,
+        front_port,
+        TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with 2-hop DNS chain...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(500)).await;
 
-    eprintln!("[TEST] Making HTTP request to example.com (DNS via SOCKS5 -> VLESS)");
+    eprintln!("[TEST] Making HTTP request to example.com (DNS via VLESS -> VLESS+TLS)");
     let output = common::curl::run_curl(
         "http://example.com",
         common::curl::CurlOptions::new()
@@ -1261,6 +1368,7 @@ async fn test_dns_two_hop_chain() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_dns_timeout_with_fallback() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
     eprintln!("[TEST] Using port: HTTP Proxy={}", http_proxy_port);
 
@@ -1279,18 +1387,21 @@ async fn test_dns_timeout_with_fallback() -> Result<(), Box<dyn std::error::Erro
       attempts: 1
       ip_strategy: ipv4_only
 
-# HTTP proxy using the timeout-test DNS
+# VLESS front using the timeout-test DNS
 - address: "{}:{}"
   dns:
     servers: timeout-test-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with timeout test DNS...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;
@@ -1336,6 +1447,7 @@ async fn test_dns_timeout_with_fallback() -> Result<(), Box<dyn std::error::Erro
 #[tokio::test]
 async fn test_dns_custom_attempts_and_connect_timeout() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
+    let (front_ip, front_port) = port_helper.get_listener_port();
     let (http_proxy_ip, http_proxy_port) = port_helper.get_listener_port();
 
     let shoes_config = format!(
@@ -1349,18 +1461,21 @@ async fn test_dns_custom_attempts_and_connect_timeout() -> Result<(), Box<dyn st
       attempts: 1
       ip_strategy: ipv4_only
 
-# HTTP proxy using the tuned DNS
+# VLESS front using the tuned DNS
 - address: "{}:{}"
   dns:
     servers: tuned-dns
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
 "#,
-        http_proxy_ip, http_proxy_port
+        front_ip, front_port, TEST_UUID
     );
 
     eprintln!("[DEBUG] Starting shoes server with tuned DNS config...");
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_singbox_guard, _singbox_config_file) =
+        start_singbox_vless_entry(&http_proxy_ip, http_proxy_port, &front_ip, front_port)?;
     port_helper.wait_for_all_ports().await?;
 
     sleep(Duration::from_millis(300)).await;

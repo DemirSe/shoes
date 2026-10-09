@@ -17,31 +17,11 @@ async fn test_shoes_vless_tls_vision_server() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
-async fn test_shoes_vless_tls_vision_client() -> Result<(), Box<dyn std::error::Error>> {
-    // Chain: curl -> shoes HTTP proxy (with Vision client) -> sing-box Vision server -> local HTTPS
-    ProxyTestFixture::new()
-        .with_shoes_vision_client()
-        .with_singbox_vision_server()
-        .test_local_https_tls13(1024)
-        .await
-}
-
-#[tokio::test]
 async fn test_shoes_vless_server() -> Result<(), Box<dyn std::error::Error>> {
     // Chain: curl -> sing-box HTTP proxy -> shoes VLESS server -> local hostname
     ProxyTestFixture::new()
         .with_singbox_vless_client()
         .with_shoes_vless_server()
-        .test_local_http_hostname(1024)
-        .await
-}
-
-#[tokio::test]
-async fn test_shoes_vless_client() -> Result<(), Box<dyn std::error::Error>> {
-    // Chain: curl -> shoes HTTP proxy (with VLESS client) -> sing-box VLESS server -> local hostname
-    ProxyTestFixture::new()
-        .with_shoes_vless_client()
-        .with_singbox_vless_server()
         .test_local_http_hostname(1024)
         .await
 }
@@ -57,16 +37,6 @@ async fn test_shoes_vless_tls_server() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[tokio::test]
-async fn test_shoes_vless_tls_client() -> Result<(), Box<dyn std::error::Error>> {
-    // Chain: curl -> shoes HTTP proxy (with VLESS+TLS client) -> sing-box VLESS+TLS server -> local HTTPS
-    ProxyTestFixture::new()
-        .with_shoes_vless_tls_client()
-        .with_singbox_vless_tls_server()
-        .test_local_https_tls13(1024)
-        .await
-}
-
-#[tokio::test]
 async fn test_shoes_vless_tls_vision_server_http_endpoint() -> Result<(), Box<dyn std::error::Error>>
 {
     // Chain: curl -> sing-box HTTP proxy -> shoes VLESS+Vision server -> local HTTP server
@@ -75,25 +45,6 @@ async fn test_shoes_vless_tls_vision_server_http_endpoint() -> Result<(), Box<dy
     let fixture = ProxyTestFixture::new()
         .with_singbox_vision_client()
         .with_shoes_vision_server()
-        .with_local_http_server()
-        .build()
-        .await?;
-
-    // Test with a reasonably sized response (similar to www.example.com's ~1256 bytes)
-    let body = fixture.test_local_server("/bytes/1256", false).await?;
-    assert_eq!(body.len(), 1256, "Expected exactly 1256 bytes");
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_shoes_vless_tls_vision_client_http_endpoint() -> Result<(), Box<dyn std::error::Error>>
-{
-    // Chain: curl -> shoes HTTP proxy (Vision client) -> sing-box Vision server -> local HTTP server
-    // Tests Vision End command with HTTP (non-TLS) endpoint
-    // Uses local server that properly closes connections after response
-    let fixture = ProxyTestFixture::new()
-        .with_shoes_vision_client()
-        .with_singbox_vision_server()
         .with_local_http_server()
         .build()
         .await?;
@@ -1093,11 +1044,11 @@ async fn test_shoes_vless_tls_vision_server_with_singbox_detour_chain()
     Ok(())
 }
 
-/// Test VISION server with HTTP proxy detour chain
+/// Test VISION server with a stock sing-box HTTP proxy detour chain
 /// Tests FuzzyTlsDeframer's ability to skip HTTP CONNECT headers before TLS data
 ///
-/// This test creates a proxy chain with an HTTP proxy as the intermediate:
-/// curl → sing-box (Vision VLESS) → shoes (Vision VLESS) → shoes (HTTP proxy) → target HTTPS server
+/// This test creates a proxy chain with a stock sing-box HTTP proxy as the intermediate:
+/// curl → sing-box (Vision VLESS) → shoes (Vision VLESS) → sing-box (HTTP proxy) → target HTTPS server
 ///
 /// The inner TLS handshake (client hello to target) gets prefixed with HTTP CONNECT headers
 /// when it passes through the HTTP proxy. FuzzyTlsDeframer should detect and skip these headers.
@@ -1114,7 +1065,7 @@ async fn test_shoes_vless_tls_vision_server_with_http_detour_chain()
     let (local_https_ip, local_https_port) = port_helper.get_listener_port();
 
     eprintln!(
-        "[TEST] Using ports: Vision VLESS={}, HTTP Proxy={}, sing-box HTTP={}, Local HTTPS={}",
+        "[TEST] Using ports: Vision VLESS={}, sing-box HTTP proxy={}, sing-box HTTP entry={}, Local HTTPS={}",
         vision_vless_port, http_proxy_port, singbox_http_port, local_https_port
     );
 
@@ -1132,16 +1083,9 @@ async fn test_shoes_vless_tls_vision_server_with_http_detour_chain()
     )
     .await?;
 
-    // shoes config with TWO servers:
-    // 1. HTTP proxy server - intermediate proxy to target
-    // 2. Vision VLESS server - entry point from sing-box
+    // shoes config: Vision VLESS server - entry point from sing-box
     let shoes_config = format!(
         r#"
-# HTTP proxy server (intermediate) - proxies to target
-- address: "{}:{}"
-  protocol:
-    type: http
-
 # Vision VLESS server - entry point from sing-box
 - address: "{}:{}"
   protocol:
@@ -1156,8 +1100,6 @@ async fn test_shoes_vless_tls_vision_server_with_http_detour_chain()
           user_id: "{}"
           udp_enabled: true
 "#,
-        http_proxy_ip,
-        http_proxy_port,
         vision_vless_ip,
         vision_vless_port,
         AsRef::<Path>::as_ref(&vision_cert).to_str().unwrap(),
@@ -1165,9 +1107,37 @@ async fn test_shoes_vless_tls_vision_server_with_http_detour_chain()
         TEST_UUID
     );
 
+    // Stock sing-box HTTP proxy server (intermediate). It replaces the removed
+    // shoes HTTP proxy fixture; the Vision server remains the subject.
+    let http_proxy_config = format!(
+        r#"{{
+  "log": {{
+    "level": "debug"
+  }},
+  "inbounds": [
+    {{
+      "type": "http",
+      "tag": "http-in",
+      "listen": "{}",
+      "listen_port": {}
+    }}
+  ],
+  "outbounds": [
+    {{
+      "type": "direct",
+      "tag": "direct"
+    }}
+  ],
+  "route": {{
+    "final": "direct"
+  }}
+}}"#,
+        http_proxy_ip, http_proxy_port
+    );
+
     // sing-box config with HTTP proxy detour:
     // - HTTP inbound
-    // - http-inner: HTTP proxy to shoes HTTP server, with detour to vless-outer
+    // - http-inner: HTTP proxy to the stock sing-box HTTP server, with detour to vless-outer
     // - vless-outer: Vision VLESS+TLS to shoes Vision server
     // - Route final goes to http-inner
     let singbox_config = format!(
@@ -1220,13 +1190,14 @@ async fn test_shoes_vless_tls_vision_server_with_http_detour_chain()
 
     // Start servers
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_http_proxy_guard, _http_proxy_config_file) = start_singbox_server(&http_proxy_config)?;
     let (_singbox_guard, _singbox_config_file) = start_singbox_server(&singbox_config)?;
     port_helper.wait_for_all_ports().await?;
 
     // Test HTTPS request through the proxy chain
     eprintln!("[TEST] Testing HTTPS/TLS1.3 request through HTTP proxy detour chain");
     eprintln!(
-        "[TEST] Flow: curl → sing-box HTTP → sing-box Vision VLESS (detour) → shoes Vision VLESS → shoes HTTP proxy → local HTTPS server"
+        "[TEST] Flow: curl → sing-box HTTP → sing-box Vision VLESS (detour) → shoes Vision VLESS → sing-box HTTP proxy → local HTTPS server"
     );
     eprintln!("[TEST] Expected: FuzzyTlsDeframer should skip HTTP CONNECT headers before TLS data");
 
@@ -1260,21 +1231,4 @@ async fn test_shoes_vless_tls_vision_server_with_http_detour_chain()
     eprintln!("[TEST] Look for: 'FuzzyTlsDeframer: Found TLS pattern after N byte prefix'");
 
     Ok(())
-}
-
-/// Test shoes VLESS+Vision client connecting to shoes VLESS+Vision server
-/// This tests the complete shoes-to-shoes Vision implementation without sing-box
-///
-/// Flow: curl → shoes HTTP proxy (with Vision client) → shoes Vision server → internet
-#[tokio::test]
-async fn test_shoes_tls_vision_client_to_shoes_tls_vision_server()
--> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("[TEST] Testing shoes Vision client → shoes Vision server");
-    eprintln!("[TEST] This validates the complete shoes Vision implementation");
-
-    ProxyTestFixture::new()
-        .with_shoes_vision_client() // Entry: HTTP proxy that routes through Vision client
-        .with_shoes_vision_server() // Exit: Vision server
-        .test_local_https_tls13(1024)
-        .await
 }

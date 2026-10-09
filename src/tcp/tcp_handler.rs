@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::address::{NetLocation, ResolvedLocation};
-use crate::async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream};
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
 
 pub enum TcpServerSetupResult {
@@ -28,12 +28,6 @@ pub enum TcpServerSetupResult {
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
     },
-    MultiDirectionalUdp {
-        need_initial_flush: bool,
-        stream: Box<dyn AsyncTargetedMessageStream>,
-        /// The proxy selector to use for routing this connection
-        proxy_selector: Arc<ClientProxySelector>,
-    },
     SessionBasedUdp {
         need_initial_flush: bool,
         stream: Box<dyn crate::async_stream::AsyncSessionMessageStream>,
@@ -52,10 +46,6 @@ impl TcpServerSetupResult {
                 ..
             }
             | TcpServerSetupResult::BidirectionalUdp {
-                need_initial_flush: flush,
-                ..
-            }
-            | TcpServerSetupResult::MultiDirectionalUdp {
                 need_initial_flush: flush,
                 ..
             }

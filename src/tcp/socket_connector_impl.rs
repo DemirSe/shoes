@@ -6,7 +6,6 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -15,19 +14,14 @@ use log::{debug, error};
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
-use crate::address::{NetLocation, ResolvedLocation};
+use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncStream;
-use crate::config::{ClientConfig, ClientQuicConfig, Transport};
-use crate::quic_endpoint::QuicEndpoint;
-use crate::quic_stream::QuicStream;
+use crate::config::ClientConfig;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
-use crate::rustls_config_util::create_client_config;
 use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
-use crate::thread_util::get_num_threads;
 
 use super::socket_connector::SocketConnector;
 
-const MAX_QUIC_ENDPOINTS: usize = 32;
 const TCP_FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const TCP_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_TCP_ATTEMPTS: usize = 2;
@@ -108,23 +102,15 @@ where
 
 #[derive(Debug)]
 enum TransportConfig {
-    Tcp {
-        no_delay: bool,
-    },
-    Quic {
-        sni_hostname: Option<String>,
-        endpoints: Vec<Arc<QuicEndpoint>>,
-        next_endpoint_index: AtomicU8,
-    },
+    Tcp { no_delay: bool },
 }
 
-/// Implementation of SocketConnector for TCP and QUIC transports.
+/// Implementation of SocketConnector for the TCP transport.
 ///
 /// Created from the socket-related fields of any ClientConfig:
 /// - `bind_interface`
 /// - `transport`
 /// - `tcp_settings`
-/// - `quic_settings`
 #[derive(Debug)]
 pub struct SocketConnectorImpl {
     bind_interface: Option<String>,
@@ -136,139 +122,19 @@ impl SocketConnectorImpl {
     ///
     /// # Arguments
     /// * `config` - The client config (socket fields are extracted)
-    /// * `target_address` - The address this connector will connect to (used for QUIC SNI default).
-    ///   Pass None for direct protocol (QUIC is not supported for direct).
-    ///
-    /// # Returns
-    /// None if QUIC endpoint creation fails.
-    pub fn from_config(
-        config: &ClientConfig,
-        target_address: Option<&NetLocation>,
-    ) -> Option<Self> {
+    pub fn from_config(config: &ClientConfig) -> Self {
         let bind_interface = config.bind_interface.clone().into_option();
 
-        let default_sni_hostname =
-            target_address.and_then(|addr| addr.address().hostname().map(ToString::to_string));
+        let no_delay = config
+            .tcp_settings
+            .as_ref()
+            .map(|tc| tc.no_delay)
+            .unwrap_or(true);
 
-        // Direct protocol only supports TCP (no proxy server to connect via QUIC)
-        let effective_transport = if config.protocol.is_direct() {
-            &Transport::Tcp
-        } else {
-            &config.transport
-        };
-
-        let transport = match *effective_transport {
-            Transport::Tcp | Transport::Udp => {
-                let no_delay = config
-                    .tcp_settings
-                    .as_ref()
-                    .map(|tc| tc.no_delay)
-                    .unwrap_or(true);
-                TransportConfig::Tcp { no_delay }
-            }
-            Transport::Quic => {
-                // QUIC requires a target address for endpoint creation
-                let target_address = target_address.expect(
-                    "QUIC transport requires target_address (direct protocol should use TCP)",
-                );
-
-                let ClientQuicConfig {
-                    verify,
-                    server_fingerprints,
-                    alpn_protocols,
-                    sni_hostname,
-                    key,
-                    cert,
-                } = config.quic_settings.clone().unwrap_or_default();
-
-                let sni_hostname = if sni_hostname.is_unspecified() {
-                    if let Some(ref hostname) = default_sni_hostname {
-                        debug!(
-                            "Using default sni hostname for QUIC client connection: {}",
-                            hostname
-                        );
-                    }
-                    default_sni_hostname.clone()
-                } else {
-                    sni_hostname.into_option()
-                };
-
-                let tls13_suite =
-                    match rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256 {
-                        rustls::SupportedCipherSuite::Tls13(t) => t,
-                        _ => {
-                            panic!("Could not retrieve Tls13CipherSuite");
-                        }
-                    };
-
-                let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
-                    let cert_bytes = cert.as_bytes().to_vec();
-                    let key_bytes = key.as_bytes().to_vec();
-                    (key_bytes, cert_bytes)
-                });
-
-                let rustls_client_config = create_client_config(
-                    verify,
-                    server_fingerprints.into_vec(),
-                    alpn_protocols.into_vec(),
-                    sni_hostname.is_some(),
-                    key_and_cert_bytes,
-                    false, // tls13_only - QUIC enforces TLS 1.3 anyway
-                );
-
-                let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
-                    Arc::new(rustls_client_config),
-                    tls13_suite.quic_suite().unwrap(),
-                )
-                .unwrap();
-
-                let mut quinn_client_config =
-                    quinn::ClientConfig::new(Arc::new(quic_client_config));
-
-                let mut transport_config = quinn::TransportConfig::default();
-                let memory_bytes =
-                    crate::resources::configure_quic_transport(&mut transport_config);
-                transport_config
-                    .max_concurrent_bidi_streams(0_u32.into())
-                    .max_concurrent_uni_streams(0_u8.into())
-                    .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
-                    .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
-
-                quinn_client_config.transport_config(Arc::new(transport_config));
-
-                let endpoints_len = std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS);
-                let mut endpoints = Vec::with_capacity(endpoints_len);
-
-                for _ in 0..endpoints_len {
-                    let udp_socket = match new_udp_socket(
-                        target_address.address().is_ipv6(),
-                        bind_interface.clone(),
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("Failed to bind new UDP socket for QUIC: {e}");
-                            return None;
-                        }
-                    };
-                    let udp_socket = udp_socket.into_std().unwrap();
-
-                    let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes).unwrap();
-                    endpoint.set_default_client_config(quinn_client_config.clone());
-                    endpoints.push(Arc::new(endpoint));
-                }
-
-                TransportConfig::Quic {
-                    sni_hostname,
-                    endpoints,
-                    next_endpoint_index: AtomicU8::new(0),
-                }
-            }
-        };
-
-        Some(Self {
+        Self {
             bind_interface,
-            transport,
-        })
+            transport: TransportConfig::Tcp { no_delay },
+        }
     }
 
     /// Create a simple TCP SocketConnector for direct connections.
@@ -313,62 +179,6 @@ impl SocketConnector for SocketConnectorImpl {
                     error!("Failed to set TCP no-delay: {e}");
                 }
                 Ok(Box::new(stream))
-            }
-            TransportConfig::Quic {
-                endpoints,
-                next_endpoint_index,
-                sni_hostname,
-            } => {
-                let domain = match sni_hostname {
-                    Some(s) => s.as_str(),
-                    None => address.address().hostname().unwrap_or("example.com"),
-                };
-
-                let mut last_err = None;
-                for (i, target_addr) in target_addrs.iter().enumerate() {
-                    let endpoint = if endpoints.len() == 1 {
-                        &endpoints[0]
-                    } else {
-                        let idx = next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize;
-                        &endpoints[idx % endpoints.len()]
-                    };
-
-                    match endpoint.connect(*target_addr, domain) {
-                        Ok(connecting) => match connecting.await {
-                            Ok(conn) => match conn.open_bi().await {
-                                Ok((send, recv)) => {
-                                    if i > 0 {
-                                        debug!(
-                                            "QUIC connect succeeded on address #{} ({}) after {} failures",
-                                            i, target_addr, i
-                                        );
-                                    }
-                                    return Ok(Box::new(QuicStream::from(send, recv)));
-                                }
-                                Err(e) => {
-                                    debug!("QUIC open_bi to {} failed: {}", target_addr, e);
-                                    last_err = Some(std::io::Error::other(format!(
-                                        "Failed to open QUIC stream: {e}"
-                                    )));
-                                }
-                            },
-                            Err(e) => {
-                                debug!("QUIC connection to {} failed: {}", target_addr, e);
-                                last_err = Some(std::io::Error::other(format!(
-                                    "QUIC connection failed: {e}"
-                                )));
-                            }
-                        },
-                        Err(e) => {
-                            debug!("QUIC connect to {} failed: {}", target_addr, e);
-                            last_err = Some(std::io::Error::other(format!(
-                                "Failed to connect to QUIC endpoint: {e}"
-                            )));
-                        }
-                    }
-                }
-                Err(last_err
-                    .unwrap_or_else(|| std::io::Error::other("no resolved addresses succeeded")))
             }
         }
     }
@@ -489,7 +299,8 @@ impl crate::async_stream::AsyncMessageStream for UnconnectedUdpSocket {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use crate::address::NetLocation;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -692,11 +503,7 @@ mod tests {
     #[test]
     fn test_from_config_direct_protocol() {
         let config = ClientConfig::default(); // default is direct protocol
-        let connector = SocketConnectorImpl::from_config(&config, None);
-        assert!(connector.is_some());
-        assert!(matches!(
-            connector.unwrap().transport,
-            TransportConfig::Tcp { .. }
-        ));
+        let connector = SocketConnectorImpl::from_config(&config);
+        assert!(matches!(connector.transport, TransportConfig::Tcp { .. }));
     }
 }

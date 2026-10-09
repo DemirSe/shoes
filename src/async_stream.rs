@@ -89,23 +89,6 @@ pub trait AsyncReadTargetedMessage {
     ) -> Poll<std::io::Result<NetLocation>>;
 }
 
-pub trait AsyncWriteTargetedMessage {
-    fn poll_write_targeted_message(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-        target: &NetLocation,
-    ) -> Poll<std::io::Result<()>>;
-}
-
-pub trait AsyncReadSourcedMessage {
-    fn poll_read_sourced_message(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<SocketAddr>>;
-}
-
 pub trait AsyncWriteSourcedMessage {
     fn poll_write_sourced_message(
         self: Pin<&mut Self>,
@@ -208,19 +191,6 @@ pub trait AsyncMessageStream:
 pub trait AsyncTargetedMessageStream:
     AsyncReadTargetedMessage
     + AsyncWriteSourcedMessage
-    + AsyncFlushMessage
-    + AsyncShutdownMessage
-    + AsyncPing
-    + Unpin
-    + Send
-{
-}
-
-/// Client stream trait connected directly to targets or to proxy servers, where received messages
-/// come with a source address, and we write where we want messages to be sent.
-pub trait AsyncSourcedMessageStream:
-    AsyncReadSourcedMessage
-    + AsyncWriteTargetedMessage
     + AsyncFlushMessage
     + AsyncShutdownMessage
     + AsyncPing
@@ -429,48 +399,6 @@ impl<T: ?Sized + AsyncReadTargetedMessage + Unpin> AsyncReadTargetedMessage for 
     }
 }
 
-impl<T: ?Sized + AsyncWriteTargetedMessage + Unpin> AsyncWriteTargetedMessage for Box<T> {
-    fn poll_write_targeted_message(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-        target: &NetLocation,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut **self).poll_write_targeted_message(cx, buf, target)
-    }
-}
-
-impl<T: ?Sized + AsyncWriteTargetedMessage + Unpin> AsyncWriteTargetedMessage for &mut T {
-    fn poll_write_targeted_message(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-        target: &NetLocation,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut **self).poll_write_targeted_message(cx, buf, target)
-    }
-}
-
-impl<T: ?Sized + AsyncReadSourcedMessage + Unpin> AsyncReadSourcedMessage for Box<T> {
-    fn poll_read_sourced_message(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<SocketAddr>> {
-        Pin::new(&mut **self).poll_read_sourced_message(cx, buf)
-    }
-}
-
-impl<T: ?Sized + AsyncReadSourcedMessage + Unpin> AsyncReadSourcedMessage for &mut T {
-    fn poll_read_sourced_message(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<SocketAddr>> {
-        Pin::new(&mut **self).poll_read_sourced_message(cx, buf)
-    }
-}
-
 impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for Box<T> {
     fn poll_write_sourced_message(
         mut self: Pin<&mut Self>,
@@ -509,9 +437,6 @@ impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for &mut T {}
 
 impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream for Box<T> {}
 impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream for &mut T {}
-
-impl<T: ?Sized + AsyncSourcedMessageStream + Unpin> AsyncSourcedMessageStream for Box<T> {}
-impl<T: ?Sized + AsyncSourcedMessageStream + Unpin> AsyncSourcedMessageStream for &mut T {}
 
 impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for Box<T> {
     fn poll_read_session_message(

@@ -158,9 +158,11 @@ pub(crate) fn exhausted() -> std::io::Error {
     )
 }
 
+#[cfg(test)]
 const DATAGRAM_BUFFER: usize = 256 << 10;
 
 /// Reserve configured QUIC buffering allowances, not an estimate of total RSS.
+#[cfg(test)]
 pub(crate) fn try_quic_memory(bytes: usize) -> Option<BudgetPermit> {
     QUIC_BYTES.acquire(bytes)
 }
@@ -170,35 +172,8 @@ pub(crate) fn try_dns_quic_memory() -> Option<BudgetPermit> {
     QUIC_BYTES.acquire(limits.quic_dns_memory_bytes)
 }
 
-pub(crate) fn configure_quic(
-    config: &mut quinn::ServerConfig,
-    bidi_streams: u32,
-    uni_streams: u32,
-) -> usize {
-    let limits = limits();
-    // Pending Initials are buffered before connection memory is reserved.
-    config
-        .max_incoming(limits.max_connections.unwrap_or(128).min(128))
-        .incoming_buffer_size(65536)
-        .incoming_buffer_size_total(1 << 20);
-    let transport = Arc::get_mut(&mut config.transport).unwrap();
-    let memory_bytes = configure_quic_transport(transport);
-    // Quinn eagerly allocates advertised stream credit. Unlimited admission keeps
-    // the protocol's existing flow-control window rather than advertising infinity.
-    let (bidi_streams, uni_streams) = match limits.max_streams_per_connection {
-        Some(limit) => {
-            let limit = limit as u32;
-            (limit, uni_streams.min(limit))
-        }
-        None => (bidi_streams, uni_streams),
-    };
-    transport
-        .max_concurrent_bidi_streams(bidi_streams.into())
-        .max_concurrent_uni_streams(uni_streams.into());
-    memory_bytes
-}
-
 /// Returns the per-connection allowance from the same limits used to configure the windows.
+#[cfg(test)]
 pub(crate) fn configure_quic_transport(transport: &mut quinn::TransportConfig) -> usize {
     let limits = limits();
     transport

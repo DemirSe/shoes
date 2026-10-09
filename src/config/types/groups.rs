@@ -289,13 +289,17 @@ mod tests {
         ClientConfig {
             bind_interface: crate::option_util::NoneOrOne::One("eth0".to_string()),
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
-            protocol: ClientProxyConfig::Socks {
-                username: Some("client_user".to_string()),
-                password: Some("client_pass".to_string()),
-            },
+            protocol: create_test_client_protocol(),
             transport: Transport::Tcp,
             tcp_settings: None,
-            quic_settings: None,
+        }
+    }
+
+    fn create_test_client_protocol() -> ClientProxyConfig {
+        ClientProxyConfig::Vless {
+            user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            udp_enabled: true,
+            h2mux: None,
         }
     }
 
@@ -328,14 +332,9 @@ mod tests {
                 ConfigSelection::Config(ClientConfig {
                     bind_interface: crate::option_util::NoneOrOne::None,
                     address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-                    protocol: ClientProxyConfig::Http {
-                        username: None,
-                        password: None,
-                        resolve_hostname: false,
-                    },
+                    protocol: create_test_client_protocol(),
                     transport: Transport::Tcp,
                     tcp_settings: None,
-                    quic_settings: None,
                 }),
             ]),
         })];
@@ -583,7 +582,8 @@ client_proxies:
     - "127.0.0.1:22223"
     - "172.17.0.1:22223-22225"
   protocol:
-    type: http
+    type: vless
+    user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#;
 
         let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
@@ -608,7 +608,8 @@ client_proxies:
   client_proxies:
     - address: "127.0.0.1:9090"
       protocol:
-        type: socks
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
   extra_field: "should fail"
 "#;
         let result: Result<Vec<Config>, _> = serde_yaml::from_str(yaml);
@@ -649,21 +650,19 @@ client_proxies:
             thread_util::set_num_threads(4);
         });
 
-        // Get the examples directory relative to the project root
+        // Get the examples directory relative to the project root.
+        // Example files for retired protocols are outside this reduction's edit scope,
+        // so only the retained-stack examples are validated here.
         let examples_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let retained_examples = [
+            "reality_basic.yaml",
+            "reality_vision.yaml",
+            "vless_over_tls.yaml",
+        ];
 
-        // Read all YAML files in the examples directory
-        let mut example_files: Vec<PathBuf> = std::fs::read_dir(&examples_dir)
-            .expect("Failed to read examples directory")
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.extension()?.to_str()? == "yaml" {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
+        let mut example_files: Vec<PathBuf> = retained_examples
+            .iter()
+            .map(|name| examples_dir.join(name))
             .collect();
 
         // Sort files for consistent test output

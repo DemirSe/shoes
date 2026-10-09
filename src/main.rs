@@ -1,5 +1,4 @@
 mod address;
-mod anytls;
 mod async_stream;
 mod buf_reader;
 mod client_proxy_chain;
@@ -10,18 +9,11 @@ mod copy_bidirectional_message;
 mod crypto;
 mod dns;
 mod h2mux;
-mod http_handler;
-mod hysteria2_server;
 mod listener_tasks;
 mod logging;
-mod mixed_handler;
-mod naiveproxy;
 mod option_util;
-mod port_forward_handler;
 mod prepend_stream;
 mod quic_endpoint;
-mod quic_server;
-mod quic_stream;
 mod reality;
 mod reality_client_handler;
 mod resolver;
@@ -29,31 +21,21 @@ mod resources;
 mod routing;
 mod rustls_config_util;
 mod rustls_connection_util;
-mod shadow_tls;
-mod shadowsocks;
 mod slide_buffer;
-mod snell;
 mod socket_util;
-mod socks5_udp_relay;
-mod socks_handler;
 mod stream_reader;
 mod sync_adapter;
 mod tcp;
 mod thread_util;
 mod tls_client_handler;
+mod tls_hello;
 mod tls_server_handler;
-mod trojan_handler;
-mod tuic_server;
 #[cfg(unix)]
 mod tun;
-mod udp_fragments;
-mod udp_message_stream;
 mod uot;
 mod util;
 mod uuid_util;
 mod vless;
-mod vmess;
-mod websocket;
 mod xudp;
 
 #[cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))]
@@ -65,8 +47,6 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 use std::path::Path;
 
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-use base64::engine::{Engine as _, general_purpose::STANDARD};
 use log::debug;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tcp_server::start_servers;
@@ -74,7 +54,6 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::{Receiver, channel};
 
 use crate::reality::generate_keypair;
-use crate::shadowsocks::ShadowsocksCipher;
 use crate::thread_util::set_num_threads;
 use tcp::*;
 
@@ -116,7 +95,6 @@ fn print_usage_and_exit(arg0: String) {
     eprintln!(
         "    global_limits.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
     );
-    eprintln!("    QUIC connections disconnect immediately on reload.");
     eprintln!("    -V, --version        Print version information and exit");
     eprintln!();
     eprintln!("RESOURCE LIMITS:");
@@ -129,9 +107,8 @@ fn print_usage_and_exit(arg0: String) {
     eprintln!(
         "    generate-reality-keypair                       Generate a new Reality X25519 keypair"
     );
-    eprintln!("    generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password");
     eprintln!(
-        "    generate-vless-user-id                         Generate a random VLESS/VMESS user ID (UUID v4)"
+        "    generate-vless-user-id                         Generate a random VLESS user ID (UUID v4)"
     );
     std::process::exit(1);
 }
@@ -218,69 +195,12 @@ fn main() {
         return;
     }
 
-    if let Some(pos) = args
-        .iter()
-        .position(|s| s == "generate-shadowsocks-2022-password")
-    {
-        let cipher = args.get(pos + 1).map(|s| s.as_str());
-        match cipher {
-            Some(c) => {
-                // Strip 2022-blake3- prefix if present for cipher lookup
-                let base_cipher = match c.strip_prefix("2022-blake3-") {
-                    Some(b) => b,
-                    None => {
-                        eprintln!(
-                            "Password generation is only necessary for shadowsocks 2022 ciphers."
-                        );
-                        std::process::exit(1);
-                    }
-                };
-                match ShadowsocksCipher::try_from(base_cipher) {
-                    Ok(cipher) => {
-                        let rng = SystemRandom::new();
-                        let mut key_bytes = vec![0u8; cipher.key_len()];
-                        rng.fill(&mut key_bytes).expect("RNG failed");
-                        let password = STANDARD.encode(&key_bytes);
-                        println!(
-                            "--------------------------------------------------------------------------------"
-                        );
-                        println!("Cipher: {}", c);
-                        println!("Password: {}", password);
-                        println!(
-                            "--------------------------------------------------------------------------------"
-                        );
-                    }
-                    Err(_) => {
-                        eprintln!("Unknown cipher: {}", c);
-                        eprintln!("Supported shadowsocks 2022 ciphers:");
-                        eprintln!("  2022-blake3-aes-128-gcm");
-                        eprintln!("  2022-blake3-aes-256-gcm");
-                        eprintln!("  2022-blake3-chacha20-poly1305");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            None => {
-                eprintln!(
-                    "Usage: {} generate-shadowsocks-2022-password <cipher>",
-                    arg0
-                );
-                eprintln!("Supported shadowsocks 2022 ciphers:");
-                eprintln!("  2022-blake3-aes-128-gcm");
-                eprintln!("  2022-blake3-aes-256-gcm");
-                eprintln!("  2022-blake3-chacha20-poly1305");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
     if args.iter().any(|s| s == "generate-vless-user-id") {
         let uuid = uuid_util::generate_uuid();
         println!(
             "--------------------------------------------------------------------------------"
         );
-        println!("VLESS/VMESS User ID: {}", uuid);
+        println!("VLESS User ID: {}", uuid);
         println!(
             "--------------------------------------------------------------------------------"
         );
@@ -308,8 +228,7 @@ fn main() {
         println!("Using custom thread count ({num_threads})");
     }
 
-    // Used by QUIC to figure out the number of endpoints.
-    // TODO: can we pass it in instead?
+    // Shared with the library so DNS and socket helpers agree on the thread budget.
     set_num_threads(num_threads);
 
     let mut builder = if num_threads == 1 {

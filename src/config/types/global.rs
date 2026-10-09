@@ -140,7 +140,8 @@ mod tests {
     reload_grace_secs: 0
 - address: '0.0.0.0:1080'
   protocol:
-    type: socks
+    type: vless
+    user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#,
         )
         .unwrap();

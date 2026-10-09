@@ -11,147 +11,46 @@ use super::common::{default_reality_server_short_ids, default_reality_time_diff,
 use super::dns::DnsConfig;
 use super::rules::{ClientChainHop, RuleConfig};
 use super::selection::ConfigSelection;
-use super::shadowsocks::ShadowsocksConfig;
-use super::transport::{BindLocation, ServerQuicConfig, TcpConfig, Transport};
-
-/// AnyTLS user configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AnyTlsUserConfig {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub name: String,
-    pub password: String,
-}
-
-/// NaiveProxy user configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct NaiveUserConfig {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub name: String,
-    pub username: String,
-    pub password: String,
-}
-
-/// NaiveProxy fallback configuration for probe resistance
-///
-/// Must be an absolute path to a directory to serve static files from.
-/// External server fallback (http/https URLs) is no longer supported.
-#[derive(Debug, Clone)]
-pub struct NaiveFallbackConfig(pub std::path::PathBuf);
-
-impl<'de> serde::Deserialize<'de> for NaiveFallbackConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
-
-        let s = String::deserialize(deserializer)?;
-        if s.starts_with('/') {
-            Ok(NaiveFallbackConfig(std::path::PathBuf::from(s)))
-        } else {
-            Err(Error::custom(
-                "Fallback must be an absolute path (starting with '/')",
-            ))
-        }
-    }
-}
-
-impl serde::Serialize for NaiveFallbackConfig {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.0.display().to_string())
-    }
-}
-
-// Forward declarations for client types (used in ShadowTlsRemoteHandshake)
-use super::client::ClientConfig;
-
-/// Custom deserializer for ServerProxyConfig::Shadowsocks
-fn deserialize_shadowsocks_server<'de, D>(
-    deserializer: D,
-) -> Result<(ShadowsocksConfig, bool), D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct ShadowsocksServerTemp {
-        cipher: String,
-        password: String,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-    }
-
-    let temp = ShadowsocksServerTemp::deserialize(deserializer)?;
-    let config =
-        ShadowsocksConfig::from_fields(&temp.cipher, &temp.password).map_err(Error::custom)?;
-
-    Ok((config, temp.udp_enabled))
-}
-
-/// Custom serializer for ServerProxyConfig::Shadowsocks - flattens config fields
-fn serialize_shadowsocks_server<S>(
-    config: &ShadowsocksConfig,
-    udp_enabled: &bool,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::ser::SerializeStruct;
-
-    let mut state = serializer.serialize_struct("Shadowsocks", 3)?;
-    config.serialize_fields(&mut state)?;
-    state.serialize_field("udp_enabled", udp_enabled)?;
-    state.end()
-}
-
-/// Custom deserializer for ServerProxyConfig::Vmess that validates legacy force_aead field
-fn deserialize_vmess_server<'de, D>(deserializer: D) -> Result<(String, String, bool), D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct VmessServerTemp {
-        cipher: String,
-        user_id: String,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-        #[serde(default)]
-        force_aead: Option<bool>,
-    }
-
-    let temp = VmessServerTemp::deserialize(deserializer)?;
-
-    // Check if force_aead was explicitly set
-    if let Some(force_aead_value) = temp.force_aead {
-        if !force_aead_value {
-            return Err(Error::custom(
-                "Non-AEAD VMess mode (force_aead=false) is no longer supported. \
-                 Please remove the force_aead field from your configuration, or set it to true.",
-            ));
-        }
-        // Warn about deprecated field
-        log::warn!(
-            "The 'force_aead' field in VMess server configuration is deprecated and will be removed in a future version. \
-             AEAD mode is now always enabled. Please remove this field from your configuration."
-        );
-    }
-
-    Ok((temp.cipher, temp.user_id, temp.udp_enabled))
-}
+use super::transport::{BindLocation, TcpConfig, Transport};
 
 pub fn direct_allow_rule() -> NoneOrSome<ConfigSelection<RuleConfig>> {
     NoneOrSome::One(ConfigSelection::Config(RuleConfig::default()))
+}
+
+/// Rejects the removed `shadowtls_targets` map in TLS profiles.
+///
+/// ShadowTLS was removed from this build. Without this check a profile that
+/// combines valid `tls_targets` or `reality_targets` with `shadowtls_targets`
+/// would deserialize successfully and silently discard the retired targets.
+fn reject_removed_shadowtls_targets(value: &serde_yaml::Value) -> Result<(), String> {
+    let Some(map) = value.as_mapping() else {
+        return Ok(());
+    };
+    let is_tls = map
+        .get(serde_yaml::Value::String("type".to_string()))
+        .and_then(|tag| tag.as_str())
+        == Some("tls");
+    if is_tls && map.contains_key(serde_yaml::Value::String("shadowtls_targets".to_string())) {
+        return Err(
+            "the `shadowtls_targets` field is not supported: ShadowTLS was removed. \
+             Remove the field from the TLS profile."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Deserializer for `ServerProxyConfig` fields that rejects retired ShadowTLS targets
+/// before the protocol variant is built.
+fn deserialize_server_proxy_config<'de, D>(deserializer: D) -> Result<ServerProxyConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    reject_removed_shadowtls_targets(&value).map_err(Error::custom)?;
+    serde_yaml::from_value(value).map_err(Error::custom)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,8 +66,6 @@ pub struct ServerConfig {
     pub transport: Transport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_settings: Option<TcpConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quic_settings: Option<ServerQuicConfig>,
     #[serde(
         alias = "rule",
         default = "direct_allow_rule",
@@ -200,7 +97,6 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             "protocol",
             "transport",
             "tcp_settings",
-            "quic_settings",
             "rules",
             "rule",
             "dns",
@@ -239,6 +135,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .get("protocol")
             .ok_or_else(|| Error::custom("missing 'protocol' field in server config"))
             .and_then(|v| {
+                reject_removed_shadowtls_targets(v).map_err(Error::custom)?;
                 serde_yaml::from_value(v.clone())
                     .map_err(|e| Error::custom(format!("invalid protocol: {e}")))
             })?;
@@ -258,14 +155,6 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .map(|v| serde_yaml::from_value(v.clone()))
             .transpose()
             .map_err(|e| Error::custom(format!("invalid tcp_settings: {e}")))?;
-
-        // Parse quic_settings (optional, skip if null)
-        let quic_settings: Option<ServerQuicConfig> = map
-            .get("quic_settings")
-            .filter(|v| !v.is_null())
-            .map(|v| serde_yaml::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| Error::custom(format!("invalid quic_settings: {e}")))?;
 
         // Parse rules (optional, with alias "rule", default to direct_allow_rule, skip if null)
         let rules: NoneOrSome<ConfigSelection<RuleConfig>> = map
@@ -290,15 +179,31 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             protocol,
             transport,
             tcp_settings,
-            quic_settings,
             rules,
             dns,
         })
     }
 }
 
+/// Optional rate control for one direction of a transparent REALITY connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackRateLimit {
+    #[serde(default)]
+    pub after_bytes: u64,
+    #[serde(default)]
+    pub bytes_per_sec: u64,
+    /// Zero or omitted uses one second of bytes_per_sec as the bucket capacity.
+    #[serde(default)]
+    pub burst_bytes_per_sec: u64,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RealityServerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_fallback_upload: Option<FallbackRateLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_fallback_download: Option<FallbackRateLimit>,
     /// X25519 private key (32 bytes, base64url encoded)
     pub private_key: String,
 
@@ -333,7 +238,8 @@ pub struct RealityServerConfig {
     /// Reality provides censorship resistance while Vision provides performance optimization.
     #[serde(default)]
     pub vision: bool,
-    /// Inner protocol (VLESS, Trojan, etc.)
+    /// Inner protocol (VLESS)
+    #[serde(deserialize_with = "deserialize_server_proxy_config")]
     pub protocol: ServerProxyConfig,
 
     /// Client chain for connecting to dest server (for fallback connections).
@@ -382,295 +288,16 @@ pub struct TlsServerConfig {
     /// Requires TLS 1.3.
     #[serde(default)]
     pub vision: bool,
+    #[serde(deserialize_with = "deserialize_server_proxy_config")]
     pub protocol: ServerProxyConfig,
 
     #[serde(alias = "override_rule", default)]
     pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ShadowTlsServerConfig {
-    pub password: String,
-    pub handshake: ShadowTlsServerHandshakeConfig,
-    pub protocol: ServerProxyConfig,
-    #[serde(alias = "override_rule", default)]
-    pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ShadowTlsLocalHandshake {
-    pub cert: String,
-    pub key: String,
-    #[serde(
-        alias = "alpn_protocol",
-        default,
-        skip_serializing_if = "NoneOrSome::is_unspecified"
-    )]
-    pub alpn_protocols: NoneOrSome<String>,
-    #[serde(
-        alias = "client_ca_cert",
-        default,
-        skip_serializing_if = "NoneOrSome::is_unspecified"
-    )]
-    pub client_ca_certs: NoneOrSome<String>,
-    #[serde(
-        alias = "client_fingerprint",
-        default,
-        skip_serializing_if = "NoneOrSome::is_unspecified"
-    )]
-    pub client_fingerprints: NoneOrSome<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ShadowTlsRemoteHandshake {
-    pub address: NetLocation,
-    /// Ordered chain of proxy hops for reaching the remote handshake server.
-    /// Guaranteed to be non-empty - if not specified, defaults to a single direct hop.
-    pub client_chain: OneOrSome<ClientChainHop>,
-}
-
-impl<'de> Deserialize<'de> for ShadowTlsRemoteHandshake {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
-
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ShadowTlsRemoteHandshakeTemp {
-            address: NetLocation,
-            /// Legacy field - will be converted to client_chain
-            #[serde(alias = "client_proxy", default)]
-            client_proxies: NoneOrSome<ConfigSelection<ClientConfig>>,
-            /// New field
-            #[serde(default)]
-            client_chain: NoneOrSome<ClientChainHop>,
-        }
-
-        let temp = ShadowTlsRemoteHandshakeTemp::deserialize(deserializer)?;
-
-        // Check for conflicting fields
-        let has_client_proxies = !temp.client_proxies.is_empty();
-        let has_client_chain = !temp.client_chain.is_empty();
-
-        if has_client_proxies && has_client_chain {
-            return Err(D::Error::custom(
-                "cannot specify both 'client_proxies' and 'client_chain' in ShadowTLS remote handshake. \
-                 'client_proxies' is deprecated - please use 'client_chain' instead.",
-            ));
-        }
-
-        // Convert client_proxies to client_chain if present
-        let client_chain: OneOrSome<ClientChainHop> = if has_client_proxies {
-            log::warn!(
-                "The 'client_proxies' field in ShadowTLS remote handshake is deprecated and will be removed in a future version. \
-                 Please use 'client_chain' instead. Your config will continue to work, but consider updating it."
-            );
-
-            // Convert to client_chain format:
-            // - Single proxy -> Single hop
-            // - Multiple proxies -> Pool hop
-            let proxy_list = temp.client_proxies.into_vec();
-            if proxy_list.len() == 1 {
-                let selection = proxy_list.into_iter().next().unwrap();
-                OneOrSome::One(ClientChainHop::Single(selection))
-            } else {
-                // Multiple client_proxies entries mean a pool
-                let selections: Vec<ConfigSelection<ClientConfig>> = proxy_list;
-                OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(selections)))
-            }
-        } else if has_client_chain {
-            // client_chain specified - convert NoneOrSome to OneOrSome
-            let hops = temp.client_chain.into_vec();
-            if hops.len() == 1 {
-                OneOrSome::One(hops.into_iter().next().unwrap())
-            } else {
-                OneOrSome::Some(hops)
-            }
-        } else {
-            // Default: single direct hop
-            OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                ClientConfig::default(),
-            )))
-        };
-
-        Ok(ShadowTlsRemoteHandshake {
-            address: temp.address,
-            client_chain,
-        })
-    }
-}
-
-impl Serialize for ShadowTlsRemoteHandshake {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeMap;
-
-        let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("address", &self.address)?;
-        map.serialize_entry("client_chain", &self.client_chain)?;
-        map.end()
-    }
-}
-
-#[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
-pub enum ShadowTlsServerHandshakeConfig {
-    // Do the handshake locally with the provided TLS config.
-    // This does not require a remote server, but for most clients,
-    // the provided certificate must be signed by a trusted CA.
-    Local(ShadowTlsLocalHandshake),
-    Remote(ShadowTlsRemoteHandshake),
-}
-
-impl<'de> serde::de::Deserialize<'de> for ShadowTlsServerHandshakeConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        use serde::de::Error;
-        use serde_yaml::Value;
-
-        // First deserialize to a generic Value to inspect the structure
-        let value = Value::deserialize(deserializer)?;
-
-        // Check if it's a mapping (as it should be)
-        let map = value.as_mapping().ok_or_else(|| {
-            Error::custom("Expected a YAML mapping for ShadowTLS handshake config")
-        })?;
-
-        // Look for discriminating fields
-        let has_cert = map.contains_key(Value::String("cert".to_string()));
-        let has_key = map.contains_key(Value::String("key".to_string()));
-        let has_address = map.contains_key(Value::String("address".to_string()));
-
-        if has_cert || has_key {
-            // This is a Local handshake config
-            let handshake: ShadowTlsLocalHandshake =
-                serde_yaml::from_value(value).map_err(|e| {
-                    Error::custom(format!(
-                        "Failed to parse local ShadowTLS handshake config: {e}. \
-                    Local handshake requires 'cert' and 'key' fields, with optional \
-                    'alpn_protocols', 'client_ca_certs', and 'client_fingerprints'"
-                    ))
-                })?;
-
-            Ok(ShadowTlsServerHandshakeConfig::Local(handshake))
-        } else if has_address {
-            // This is a Remote handshake config
-            let handshake: ShadowTlsRemoteHandshake =
-                serde_yaml::from_value(value).map_err(|e| {
-                    Error::custom(format!(
-                        "Failed to parse remote ShadowTLS handshake config: {e}. \
-                    Remote handshake requires 'address' field, with optional 'client_chain'"
-                    ))
-                })?;
-
-            Ok(ShadowTlsServerHandshakeConfig::Remote(handshake))
-        } else {
-            // Provide a helpful error message
-            let found_fields: Vec<String> = map
-                .keys()
-                .filter_map(|k| k.as_str().map(|s| s.to_string()))
-                .collect();
-
-            Err(Error::custom(format!(
-                "Unable to determine ShadowTLS handshake type. Found fields: {found_fields:?}. Expected one of:\n\
-                - Local handshake: must have 'cert' and 'key' fields\n\
-                - Remote handshake: must have 'address' field"
-            )))
-        }
-    }
-}
-
-impl serde::ser::Serialize for ShadowTlsServerHandshakeConfig {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        match self {
-            ShadowTlsServerHandshakeConfig::Local(handshake) => handshake.serialize(serializer),
-            ShadowTlsServerHandshakeConfig::Remote(handshake) => handshake.serialize(serializer),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WebsocketServerConfig {
-    #[serde(default)]
-    pub matching_path: Option<String>,
-    #[serde(default)]
-    pub matching_headers: Option<HashMap<String, String>>,
-    pub protocol: ServerProxyConfig,
-    #[serde(default)]
-    pub ping_type: WebsocketPingType,
-
-    #[serde(alias = "override_rule", default)]
-    pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
-}
-
-#[derive(Default, Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum WebsocketPingType {
-    Disabled,
-    // Ping frames are better if the websocket (or a proxy) requires it to stop from timing
-    // out because it causes the remote end to write a pong, which could prevent the connection
-    // from timing out.
-    // However, some clients (e.g. Quantumult-X) can't handle ping frames and disconnects when
-    // one is received, so empty frames can be better for compatibility.
-    #[serde(alias = "ping", alias = "ping-frame")]
-    #[default]
-    PingFrame,
-    #[serde(alias = "empty", alias = "empty-frame")]
-    EmptyFrame,
-}
-
-impl WebsocketPingType {
-    pub fn is_default(&self) -> bool {
-        matches!(self, WebsocketPingType::PingFrame)
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
-    Http {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
-    },
-    #[serde(alias = "socks5")]
-    Socks {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
-        /// Enable UDP functionality (UDP ASSOCIATE and UDP-over-TCP).
-        /// When false (default), UDP ASSOCIATE returns "command not supported".
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-    },
-    #[serde(
-        alias = "ss",
-        deserialize_with = "deserialize_shadowsocks_server",
-        serialize_with = "serialize_shadowsocks_server"
-    )]
-    Shadowsocks {
-        config: ShadowsocksConfig,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-    },
-    Snell {
-        cipher: String,
-        password: String,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-    },
     Vless {
         user_id: String,
         #[serde(default = "default_true")]
@@ -679,11 +306,6 @@ pub enum ServerProxyConfig {
         /// When set, failed auth attempts are proxied here instead of rejected
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fallback: Option<NetLocation>,
-    },
-    Trojan {
-        password: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        shadowsocks: Option<ShadowsocksConfig>,
     },
     Tls {
         // sni_targets is the previous field name
@@ -697,104 +319,20 @@ pub enum ServerProxyConfig {
         )]
         default_tls_target: Option<Box<TlsServerConfig>>,
         #[serde(default)]
-        shadowtls_targets: HashMap<String, ShadowTlsServerConfig>,
-        #[serde(default)]
         reality_targets: HashMap<String, RealityServerConfig>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tls_buffer_size: Option<usize>,
-    },
-    #[serde(deserialize_with = "deserialize_vmess_server")]
-    Vmess {
-        cipher: String,
-        user_id: String,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-    },
-    /// AnyTLS inner protocol handler
-    /// Used as inner protocol within TLS/Reality/etc.
-    Anytls {
-        #[serde(alias = "user")]
-        users: OneOrSome<AnyTlsUserConfig>,
-        #[serde(alias = "padding")]
-        padding_scheme: Option<Vec<String>>,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-        /// Fallback destination for failed authentication (optional)
-        /// When set, failed auth attempts are proxied here instead of rejected
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        fallback: Option<NetLocation>,
-    },
-    #[serde(alias = "ws")]
-    Websocket {
-        #[serde(alias = "target")]
-        targets: Box<OneOrSome<WebsocketServerConfig>>,
-    },
-    #[serde(alias = "forward")]
-    PortForward {
-        #[serde(alias = "target")]
-        targets: OneOrSome<NetLocation>,
-    },
-    Hysteria2 {
-        password: String,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-    },
-    #[serde(alias = "tuic")]
-    TuicV5 {
-        uuid: String,
-        password: String,
-        /// Enable 0-RTT (0.5-RTT for server) handshake for faster connection establishment.
-        /// Default is false for security - 0-RTT data is vulnerable to replay attacks.
-        /// See: https://blog.cloudflare.com/even-faster-connection-establishment-with-quic-0-rtt-resumption/
-        #[serde(default)]
-        zero_rtt_handshake: bool,
-    },
-    /// Mixed HTTP+SOCKS5 server (auto-detects protocol from first byte)
-    /// Similar to mihomo's mixed-port feature.
-    #[serde(alias = "http+socks", alias = "socks+http")]
-    Mixed {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
-        /// Enable UDP functionality for SOCKS5 (UDP ASSOCIATE and UDP-over-TCP)
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-    },
-    /// NaiveProxy server (HTTP/2 CONNECT with padding)
-    /// Should be used within TLS for proper camouflage
-    #[serde(alias = "naive")]
-    Naiveproxy {
-        /// List of authorized users
-        #[serde(alias = "user")]
-        users: OneOrSome<NaiveUserConfig>,
-        /// Enable padding protocol (default: true)
-        #[serde(default = "default_true")]
-        padding: bool,
-        /// Fallback for probe resistance (optional)
-        /// Can be either a URL (http:// or https://) to reverse proxy, or an absolute path to serve files from
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        fallback: Option<NaiveFallbackConfig>,
-        /// Enable UDP-over-TCP (UoT) support (default: true)
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
     },
 }
 
 impl std::fmt::Display for ServerProxyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Http { .. } => write!(f, "HTTP"),
-            Self::Socks { .. } => write!(f, "SOCKS"),
-            Self::Shadowsocks { .. } => write!(f, "Shadowsocks"),
-            Self::Snell { .. } => write!(f, "Snell"),
             Self::Vless { .. } => write!(f, "Vless"),
-            Self::Trojan { .. } => write!(f, "Trojan"),
             Self::Tls {
                 tls_targets,
                 default_tls_target,
-                shadowtls_targets,
                 reality_targets,
                 ..
             } => {
@@ -807,9 +345,6 @@ impl std::fmt::Display for ServerProxyConfig {
                 if !reality_targets.is_empty() {
                     parts.push("REALITY");
                 }
-                if !shadowtls_targets.is_empty() {
-                    parts.push("ShadowTLSv3");
-                }
                 if tls_targets.values().any(|cfg| cfg.vision)
                     || default_tls_target.as_ref().is_some_and(|cfg| cfg.vision)
                     || reality_targets.values().any(|cfg| cfg.vision)
@@ -819,14 +354,6 @@ impl std::fmt::Display for ServerProxyConfig {
 
                 write!(f, "{}", parts.join("+"))
             }
-            Self::Vmess { .. } => write!(f, "Vmess"),
-            Self::Websocket { .. } => write!(f, "Websocket"),
-            Self::PortForward { .. } => write!(f, "Portforward"),
-            Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
-            Self::TuicV5 { .. } => write!(f, "TuicV5"),
-            Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
-            Self::Anytls { .. } => write!(f, "AnyTLS"),
-            Self::Naiveproxy { .. } => write!(f, "NaiveProxy"),
         }
     }
 }
@@ -835,56 +362,14 @@ impl std::fmt::Display for ServerProxyConfig {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    use std::path::PathBuf;
 
-    fn create_test_server_config_http() -> ServerConfig {
-        ServerConfig {
-            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
-                .into(),
-            protocol: ServerProxyConfig::Http {
-                username: Some("user".to_string()),
-                password: Some("pass".to_string()),
-            },
-            transport: Transport::Tcp,
-            tcp_settings: Some(TcpConfig { no_delay: true }),
-            quic_settings: None,
-            rules: NoneOrSome::None,
-            dns: None,
-        }
-    }
+    const TEST_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
-    fn create_test_server_config_socks() -> ServerConfig {
-        ServerConfig {
-            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1080)
-                .into(),
-            protocol: ServerProxyConfig::Socks {
-                username: None,
-                password: None,
-                udp_enabled: false,
-            },
-            transport: Transport::Tcp,
-            tcp_settings: None,
-            quic_settings: None,
-            rules: NoneOrSome::None,
-            dns: None,
-        }
-    }
-
-    fn create_test_server_config_shadowsocks() -> ServerConfig {
-        ServerConfig {
-            bind_location: BindLocation::Path(PathBuf::from("/tmp/ss.sock")),
-            protocol: ServerProxyConfig::Shadowsocks {
-                config: ShadowsocksConfig::Legacy {
-                    cipher: "aes-256-gcm".try_into().unwrap(),
-                    password: "secret123".to_string(),
-                },
-                udp_enabled: true,
-            },
-            transport: Transport::Tcp,
-            tcp_settings: None,
-            quic_settings: None,
-            rules: NoneOrSome::None,
-            dns: None,
+    fn vless_protocol() -> ServerProxyConfig {
+        ServerProxyConfig::Vless {
+            user_id: TEST_UUID.to_string(),
+            udp_enabled: true,
+            fallback: None,
         }
     }
 
@@ -895,43 +380,9 @@ mod tests {
                 443,
             )
             .into(),
-            protocol: ServerProxyConfig::Vless {
-                user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-                udp_enabled: true,
-                fallback: None,
-            },
-            transport: Transport::Quic,
-            tcp_settings: None,
-            quic_settings: Some(ServerQuicConfig {
-                cert: "server.crt".to_string(),
-                key: "server.key".to_string(),
-                alpn_protocols: NoneOrSome::Some(vec!["h3".to_string()]),
-                client_ca_certs: NoneOrSome::None,
-                client_fingerprints: NoneOrSome::None,
-                num_endpoints: 1,
-            }),
-            rules: NoneOrSome::None,
-            dns: None,
-        }
-    }
-
-    fn create_test_server_config_trojan() -> ServerConfig {
-        ServerConfig {
-            bind_location: NetLocation::from_ip_addr(
-                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
-                443,
-            )
-            .into(),
-            protocol: ServerProxyConfig::Trojan {
-                password: "trojan_password".to_string(),
-                shadowsocks: Some(ShadowsocksConfig::Legacy {
-                    cipher: "chacha20-poly1305".try_into().unwrap(),
-                    password: "ss_password".to_string(),
-                }),
-            },
+            protocol: vless_protocol(),
             transport: Transport::Tcp,
             tcp_settings: None,
-            quic_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -947,11 +398,28 @@ mod tests {
                 alpn_protocols: NoneOrSome::Some(vec!["h2".to_string(), "http/1.1".to_string()]),
                 client_ca_certs: NoneOrSome::One("ca.crt".to_string()),
                 client_fingerprints: NoneOrSome::One("abc123".to_string()),
-                vision: false,
-                protocol: ServerProxyConfig::Http {
-                    username: None,
-                    password: None,
-                },
+                vision: true,
+                protocol: vless_protocol(),
+                override_rules: NoneOrSome::None,
+            },
+        );
+
+        let mut reality_targets = HashMap::new();
+        reality_targets.insert(
+            "www.example.com".to_string(),
+            RealityServerConfig {
+                limit_fallback_upload: None,
+                limit_fallback_download: None,
+                private_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".to_string(),
+                short_ids: OneOrSome::One("0123456789abcdef".to_string()),
+                dest: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443),
+                max_time_diff: None,
+                min_client_version: None,
+                max_client_version: None,
+                cipher_suites: NoneOrSome::None,
+                vision: true,
+                protocol: vless_protocol(),
+                dest_client_chain: NoneOrSome::None,
                 override_rules: NoneOrSome::None,
             },
         );
@@ -968,128 +436,14 @@ mod tests {
                     client_ca_certs: NoneOrSome::None,
                     client_fingerprints: NoneOrSome::None,
                     vision: false,
-                    protocol: ServerProxyConfig::Http {
-                        username: None,
-                        password: None,
-                    },
+                    protocol: vless_protocol(),
                     override_rules: NoneOrSome::None,
                 })),
-                shadowtls_targets: HashMap::new(),
-                reality_targets: HashMap::new(),
+                reality_targets,
                 tls_buffer_size: Some(8192),
             },
             transport: Transport::Tcp,
             tcp_settings: None,
-            quic_settings: None,
-            rules: NoneOrSome::None,
-            dns: None,
-        }
-    }
-
-    fn create_test_server_config_vmess() -> ServerConfig {
-        ServerConfig {
-            bind_location: NetLocation::from_ip_addr(
-                IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
-                10086,
-            )
-            .into(),
-            protocol: ServerProxyConfig::Vmess {
-                cipher: "aes-128-gcm".to_string(),
-                user_id: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
-                udp_enabled: false,
-            },
-            transport: Transport::Tcp,
-            tcp_settings: None,
-            quic_settings: None,
-            rules: NoneOrSome::None,
-            dns: None,
-        }
-    }
-
-    fn create_test_server_config_websocket() -> ServerConfig {
-        ServerConfig {
-            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
-                .into(),
-            protocol: ServerProxyConfig::Websocket {
-                targets: Box::new(OneOrSome::One(WebsocketServerConfig {
-                    matching_path: Some("/ws".to_string()),
-                    matching_headers: None,
-                    protocol: ServerProxyConfig::Http {
-                        username: None,
-                        password: None,
-                    },
-                    ping_type: WebsocketPingType::PingFrame,
-                    override_rules: NoneOrSome::None,
-                })),
-            },
-            transport: Transport::Tcp,
-            tcp_settings: None,
-            quic_settings: None,
-            rules: NoneOrSome::None,
-            dns: None,
-        }
-    }
-
-    fn create_test_server_config_port_forward() -> ServerConfig {
-        ServerConfig {
-            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090)
-                .into(),
-            protocol: ServerProxyConfig::PortForward {
-                targets: OneOrSome::Some(vec![
-                    NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 80),
-                    NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 80),
-                ]),
-            },
-            transport: Transport::Tcp,
-            tcp_settings: None,
-            quic_settings: None,
-            rules: NoneOrSome::None,
-            dns: None,
-        }
-    }
-
-    fn create_test_server_config_hysteria2() -> ServerConfig {
-        ServerConfig {
-            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443)
-                .into(),
-            protocol: ServerProxyConfig::Hysteria2 {
-                password: "hysteria_pass".to_string(),
-                udp_enabled: true,
-            },
-            transport: Transport::Quic,
-            tcp_settings: None,
-            quic_settings: Some(ServerQuicConfig {
-                cert: "hysteria.crt".to_string(),
-                key: "hysteria.key".to_string(),
-                alpn_protocols: NoneOrSome::One("hysteria".to_string()),
-                client_ca_certs: NoneOrSome::None,
-                client_fingerprints: NoneOrSome::None,
-                num_endpoints: 1,
-            }),
-            rules: NoneOrSome::None,
-            dns: None,
-        }
-    }
-
-    fn create_test_server_config_tuic() -> ServerConfig {
-        ServerConfig {
-            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8443)
-                .into(),
-            protocol: ServerProxyConfig::TuicV5 {
-                uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-                password: "tuic_password".to_string(),
-                zero_rtt_handshake: false,
-            },
-            transport: Transport::Quic,
-            tcp_settings: None,
-            quic_settings: Some(ServerQuicConfig {
-                cert: "tuic.crt".to_string(),
-                key: "tuic.key".to_string(),
-                alpn_protocols: NoneOrSome::None,
-                client_ca_certs: NoneOrSome::None,
-                client_fingerprints: NoneOrSome::None,
-                num_endpoints: 1,
-            }),
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1097,41 +451,59 @@ mod tests {
 
     // Test individual server config variants
     #[test]
-    fn test_server_config_http() {
-        let original = create_test_server_config_http();
-        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        println!("HTTP config YAML:\n{yaml_str}");
-        let deserialized: ServerConfig =
-            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
-        assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::Http { .. }
-        ));
-    }
-
-    #[test]
-    fn test_server_config_socks() {
-        let original = create_test_server_config_socks();
-        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        let deserialized: ServerConfig =
-            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
-        assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::Socks { .. }
-        ));
-    }
-
-    #[test]
-    fn test_server_config_shadowsocks() {
-        let original = create_test_server_config_shadowsocks();
-        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        println!("Shadowsocks YAML: {yaml_str}");
-        let deserialized: ServerConfig =
-            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
-        assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::Shadowsocks { .. }
-        ));
+    fn fallback_rate_limit_round_trip_and_invalid_fields() {
+        let yaml = "after_bytes: 18446744073709551615\nbytes_per_sec: 4\nburst_bytes_per_sec: 2\n";
+        let limit: FallbackRateLimit = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(limit.after_bytes, u64::MAX);
+        assert_eq!(
+            serde_yaml::from_str::<FallbackRateLimit>(&serde_yaml::to_string(&limit).unwrap())
+                .unwrap(),
+            limit
+        );
+        assert_eq!(
+            serde_yaml::from_str::<FallbackRateLimit>("{}").unwrap(),
+            FallbackRateLimit::default()
+        );
+        for invalid in [
+            "bytes_per_sec: -1",
+            "bytes_per_sec: 1.5",
+            "bytes_per_sec: nope",
+            "after_bytes: 18446744073709551616",
+            "burst_bytes_per_sec: -1",
+            "bytes_per_second: 1",
+        ] {
+            assert!(
+                serde_yaml::from_str::<FallbackRateLimit>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        let mut server = create_test_server_config_tls();
+        let ServerProxyConfig::Tls {
+            ref mut reality_targets,
+            ..
+        } = server.protocol
+        else {
+            panic!()
+        };
+        let target = reality_targets.get_mut("www.example.com").unwrap();
+        target.limit_fallback_upload = Some(limit);
+        target.limit_fallback_download = Some(FallbackRateLimit::default());
+        let decoded: ServerConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&server).unwrap()).unwrap();
+        let ServerProxyConfig::Tls {
+            reality_targets, ..
+        } = decoded.protocol
+        else {
+            panic!()
+        };
+        assert_eq!(
+            reality_targets["www.example.com"].limit_fallback_upload,
+            Some(limit)
+        );
+        assert_eq!(
+            reality_targets["www.example.com"].limit_fallback_download,
+            Some(FallbackRateLimit::default())
+        );
     }
 
     #[test]
@@ -1147,87 +519,199 @@ mod tests {
     }
 
     #[test]
-    fn test_server_config_trojan() {
-        let original = create_test_server_config_trojan();
-        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        let deserialized: ServerConfig =
-            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
-        assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::Trojan { .. }
-        ));
-    }
-
-    #[test]
-    fn test_server_config_tls() {
+    fn test_server_config_tls_with_reality_and_vision() {
         let original = create_test_server_config_tls();
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
         let deserialized: ServerConfig =
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
+        let ServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            reality_targets,
+            tls_buffer_size,
+        } = deserialized.protocol
+        else {
+            panic!("expected TLS protocol");
+        };
+        assert!(tls_targets.contains_key("example.com"));
+        assert!(tls_targets["example.com"].vision);
         assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::Tls { .. }
+            tls_targets["example.com"].protocol,
+            ServerProxyConfig::Vless { .. }
         ));
+        assert!(default_tls_target.is_some());
+        assert!(reality_targets.contains_key("www.example.com"));
+        assert!(reality_targets["www.example.com"].vision);
+        assert_eq!(tls_buffer_size, Some(8192));
     }
 
     #[test]
-    fn test_server_config_vmess() {
-        let original = create_test_server_config_vmess();
-        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        let deserialized: ServerConfig =
-            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
-        assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::Vmess { .. }
-        ));
+    fn test_rejects_retired_protocol_types() {
+        for protocol_type in [
+            "http",
+            "socks",
+            "socks5",
+            "shadowsocks",
+            "ss",
+            "snell",
+            "trojan",
+            "vmess",
+            "websocket",
+            "ws",
+            "portforward",
+            "forward",
+            "hysteria2",
+            "tuic",
+            "mixed",
+            "http+socks",
+            "anytls",
+            "naiveproxy",
+            "naive",
+            "shadowtls",
+        ] {
+            let yaml = format!("address: \"127.0.0.1:8080\"\nprotocol:\n  type: {protocol_type}\n");
+            let result: Result<ServerConfig, _> = serde_yaml::from_str(&yaml);
+            let err = result
+                .expect_err(&format!(
+                    "retired protocol {protocol_type} must be rejected"
+                ))
+                .to_string();
+            assert!(
+                err.contains("unknown variant"),
+                "error for {protocol_type} should name the unknown variant, got: {err}"
+            );
+        }
     }
 
     #[test]
-    fn test_server_config_websocket() {
-        let original = create_test_server_config_websocket();
-        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        let deserialized: ServerConfig =
-            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
-        assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::Websocket { .. }
-        ));
+    fn test_rejects_removed_shadowtls_targets_mixed_with_retained_targets() {
+        let mixed_tls = r#"
+address: "127.0.0.1:8443"
+protocol:
+  type: tls
+  tls_targets:
+    "example.com":
+      cert: "example.crt"
+      key: "example.key"
+      protocol:
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
+  shadowtls_targets:
+    "shadow.example.com":
+      password: "secret"
+      handshake:
+        address: "example.com:443"
+      protocol:
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
+"#;
+        let err = serde_yaml::from_str::<ServerConfig>(mixed_tls)
+            .expect_err("TLS profile with shadowtls_targets must be rejected")
+            .to_string();
+        assert!(
+            err.contains("shadowtls_targets"),
+            "error should name the removed field: {err}"
+        );
+
+        let mixed_reality = r#"
+address: "127.0.0.1:8443"
+protocol:
+  type: tls
+  reality_targets:
+    "www.example.com":
+      private_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+      dest: "www.example.com:443"
+      protocol:
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
+  shadowtls_targets: {}
+"#;
+        let err = serde_yaml::from_str::<ServerConfig>(mixed_reality)
+            .expect_err("REALITY profile with shadowtls_targets must be rejected")
+            .to_string();
+        assert!(
+            err.contains("shadowtls_targets"),
+            "error should name the removed field: {err}"
+        );
+
+        // Retained aliases and profiles without the removed field still parse.
+        let retained = r#"
+address: "127.0.0.1:8443"
+protocol:
+  type: tls
+  sni_targets:
+    "example.com":
+      cert: "example.crt"
+      key: "example.key"
+      protocol:
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
+"#;
+        let config: ServerConfig =
+            serde_yaml::from_str(retained).expect("retained TLS profile must parse");
+        assert!(matches!(config.protocol, ServerProxyConfig::Tls { .. }));
     }
 
     #[test]
-    fn test_server_config_port_forward() {
-        let original = create_test_server_config_port_forward();
-        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        let deserialized: ServerConfig =
-            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
-        assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::PortForward { .. }
-        ));
+    fn test_rejects_nested_shadowtls_targets_in_retained_profile() {
+        let nested = r#"
+address: "127.0.0.1:8443"
+protocol:
+  type: tls
+  tls_targets:
+    "outer.example.com":
+      cert: "outer.crt"
+      key: "outer.key"
+      protocol:
+        type: tls
+        tls_targets:
+          "inner.example.com":
+            cert: "inner.crt"
+            key: "inner.key"
+            protocol:
+              type: vless
+              user_id: "550e8400-e29b-41d4-a716-446655440000"
+        shadowtls_targets: {}
+"#;
+        let err = serde_yaml::from_str::<ServerConfig>(nested)
+            .expect_err("nested TLS profile with shadowtls_targets must be rejected")
+            .to_string();
+        assert!(
+            err.contains("shadowtls_targets"),
+            "error should name the removed field: {err}"
+        );
     }
 
     #[test]
-    fn test_server_config_hysteria2() {
-        let original = create_test_server_config_hysteria2();
-        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        let deserialized: ServerConfig =
-            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
-        assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::Hysteria2 { .. }
-        ));
-    }
+    fn test_rejects_quic_transport_and_quic_settings() {
+        let yaml = r#"
+address: "127.0.0.1:8080"
+transport: quic
+protocol:
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
+"#;
+        let err = serde_yaml::from_str::<ServerConfig>(yaml)
+            .expect_err("quic transport must be rejected")
+            .to_string();
+        assert!(err.contains("quic"), "error should name quic: {err}");
 
-    #[test]
-    fn test_server_config_tuic() {
-        let original = create_test_server_config_tuic();
-        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        let deserialized: ServerConfig =
-            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
-        assert!(matches!(
-            deserialized.protocol,
-            ServerProxyConfig::TuicV5 { .. }
-        ));
+        let yaml = r#"
+address: "127.0.0.1:8080"
+quic_settings:
+  cert: "server.crt"
+  key: "server.key"
+protocol:
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
+"#;
+        let err = serde_yaml::from_str::<ServerConfig>(yaml)
+            .expect_err("quic_settings must be rejected")
+            .to_string();
+        assert!(
+            err.contains("quic_settings"),
+            "error should name the unknown field: {err}"
+        );
     }
 
     #[test]
@@ -1235,12 +719,13 @@ mod tests {
         let yaml = r#"
 address: "127.0.0.1:8080"
 protocol:
-  type: http
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 upstream:
   address: "127.0.0.1:443"
   protocol:
     type: vless
-    user_id: "test-uuid"
+    user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#;
 
         let result: Result<ServerConfig, _> = serde_yaml::from_str(yaml);
@@ -1260,7 +745,7 @@ upstream:
         let yaml = r#"
 address: "127.0.0.1:8080"
 protocl:
-  type: http
+  type: vless
 "#;
 
         let result: Result<ServerConfig, _> = serde_yaml::from_str(yaml);
@@ -1277,7 +762,8 @@ protocl:
         let yaml = r#"
 address: "127.0.0.1:8080"
 protocol:
-  type: http
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 rules:
   - mask: 0.0.0.0/0
     action: allow
@@ -1296,7 +782,8 @@ rules:
         let yaml = r#"
 address: "127.0.0.1:8080"
 protocol:
-  type: http
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#;
 
         let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
@@ -1321,7 +808,8 @@ address:
   - "127.0.0.1:22223"
   - "172.17.0.1:22223-22225"
 protocol:
-  type: http
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#;
 
         let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
@@ -1355,7 +843,8 @@ address: "127.0.0.1:8080"
 addresses:
   - "172.17.0.1:8080"
 protocol:
-  type: http
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#;
 
         let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
@@ -1367,7 +856,8 @@ protocol:
         let yaml = r#"
 address: []
 protocol:
-  type: http
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#;
 
         assert!(serde_yaml::from_str::<ServerConfig>(yaml).is_err());
@@ -1378,7 +868,8 @@ protocol:
         let yaml = r#"
 address: "127.0.0.1:8080"
 protocol:
-  type: http
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 transport: tcp
 tcp_settings:
   no_delay: true
@@ -1396,292 +887,26 @@ rules:
     }
 
     #[test]
-    fn test_rejects_unknown_field_in_vmess_server() {
+    fn test_vless_fallback_profile_parses() {
         let yaml = r#"
 address: "127.0.0.1:8080"
 protocol:
-  type: vmess
-  cipher: aes-128-gcm
-  user_id: "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4"
-  typo_field: "should fail"
-"#;
-        let result: Result<ServerConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field `typo_field`"),
-            "Error should mention unknown field: {err}"
-        );
-    }
-
-    // Note: This test was for reject unknown fields in Shadowsocks config.
-    // After adding udp_enabled with #[serde(flatten)] for ShadowsocksConfig,
-    // serde can no longer enforce deny_unknown_fields due to a serde limitation.
-    // See: https://github.com/serde-rs/serde/issues/1547
-    //
-    // The test is kept here but modified to verify that the known fields work correctly.
-    #[test]
-    fn test_shadowsocks_with_udp_enabled() {
-        let yaml = r#"
-address: "127.0.0.1:8080"
-protocol:
-  type: shadowsocks
-  cipher: aes-256-gcm
-  password: "secret"
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
   udp_enabled: false
+  fallback: "whatsapp.net:443"
 "#;
-        let result: Result<ServerConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_ok(), "Valid Shadowsocks config should parse");
-        let config = result.unwrap();
-        if let ServerProxyConfig::Shadowsocks { udp_enabled, .. } = config.protocol {
-            assert!(!udp_enabled, "udp_enabled should be false");
-        } else {
-            panic!("Expected Shadowsocks protocol");
-        }
-    }
 
-    #[test]
-    fn test_shadowtls_handshake_serialization() {
-        // Test local handshake with minimal fields
-        let local = ShadowTlsLocalHandshake {
-            cert: "server.crt".to_string(),
-            key: "server.key".to_string(),
-            alpn_protocols: NoneOrSome::Unspecified,
-            client_ca_certs: NoneOrSome::Unspecified,
-            client_fingerprints: NoneOrSome::Unspecified,
+        let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let ServerProxyConfig::Vless {
+            udp_enabled,
+            fallback,
+            ..
+        } = config.protocol
+        else {
+            panic!("expected VLESS protocol");
         };
-
-        let yaml = serde_yaml::to_string(&local).unwrap();
-        println!("Local handshake (minimal):\n{yaml}");
-
-        // Should only contain cert and key
-        assert!(yaml.contains("cert:"));
-        assert!(yaml.contains("key:"));
-        assert!(!yaml.contains("alpn_protocols:"));
-        assert!(!yaml.contains("client_ca_certs:"));
-        assert!(!yaml.contains("client_fingerprints:"));
-
-        // Test remote handshake
-        let remote = ShadowTlsRemoteHandshake {
-            address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443),
-            client_chain: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                super::super::client::ClientConfig::default(),
-            ))),
-        };
-
-        let yaml = serde_yaml::to_string(&remote).unwrap();
-        println!("Remote handshake (minimal):\n{yaml}");
-
-        // Should contain address and client_chain
-        assert!(yaml.contains("address:"));
-        assert!(yaml.contains("client_chain:"));
-    }
-
-    #[test]
-    fn test_shadowtls_handshake_error_messages() {
-        // Test invalid handshake config with cert but missing key
-        let invalid_missing_key = r#"
-cert: "server.crt"
-"#;
-
-        let result: Result<ShadowTlsServerHandshakeConfig, _> =
-            serde_yaml::from_str(invalid_missing_key);
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        println!("Error for missing key: {error_msg}");
-        assert!(error_msg.contains("Failed to parse local ShadowTLS handshake config"));
-        assert!(error_msg.contains("missing field `key`"));
-        assert!(error_msg.contains("Local handshake requires 'cert' and 'key' fields"));
-
-        // Test invalid handshake config with mixed fields (cert + address)
-        let invalid_mixed = r#"
-cert: "server.crt"
-address: "example.com:443"
-"#;
-
-        let result: Result<ShadowTlsServerHandshakeConfig, _> = serde_yaml::from_str(invalid_mixed);
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        println!("Error for mixed handshake fields: {error_msg}");
-        // Since it has cert, it will try to parse as Local and reject the unknown 'address' field
-        assert!(error_msg.contains("Failed to parse local ShadowTLS handshake config"));
-        assert!(error_msg.contains("unknown field `address`"));
-
-        // Test invalid handshake with unknown fields only
-        let invalid_unknown = r#"
-unknown_field: "value"
-another_field: 123
-"#;
-
-        let result: Result<ShadowTlsServerHandshakeConfig, _> =
-            serde_yaml::from_str(invalid_unknown);
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        println!("Error for unknown handshake fields: {error_msg}");
-        assert!(error_msg.contains("Unable to determine ShadowTLS handshake type"));
-        assert!(error_msg.contains("Found fields:"));
-        assert!(error_msg.contains("unknown_field"));
-        assert!(error_msg.contains("another_field"));
-
-        // Test valid local handshake
-        let valid_local = r#"
-cert: "server.crt"
-key: "server.key"
-"#;
-
-        let result: Result<ShadowTlsServerHandshakeConfig, _> = serde_yaml::from_str(valid_local);
-        assert!(result.is_ok());
-        assert!(matches!(
-            result.unwrap(),
-            ShadowTlsServerHandshakeConfig::Local(_)
-        ));
-
-        // Test valid remote handshake
-        let valid_remote = r#"
-address: "example.com:443"
-"#;
-
-        let result: Result<ShadowTlsServerHandshakeConfig, _> = serde_yaml::from_str(valid_remote);
-        assert!(result.is_ok());
-        assert!(matches!(
-            result.unwrap(),
-            ShadowTlsServerHandshakeConfig::Remote(_)
-        ));
-
-        // Test invalid remote with missing address value
-        let invalid_remote_syntax = r#"
-address:
-"#;
-
-        let result: Result<ShadowTlsServerHandshakeConfig, _> =
-            serde_yaml::from_str(invalid_remote_syntax);
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        println!("Error for invalid remote syntax: {error_msg}");
-        // This will generate a parse error for NetLocation
-        assert!(error_msg.contains("Failed to parse remote ShadowTLS handshake config"));
-    }
-
-    #[test]
-    fn test_rejects_unknown_field_in_shadowtls_local_handshake() {
-        // Test ShadowTlsServerHandshakeConfig directly
-        let yaml = r#"
-cert: "server.crt"
-key: "server.key"
-bad_option: "value"
-"#;
-        let result: Result<ShadowTlsServerHandshakeConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field `bad_option`"),
-            "Error should mention unknown field: {err}"
-        );
-    }
-
-    #[test]
-    fn test_rejects_unknown_field_in_shadowtls_remote_handshake() {
-        // Test ShadowTlsServerHandshakeConfig directly
-        let yaml = r#"
-address: "example.com:443"
-misspelled: true
-"#;
-        let result: Result<ShadowTlsServerHandshakeConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown field `misspelled`"),
-            "Error should mention unknown field: {err}"
-        );
-    }
-
-    #[test]
-    fn test_shadowtls_remote_handshake_defaults_to_direct() {
-        // When no client_chain or client_proxies is specified, should default to direct
-        let yaml = r#"
-address: "example.com:443"
-"#;
-        let result: Result<ShadowTlsRemoteHandshake, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_ok(), "Should parse: {:?}", result.err());
-        let handshake = result.unwrap();
-        assert_eq!(handshake.client_chain.len(), 1);
-        // Check it's a direct config
-        if let super::super::rules::ClientChainHop::Single(
-            super::super::selection::ConfigSelection::Config(config),
-        ) = handshake.client_chain.iter().next().unwrap()
-        {
-            assert!(config.protocol.is_direct());
-        } else {
-            panic!("Expected Single hop with direct Config");
-        }
-    }
-
-    #[test]
-    fn test_shadowtls_remote_handshake_with_client_chain() {
-        let yaml = r#"
-address: "example.com:443"
-client_chain:
-  - address: "proxy.example.com:1080"
-    protocol:
-      type: socks
-"#;
-        let result: Result<ShadowTlsRemoteHandshake, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_ok(), "Should parse: {:?}", result.err());
-        let handshake = result.unwrap();
-        assert_eq!(handshake.client_chain.len(), 1);
-    }
-
-    #[test]
-    fn test_shadowtls_remote_handshake_with_deprecated_client_proxies() {
-        // Should still work with deprecated client_proxies field
-        let yaml = r#"
-address: "example.com:443"
-client_proxies:
-  - address: "proxy.example.com:1080"
-    protocol:
-      type: socks
-"#;
-        let result: Result<ShadowTlsRemoteHandshake, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_ok(), "Should parse: {:?}", result.err());
-        let handshake = result.unwrap();
-        assert_eq!(handshake.client_chain.len(), 1);
-    }
-
-    #[test]
-    fn test_shadowtls_remote_handshake_rejects_both_client_proxies_and_chain() {
-        let yaml = r#"
-address: "example.com:443"
-client_proxies:
-  - address: "proxy1.example.com:1080"
-    protocol:
-      type: socks
-client_chain:
-  - address: "proxy2.example.com:1080"
-    protocol:
-      type: socks
-"#;
-        let result: Result<ShadowTlsRemoteHandshake, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("cannot specify both"),
-            "Error should mention cannot specify both: {err}"
-        );
-    }
-
-    #[test]
-    fn test_shadowtls_remote_handshake_serialization_roundtrip() {
-        let yaml = r#"
-address: "example.com:443"
-client_chain:
-  - address: "proxy.example.com:1080"
-    protocol:
-      type: socks
-"#;
-        let original: ShadowTlsRemoteHandshake = serde_yaml::from_str(yaml).unwrap();
-        let serialized = serde_yaml::to_string(&original).unwrap();
-        println!("Serialized:\n{serialized}");
-        let deserialized: ShadowTlsRemoteHandshake = serde_yaml::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.client_chain.len(), original.client_chain.len());
+        assert!(!udp_enabled);
+        assert_eq!(fallback.unwrap().to_string(), "whatsapp.net:443");
     }
 }

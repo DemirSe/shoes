@@ -45,6 +45,7 @@ impl<T> NoneOrSome<T> {
         matches!(self, NoneOrSome::Unspecified)
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         match self {
             NoneOrSome::Unspecified => 0,

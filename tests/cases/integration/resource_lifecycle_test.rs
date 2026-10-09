@@ -1,14 +1,17 @@
 use std::io::{self, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use shoes_test_support::port_helper::PortHelper;
-use shoes_test_support::socks5::Socks5UdpAssociation;
 use shoes_test_support::test_fixture::ProcessGuard;
 use shoes_test_support::test_servers::start_tcp_stream_echo_server;
+use shoes_test_support::vless::{VlessDestination, VlessUdpClient, parse_uuid};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
+
+const VLESS_UUID: &str = "8f1a1b2c-3d4e-4f50-8192-a3b4c5d6e7f8";
 
 fn start_process(
     config: &str,
@@ -43,6 +46,34 @@ fn start_process_with_limits(
     Ok((ProcessGuard::new(child, "lifecycle-shoes"), file, pid))
 }
 
+/// Open a VLESS TCP connection to `destination` through the server on `port`.
+async fn vless_tcp_connect(port: u16, destination: SocketAddr) -> io::Result<TcpStream> {
+    let uuid = parse_uuid(VLESS_UUID)?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    let mut request = Vec::with_capacity(22);
+    request.push(0); // version
+    request.extend_from_slice(&uuid);
+    request.push(0); // addon length
+    request.push(1); // command: TCP CONNECT
+    request.extend_from_slice(&destination.port().to_be_bytes());
+    match destination.ip() {
+        IpAddr::V4(v4) => {
+            request.push(1);
+            request.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            request.push(3);
+            request.extend_from_slice(&v6.octets());
+        }
+    }
+    stream.write_all(&request).await?;
+    // Consume the VLESS response header: version byte and addon length.
+    let mut response_header = [0u8; 2];
+    stream.read_exact(&mut response_header).await?;
+    assert_eq!(response_header, [0, 0]);
+    Ok(stream)
+}
+
 async fn round_trip(stream: &mut TcpStream, message: &[u8]) -> io::Result<()> {
     timeout(Duration::from_secs(2), async {
         stream.write_all(message).await?;
@@ -54,24 +85,31 @@ async fn round_trip(stream: &mut TcpStream, message: &[u8]) -> io::Result<()> {
     .await?
 }
 
+fn vless_server_config(proxy_port: u16) -> String {
+    format!(
+        r#"- address: '0.0.0.0:{proxy_port}'
+  protocol:
+    type: vless
+    user_id: "{VLESS_UUID}"
+"#
+    )
+}
+
 #[tokio::test]
 async fn default_admission_exceeds_previous_connection_and_stream_caps() -> io::Result<()> {
     let mut ports = PortHelper::new();
     let (_, proxy_port) = ports.get_localhost_listener_port();
     let (_, echo_port) = ports.get_localhost_listener_port();
     let _echo = start_tcp_stream_echo_server("0.0.0.0", echo_port).await?;
-    let config = format!(
-        r#"- address: '0.0.0.0:{proxy_port}'
-  protocol:
-    type: forward
-    target: '127.0.0.1:{echo_port}'
-"#
-    );
+    let config = vless_server_config(proxy_port);
     let (_process, _config, _) = start_process(&config, false)?;
     ports.wait_for_all_ports().await?;
+    let destination: SocketAddr = format!("127.0.0.1:{echo_port}")
+        .parse()
+        .map_err(io::Error::other)?;
     let mut connections = Vec::new();
     for _ in 0..520 {
-        let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+        let mut stream = vless_tcp_connect(proxy_port, destination).await?;
         round_trip(&mut stream, b"admitted").await?;
         connections.push(stream);
     }
@@ -86,21 +124,20 @@ async fn yaml_connection_limit_rejects_new_work_without_closing_existing_work() 
     let (_, proxy_port) = ports.get_localhost_listener_port();
     let (_, echo_port) = ports.get_localhost_listener_port();
     let _echo = start_tcp_stream_echo_server("0.0.0.0", echo_port).await?;
-    let config = format!(
-        r#"- address: '0.0.0.0:{proxy_port}'
-  protocol:
-    type: forward
-    target: '127.0.0.1:{echo_port}'
-"#
-    );
+    let config = vless_server_config(proxy_port);
     let (_process, _config, _) = start_process_with_limits(&config, false, "max_connections: 2")?;
     ports.wait_for_all_ports().await?;
+    let destination: SocketAddr = format!("127.0.0.1:{echo_port}")
+        .parse()
+        .map_err(io::Error::other)?;
     // The readiness probe must relinquish its reservation before both real connections open.
     let mut connections = timeout(Duration::from_secs(3), async {
         loop {
             let mut streams = Vec::new();
             for _ in 0..2 {
-                let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+                let Ok(mut stream) = vless_tcp_connect(proxy_port, destination).await else {
+                    break;
+                };
                 if round_trip(&mut stream, b"accepted").await.is_err() {
                     break;
                 }
@@ -130,12 +167,13 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
     let (_, proxy_port) = ports.get_localhost_listener_port();
     let (_, echo_port) = ports.get_localhost_listener_port();
     let _echo = start_tcp_stream_echo_server("0.0.0.0", echo_port).await?;
-    let config = format!(
-        "- address: '0.0.0.0:{proxy_port}'\n  protocol:\n    type: forward\n    target: '127.0.0.1:{echo_port}'\n"
-    );
+    let config = vless_server_config(proxy_port);
     let (_process, mut file, _) = start_process(&config, true)?;
     ports.wait_for_all_ports().await?;
-    let mut existing = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    let destination: SocketAddr = format!("127.0.0.1:{echo_port}")
+        .parse()
+        .map_err(io::Error::other)?;
+    let mut existing = vless_tcp_connect(proxy_port, destination).await?;
     round_trip(&mut existing, b"before reload").await?;
     file.write_all(b"\n# trigger reload\n")?;
     file.flush()?;
@@ -150,10 +188,10 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
     round_trip(&mut existing, b"during reload").await?;
     let mut replacement = timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(stream) = TcpStream::connect(("127.0.0.1", proxy_port)).await {
-                break stream;
+            match vless_tcp_connect(proxy_port, destination).await {
+                Ok(stream) => break stream,
+                Err(_) => sleep(Duration::from_millis(20)).await,
             }
-            sleep(Duration::from_millis(20)).await;
         }
     })
     .await?;
@@ -166,181 +204,6 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
         "old generation survived its grace deadline"
     );
     round_trip(&mut replacement, b"still active").await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn hysteria2_control_streams_survive_small_application_caps()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use shoes_test_support::certs::generate_test_cert_files;
-    use std::sync::Arc;
-
-    let (cert, key) = generate_test_cert_files()?;
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(std::fs::read(&cert)?)) {
-        roots.add(cert?)?;
-    }
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-    let client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
-    ));
-
-    for limit in [1, 2] {
-        let mut ports = PortHelper::new();
-        let (_, quic_port) = ports.get_quic_listener_port();
-        let (_, readiness_port) = ports.get_localhost_listener_port();
-        let config = format!(
-            r#"- address: '0.0.0.0:{quic_port}'
-  transport: quic
-  quic_settings:
-    cert: '{}'
-    key: '{}'
-    num_endpoints: 1
-    alpn_protocols: [h3]
-  protocol:
-    type: hysteria2
-    password: test-password
-- address: '0.0.0.0:{readiness_port}'
-  protocol:
-    type: socks
-"#,
-            cert.display(),
-            key.display(),
-        );
-        let (_process, _config, _) = start_process_with_limits(
-            &config,
-            false,
-            &format!("max_streams_per_connection: {limit}"),
-        )?;
-        ports.wait_for_all_ports().await?;
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-        endpoint.set_default_client_config(client_config.clone());
-        let connection = timeout(
-            Duration::from_secs(5),
-            endpoint.connect(([127, 0, 0, 1], quic_port).into(), "test.local")?,
-        )
-        .await??;
-        let (mut driver, mut requests) = timeout(
-            Duration::from_secs(5),
-            h3::client::new(h3_quinn::Connection::new(connection)),
-        )
-        .await??;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("https://hysteria/auth")
-            .header("Hysteria-Auth", "test-password")
-            .body(())?;
-        let response = timeout(Duration::from_secs(5), async {
-            tokio::select! {
-                result = async {
-                    let mut stream = requests.send_request(request).await?;
-                    stream.finish().await?;
-                    stream.recv_response().await
-                } => result.map_err(io::Error::other),
-                error = std::future::poll_fn(|cx| driver.poll_close(cx)) => {
-                    Err(io::Error::other(error))
-                }
-            }
-        })
-        .await??;
-        assert_eq!(response.status().as_u16(), 233, "stream cap {limit}");
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn quic_reload_disconnects_old_connections_and_allows_reconnect()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use shoes_test_support::certs::generate_test_cert_files;
-    use std::sync::Arc;
-
-    let mut ports = PortHelper::new();
-    let (_, quic_port) = ports.get_quic_listener_port();
-    let (_, readiness_port) = ports.get_localhost_listener_port();
-    let (_, echo_port) = ports.get_localhost_listener_port();
-    let _echo = start_tcp_stream_echo_server("0.0.0.0", echo_port).await?;
-    let (cert, key) = generate_test_cert_files()?;
-    let config = format!(
-        r#"
-- address: "0.0.0.0:{quic_port}"
-  transport: quic
-  quic_settings:
-    cert: "{}"
-    key: "{}"
-    num_endpoints: 2
-    alpn_protocols: [reload-test]
-  protocol:
-    type: forward
-    target: "127.0.0.1:{echo_port}"
-- address: "0.0.0.0:{readiness_port}"
-  protocol:
-    type: forward
-    target: "127.0.0.1:{echo_port}"
-"#,
-        cert.display(),
-        key.display()
-    );
-    let (_process, mut file, _) = start_process(&config, true)?;
-    ports.wait_for_all_ports().await?;
-
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(std::fs::read(&cert)?)) {
-        roots.add(cert?)?;
-    }
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"reload-test".to_vec()];
-    let config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
-    ));
-    let connect = || async {
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
-        endpoint.set_default_client_config(config.clone());
-        let connection = timeout(
-            Duration::from_secs(3),
-            endpoint
-                .connect(([127, 0, 0, 1], quic_port).into(), "test.local")
-                .unwrap(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        (endpoint, connection)
-    };
-    let mut old = Vec::new();
-    for _ in 0..4 {
-        let (endpoint, connection) = connect().await;
-        let (mut send, mut recv) = connection.open_bi().await?;
-        send.write_all(b"before").await?;
-        let mut reply = [0; 6];
-        timeout(Duration::from_secs(2), recv.read_exact(&mut reply)).await??;
-        assert_eq!(&reply, b"before");
-        old.push((endpoint, connection, send, recv));
-    }
-    file.write_all(b"\n# trigger QUIC reload\n")?;
-    file.flush()?;
-    for (_, connection, _, _) in &old {
-        let closed = timeout(Duration::from_secs(2), connection.closed()).await?;
-        assert!(matches!(
-            closed,
-            quinn::ConnectionError::ApplicationClosed(_)
-        ));
-    }
-    drop(old);
-    sleep(Duration::from_millis(3200)).await;
-    for _ in 0..12 {
-        let (_endpoint, connection) = connect().await;
-        let (mut send, mut recv) = connection.open_bi().await?;
-        send.write_all(b"after").await?;
-        let mut reply = [0; 5];
-        timeout(Duration::from_secs(2), recv.read_exact(&mut reply)).await??;
-        assert_eq!(&reply, b"after");
-        connection.close(0u32.into(), b"done");
-    }
     Ok(())
 }
 
@@ -363,18 +226,34 @@ fn process_usage(pid: u32) -> io::Result<(usize, usize)> {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn quiet_udp_association_churn_releases_descriptors_and_bounds_rss() -> io::Result<()> {
+    use shoes_test_support::test_servers::start_udp_echo_server;
+
     let mut ports = PortHelper::new();
     let (_, port) = ports.get_localhost_listener_port();
-    let config = format!(
-        "- address: '0.0.0.0:{port}'\n  protocol:\n    type: socks\n    udp_enabled: true\n"
-    );
+    let (echo_ip, echo_port) = ports.get_port();
+    let _echo = start_udp_echo_server(&echo_ip, echo_port).await?;
+    let config = vless_server_config(port);
     let (_process, _config, pid) = start_process(&config, false)?;
     ports.wait_for_all_ports().await?;
-    let churn = |count| async move {
-        for _ in 0..count {
-            drop(Socks5UdpAssociation::connect("127.0.0.1", port).await?);
+    let destination = VlessDestination::Ip(
+        format!("{echo_ip}:{echo_port}")
+            .parse()
+            .map_err(io::Error::other)?,
+    );
+    let uuid = parse_uuid(VLESS_UUID)?;
+    let churn = |count| {
+        let destination = destination.clone();
+        async move {
+            for _ in 0..count {
+                let stream = TcpStream::connect(("127.0.0.1", port)).await?;
+                let mut client = VlessUdpClient::connect(stream, uuid, destination.clone()).await?;
+                client.send_packet(b"quiet").await?;
+                let reply = client.recv_packet(Duration::from_secs(2)).await?;
+                assert_eq!(reply, b"quiet [ECHO]");
+                drop(client);
+            }
+            io::Result::Ok(())
         }
-        io::Result::Ok(())
     };
     timeout(Duration::from_secs(10), churn(64)).await??;
     sleep(Duration::from_millis(100)).await;

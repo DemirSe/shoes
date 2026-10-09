@@ -731,7 +731,7 @@ chain:
         let yaml = r#"
 address: "127.0.0.1:1080"
 protocol:
-  type: socks
+  type: direct
 "#;
         let result: Result<ClientChain, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
@@ -760,7 +760,7 @@ chain:
         let yaml_proxy = r#"
 address: "127.0.0.1:1080"
 protocol:
-  type: socks
+  type: direct
 "#;
         let result: Result<ClientChain, _> = serde_yaml::from_str(yaml_proxy);
         assert!(result.is_ok());
@@ -951,7 +951,7 @@ client_chains:
         let yaml = r#"
 address: "127.0.0.1:1080"
 protocol:
-  type: socks
+  type: direct
 "#;
         let result: Result<ClientChainHop, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
@@ -987,7 +987,7 @@ pool:
   - my-proxy-group
   - address: "127.0.0.1:1080"
     protocol:
-      type: socks
+      type: direct
 "#;
         let result: Result<ClientChainHop, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
@@ -1151,7 +1151,7 @@ client_chains:
   - chain:
       - address: "proxy.example.com:1080"
         protocol:
-          type: socks
+          type: direct
 "#;
         let result: Result<RuleConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok(), "Parse error: {:?}", result.err());

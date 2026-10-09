@@ -6,7 +6,7 @@ use log::debug;
 
 use super::types::{
     ClientChainHop, ClientConfig, ClientConfigGroup, ClientProxyConfig, Config, NamedPem,
-    PemSource, RuleActionConfig, ServerConfig, ServerProxyConfig, ShadowTlsServerHandshakeConfig,
+    PemSource, RuleActionConfig, ServerConfig, ServerProxyConfig,
 };
 use crate::config::ConfigSelection;
 
@@ -117,15 +117,6 @@ fn gather_pem_file_paths_from_server_config(
     known_pem_paths: &HashMap<String, NamedPem>,
     unknown_pem_paths: &mut HashMap<String, String>,
 ) -> std::io::Result<()> {
-    // Check QUIC settings
-    if let Some(ref mut quic_settings) = server_config.quic_settings {
-        process_pem_path(&mut quic_settings.cert, known_pem_paths, unknown_pem_paths);
-        process_pem_path(&mut quic_settings.key, known_pem_paths, unknown_pem_paths);
-        for cert in quic_settings.client_ca_certs.iter_mut() {
-            process_pem_path(cert, known_pem_paths, unknown_pem_paths);
-        }
-    }
-
     // Recursively check the protocol
     gather_pem_file_paths_from_server_proxy(
         &mut server_config.protocol,
@@ -189,124 +180,87 @@ fn gather_pem_file_paths_from_server_proxy(
     known_pem_paths: &HashMap<String, NamedPem>,
     unknown_pem_paths: &mut HashMap<String, String>,
 ) -> std::io::Result<()> {
-    match server_proxy {
-        ServerProxyConfig::Tls {
-            tls_targets,
-            default_tls_target,
-            shadowtls_targets,
-            reality_targets,
-            ..
-        } => {
-            // Process TLS targets
-            for (sni, tls_config) in tls_targets.iter_mut() {
-                process_pem_path(&mut tls_config.cert, known_pem_paths, unknown_pem_paths);
-                process_pem_path(&mut tls_config.key, known_pem_paths, unknown_pem_paths);
-                for cert in tls_config.client_ca_certs.iter_mut() {
-                    process_pem_path(cert, known_pem_paths, unknown_pem_paths);
-                }
-
-                // Validate Vision configuration
-                validate_vision_protocol(
-                    tls_config.vision,
-                    &tls_config.protocol,
-                    &format!("TLS target '{}'", sni),
-                )?;
-
-                // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut tls_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
-                // Check override rules
-                for rule in tls_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
-                }
+    if let ServerProxyConfig::Tls {
+        tls_targets,
+        default_tls_target,
+        reality_targets,
+        ..
+    } = server_proxy
+    {
+        // Process TLS targets
+        for (sni, tls_config) in tls_targets.iter_mut() {
+            process_pem_path(&mut tls_config.cert, known_pem_paths, unknown_pem_paths);
+            process_pem_path(&mut tls_config.key, known_pem_paths, unknown_pem_paths);
+            for cert in tls_config.client_ca_certs.iter_mut() {
+                process_pem_path(cert, known_pem_paths, unknown_pem_paths);
             }
 
-            // Process default TLS target
-            if let Some(tls_config) = default_tls_target {
-                process_pem_path(&mut tls_config.cert, known_pem_paths, unknown_pem_paths);
-                process_pem_path(&mut tls_config.key, known_pem_paths, unknown_pem_paths);
-                for cert in tls_config.client_ca_certs.iter_mut() {
-                    process_pem_path(cert, known_pem_paths, unknown_pem_paths);
-                }
+            // Validate Vision configuration
+            validate_vision_protocol(
+                tls_config.vision,
+                &tls_config.protocol,
+                &format!("TLS target '{}'", sni),
+            )?;
 
-                // Validate Vision configuration
-                validate_vision_protocol(
-                    tls_config.vision,
-                    &tls_config.protocol,
-                    "default TLS target",
-                )?;
-
-                // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut tls_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
-                // Check override rules
-                for rule in tls_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
-                }
-            }
-
-            // Process ShadowTLS targets
-            for shadowtls_config in shadowtls_targets.values_mut() {
-                if let ShadowTlsServerHandshakeConfig::Local(ref mut handshake) =
-                    shadowtls_config.handshake
-                {
-                    process_pem_path(&mut handshake.cert, known_pem_paths, unknown_pem_paths);
-                    process_pem_path(&mut handshake.key, known_pem_paths, unknown_pem_paths);
-                }
-                // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut shadowtls_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
-                // Check override rules
-                for rule in shadowtls_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
-                }
-            }
-
-            // Process Reality targets
-            for (sni, reality_config) in reality_targets.iter_mut() {
-                // Validate Vision configuration
-                validate_vision_protocol(
-                    reality_config.vision,
-                    &reality_config.protocol,
-                    &format!("Reality target '{}'", sni),
-                )?;
-
-                // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut reality_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
-                // Check override rules
-                for rule in reality_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
-                }
+            // Recurse into inner protocol
+            gather_pem_file_paths_from_server_proxy(
+                &mut tls_config.protocol,
+                known_pem_paths,
+                unknown_pem_paths,
+            )?;
+            // Check override rules
+            for rule in tls_config.override_rules.iter_mut() {
+                gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
             }
         }
-        ServerProxyConfig::Websocket { targets } => {
-            for websocket_config in targets.iter_mut() {
-                // Recurse into inner protocol
-                gather_pem_file_paths_from_server_proxy(
-                    &mut websocket_config.protocol,
-                    known_pem_paths,
-                    unknown_pem_paths,
-                )?;
-                // Check override rules
-                for rule in websocket_config.override_rules.iter_mut() {
-                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
-                }
+
+        // Process default TLS target
+        if let Some(tls_config) = default_tls_target {
+            process_pem_path(&mut tls_config.cert, known_pem_paths, unknown_pem_paths);
+            process_pem_path(&mut tls_config.key, known_pem_paths, unknown_pem_paths);
+            for cert in tls_config.client_ca_certs.iter_mut() {
+                process_pem_path(cert, known_pem_paths, unknown_pem_paths);
+            }
+
+            // Validate Vision configuration
+            validate_vision_protocol(
+                tls_config.vision,
+                &tls_config.protocol,
+                "default TLS target",
+            )?;
+
+            // Recurse into inner protocol
+            gather_pem_file_paths_from_server_proxy(
+                &mut tls_config.protocol,
+                known_pem_paths,
+                unknown_pem_paths,
+            )?;
+            // Check override rules
+            for rule in tls_config.override_rules.iter_mut() {
+                gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
             }
         }
-        _ => {}
+
+        // Process Reality targets
+        for (sni, reality_config) in reality_targets.iter_mut() {
+            // Validate Vision configuration
+            validate_vision_protocol(
+                reality_config.vision,
+                &reality_config.protocol,
+                &format!("Reality target '{}'", sni),
+            )?;
+
+            // Recurse into inner protocol
+            gather_pem_file_paths_from_server_proxy(
+                &mut reality_config.protocol,
+                known_pem_paths,
+                unknown_pem_paths,
+            )?;
+            // Check override rules
+            for rule in reality_config.override_rules.iter_mut() {
+                gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+            }
+        }
     }
     Ok(())
 }
@@ -366,12 +320,6 @@ fn gather_pem_file_paths_from_client_config(
     known_pem_paths: &HashMap<String, NamedPem>,
     unknown_pem_paths: &mut HashMap<String, String>,
 ) {
-    // Check QUIC settings
-    if let Some(ref mut quic_config) = client_config.quic_settings {
-        process_optional_pem_path(&mut quic_config.cert, known_pem_paths, unknown_pem_paths);
-        process_optional_pem_path(&mut quic_config.key, known_pem_paths, unknown_pem_paths);
-    }
-
     // Recurse into client proxy config
     gather_pem_file_paths_from_client_proxy(
         &mut client_config.protocol,
@@ -399,16 +347,6 @@ fn gather_pem_file_paths_from_client_proxy(
         ClientProxyConfig::Reality { protocol, .. } => {
             // Reality doesn't have cert/key PEM files, but recurse into inner protocol
             gather_pem_file_paths_from_client_proxy(protocol, known_pem_paths, unknown_pem_paths);
-        }
-        ClientProxyConfig::ShadowTls { protocol, .. } => {
-            gather_pem_file_paths_from_client_proxy(protocol, known_pem_paths, unknown_pem_paths);
-        }
-        ClientProxyConfig::Websocket(ws_config) => {
-            gather_pem_file_paths_from_client_proxy(
-                &mut ws_config.protocol,
-                known_pem_paths,
-                unknown_pem_paths,
-            );
         }
         _ => {}
     }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::address::{NetLocation, NetLocationPortRange};
-use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
+use crate::option_util::OneOrSome;
 
 use super::common::default_true;
 
@@ -39,7 +39,6 @@ impl std::fmt::Display for BindLocation {
 pub enum Transport {
     #[default]
     Tcp,
-    Quic,
     Udp,
 }
 
@@ -59,50 +58,6 @@ pub struct TcpConfig {
 impl Default for TcpConfig {
     fn default() -> Self {
         TcpConfig { no_delay: true }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ServerQuicConfig {
-    pub cert: String,
-    pub key: String,
-    #[serde(alias = "alpn_protocol", default)]
-    pub alpn_protocols: NoneOrSome<String>,
-    #[serde(alias = "client_ca_cert", default)]
-    pub client_ca_certs: NoneOrSome<String>,
-    #[serde(alias = "client_fingerprint", default)]
-    pub client_fingerprints: NoneOrSome<String>,
-    // num_endpoints of 0 will use the number of threads as the default value.
-    #[serde(default)]
-    pub num_endpoints: usize,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ClientQuicConfig {
-    #[serde(default = "default_true")]
-    pub verify: bool,
-    #[serde(alias = "server_fingerprint", default)]
-    pub server_fingerprints: NoneOrSome<String>,
-    #[serde(default)]
-    pub sni_hostname: NoneOrOne<String>,
-    #[serde(alias = "alpn_protocol", default)]
-    pub alpn_protocols: NoneOrSome<String>,
-    #[serde(default)]
-    pub key: Option<String>,
-    #[serde(default)]
-    pub cert: Option<String>,
-}
-
-impl Default for ClientQuicConfig {
-    fn default() -> Self {
-        Self {
-            verify: true,
-            server_fingerprints: NoneOrSome::Unspecified,
-            sni_hostname: NoneOrOne::Unspecified,
-            alpn_protocols: NoneOrSome::Unspecified,
-            key: None,
-            cert: None,
-        }
     }
 }
 

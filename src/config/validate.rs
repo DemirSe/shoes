@@ -6,7 +6,6 @@ use crate::address::NetLocationMask;
 use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
-use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
 
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
@@ -14,9 +13,7 @@ use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
     DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
     ExpandedDnsSpec, GlobalLimits, PemSource, RuleActionConfig, RuleConfig, ServerConfig,
-    ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
-    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, WebsocketServerConfig,
-    direct_allow_rule,
+    ServerProxyConfig, TlsServerConfig, Transport, TunConfig, direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
@@ -642,45 +639,10 @@ fn validate_server_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
-    // First handle QUIC settings certificates
-    if let Some(ref mut quic_settings) = server_config.quic_settings {
-        embed_pem_from_map(&mut quic_settings.cert, named_pems);
-        embed_pem_from_map(&mut quic_settings.key, named_pems);
-        for cert in quic_settings.client_ca_certs.iter_mut() {
-            embed_pem_from_map(cert, named_pems);
-        }
-    }
     if server_config.transport != Transport::Tcp && server_config.tcp_settings.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "TCP transport is not selected but TCP settings specified",
-        ));
-    }
-
-    if server_config.transport == Transport::Quic {
-        match server_config.quic_settings {
-            Some(ServerQuicConfig {
-                ref mut client_fingerprints,
-                ref mut num_endpoints,
-                ..
-            }) => {
-                validate_client_fingerprints(client_fingerprints)?;
-
-                if *num_endpoints == 0 {
-                    *num_endpoints = get_num_threads();
-                }
-            }
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "QUIC transport is selected but QUIC settings not specified",
-                ));
-            }
-        }
-    } else if server_config.quic_settings.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "QUIC transport is not selected but QUIC settings specified",
         ));
     }
 
@@ -712,7 +674,6 @@ fn validate_server_config(
         client_groups,
         rule_groups,
         named_pems,
-        false, // top-level, not inside TLS/Reality
     )?;
 
     Ok(())
@@ -869,12 +830,6 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
             validate_client_vision_protocol(*vision, protocol, "Reality")?;
             validate_client_proxy_structure(protocol)?;
         }
-        ClientProxyConfig::ShadowTls { protocol, .. } => {
-            validate_client_proxy_structure(protocol)?;
-        }
-        ClientProxyConfig::Websocket(ws_config) => {
-            validate_client_proxy_structure(&ws_config.protocol)?;
-        }
         _ => {}
     }
     Ok(())
@@ -889,32 +844,6 @@ fn validate_client_config(
             std::io::ErrorKind::InvalidInput,
             "TCP transport is not selected but TCP settings specified",
         ));
-    }
-
-    if let Some(ref mut quic_config) = client_config.quic_settings {
-        if client_config.transport != Transport::Quic {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "QUIC transport is not selected but QUIC settings specified",
-            ));
-        }
-
-        embed_optional_pem_from_map(&mut quic_config.cert, named_pems);
-        embed_optional_pem_from_map(&mut quic_config.key, named_pems);
-
-        let super::types::ClientQuicConfig {
-            cert,
-            key,
-            server_fingerprints,
-            ..
-        } = quic_config;
-        if cert.is_none() != key.is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Both client cert and key have to be specified, or both have to be omitted",
-            ));
-        }
-        validate_server_fingerprints(server_fingerprints)?;
     }
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -985,14 +914,6 @@ fn validate_client_proxy_config(
             validate_client_proxy_config(&mut tls_config.protocol, named_pems)?;
         }
 
-        ClientProxyConfig::ShadowTls { protocol, .. } => {
-            validate_client_proxy_config(protocol, named_pems)?;
-        }
-
-        ClientProxyConfig::Websocket(ws_config) => {
-            validate_client_proxy_config(&mut ws_config.protocol, named_pems)?;
-        }
-
         _ => {}
     }
     Ok(())
@@ -1003,33 +924,18 @@ fn validate_server_proxy_config(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
-    inside_tls_or_reality: bool,
 ) -> std::io::Result<()> {
     match server_proxy_config {
-        ServerProxyConfig::Naiveproxy { .. } if !inside_tls_or_reality => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "NaiveProxy must be used inside a TLS or Reality protocol. \
-                 Configure it as the inner protocol of tls: or reality: targets.",
-            ));
-        }
         ServerProxyConfig::Vless { user_id, .. } => {
-            parse_uuid(user_id)?;
-        }
-        ServerProxyConfig::Vmess { user_id, .. } => {
             parse_uuid(user_id)?;
         }
         ServerProxyConfig::Tls {
             tls_targets,
             default_tls_target,
-            shadowtls_targets,
             reality_targets,
             tls_buffer_size,
         } => {
-            if tls_targets.is_empty()
-                && default_tls_target.is_none()
-                && shadowtls_targets.is_empty()
-                && reality_targets.is_empty()
+            if tls_targets.is_empty() && default_tls_target.is_none() && reality_targets.is_empty()
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1052,13 +958,7 @@ fn validate_server_proxy_config(
 
                 validate_client_fingerprints(client_fingerprints)?;
 
-                validate_server_proxy_config(
-                    protocol,
-                    client_groups,
-                    rule_groups,
-                    named_pems,
-                    true,
-                )?;
+                validate_server_proxy_config(protocol, client_groups, rule_groups, named_pems)?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
 
@@ -1082,53 +982,7 @@ fn validate_server_proxy_config(
                     ref mut override_rules,
                     ..
                 } = **tls_server_config;
-                validate_server_proxy_config(
-                    protocol,
-                    client_groups,
-                    rule_groups,
-                    named_pems,
-                    true,
-                )?;
-
-                ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
-
-                for rule_config_selection in override_rules.iter_mut() {
-                    validate_rule_config(
-                        rule_config_selection.unwrap_config_mut(),
-                        client_groups,
-                        named_pems,
-                    )?;
-                }
-            }
-            for (sni_hostname, tls_server_config) in shadowtls_targets.iter_mut() {
-                if tls_targets.contains_key(sni_hostname) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "duplicated SNI hostname between TLS and ShadowTLS targets: {sni_hostname}"
-                        ),
-                    ));
-                }
-                let ShadowTlsServerConfig {
-                    ref mut protocol,
-                    ref mut override_rules,
-                    ref mut handshake,
-                    ..
-                } = *tls_server_config;
-
-                if let ShadowTlsServerHandshakeConfig::Local(local_handshake) = handshake {
-                    embed_pem_from_map(&mut local_handshake.cert, named_pems);
-                    embed_pem_from_map(&mut local_handshake.key, named_pems);
-                    validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
-                }
-
-                validate_server_proxy_config(
-                    protocol,
-                    client_groups,
-                    rule_groups,
-                    named_pems,
-                    true,
-                )?;
+                validate_server_proxy_config(protocol, client_groups, rule_groups, named_pems)?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
 
@@ -1150,14 +1004,6 @@ fn validate_server_proxy_config(
                         ),
                     ));
                 }
-                if shadowtls_targets.contains_key(sni_hostname) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "duplicated SNI hostname between ShadowTLS and REALITY targets: {sni_hostname}"
-                        ),
-                    ));
-                }
 
                 validate_reality_private_key(&reality_config.private_key, sni_hostname)?;
                 validate_reality_server_short_ids(&reality_config.short_ids, sni_hostname)?;
@@ -1167,7 +1013,6 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
-                    true,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(
@@ -1193,50 +1038,6 @@ fn validate_server_proxy_config(
                 ));
             }
         }
-        ServerProxyConfig::Websocket { targets } => {
-            for websocket_server_config in targets.iter_mut() {
-                let WebsocketServerConfig {
-                    protocol,
-                    override_rules,
-                    ..
-                } = websocket_server_config;
-                validate_server_proxy_config(
-                    protocol,
-                    client_groups,
-                    rule_groups,
-                    named_pems,
-                    false,
-                )?;
-
-                ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
-
-                for rule_config_selection in override_rules.iter_mut() {
-                    validate_rule_config(
-                        rule_config_selection.unwrap_config_mut(),
-                        client_groups,
-                        named_pems,
-                    )?;
-                }
-            }
-        }
-        ServerProxyConfig::TuicV5 { uuid, .. } => {
-            parse_uuid(uuid)?;
-        }
-        ServerProxyConfig::Trojan { shadowsocks, .. } => {
-            if matches!(shadowsocks, Some(ShadowsocksConfig::Aead2022 { .. })) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Trojan does not support shadowsocks 2022 ciphers",
-                ));
-            }
-        }
-        ServerProxyConfig::Snell { cipher, .. } if cipher.starts_with("2022-blake3-") => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Snell does not support shadowsocks 2022 ciphers",
-            ));
-        }
-        _ => (),
     }
     Ok(())
 }
@@ -1689,8 +1490,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_recursive_certificate_embedding() {
-        crate::thread_util::set_num_threads(1);
-
         let test_dir = tempfile::tempdir().unwrap();
         let cert_dir = test_dir.path().join("certs");
         tokio::fs::create_dir_all(&cert_dir).await.unwrap();
@@ -1699,15 +1498,9 @@ mod tests {
         let test_key = "-----BEGIN PRIVATE KEY-----\nTEST KEY CONTENT\n-----END PRIVATE KEY-----";
 
         let cert_files = vec![
-            ("quic.crt", test_cert),
-            ("quic.key", test_key),
             ("server.crt", test_cert),
             ("server.key", test_key),
             ("ca.crt", test_cert),
-            ("shadow.crt", test_cert),
-            ("shadow.key", test_key),
-            ("client-quic.crt", test_cert),
-            ("client-quic.key", test_key),
             ("client.crt", test_cert),
             ("client.key", test_key),
         ];
@@ -1720,10 +1513,6 @@ mod tests {
         let config_yaml = format!(
             r#"
 - address: "0.0.0.0:443"
-  transport: quic
-  quic_settings:
-    cert: "{}/quic.crt"
-    key: "{}/quic.key"
   protocol:
     type: tls
     sni_targets:
@@ -1733,80 +1522,81 @@ mod tests {
         client_ca_certs:
           - "{}/ca.crt"
         protocol:
-          type: websocket
-          targets:
-            - matching_path: "/ws"
-              protocol:
-                type: vmess
-                cipher: auto
-                user_id: "123e4567-e89b-42d3-a456-426614174000"
-    shadowtls_targets:
-      "shadow.com":
-        password: "shadowpass"
-        handshake:
-          cert: "{}/shadow.crt"
-          key: "{}/shadow.key"
-        protocol:
-          type: socks
+          type: vless
+          user_id: "123e4567-e89b-42d3-a456-426614174000"
   rules:
     - masks: "0.0.0.0/0"
       action: allow
       client_chain:
         - address: "proxy.example.com:443"
-          transport: quic
-          quic_settings:
-            cert: "{}/client-quic.crt"
-            key: "{}/client-quic.key"
           protocol:
             type: tls
             cert: "{}/client.crt"
             key: "{}/client.key"
             protocol:
-              type: http
+              type: vless
+              user_id: "123e4567-e89b-42d3-a456-426614174000"
 "#,
             cert_dir.display(),
             cert_dir.display(),
             cert_dir.display(),
             cert_dir.display(),
             cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display()
         );
 
         let configs: Vec<Config> = serde_yaml::from_str(&config_yaml).unwrap();
         let (converted_configs, load_count) = convert_cert_paths(configs).await.unwrap();
 
-        assert_eq!(load_count, 11);
+        assert_eq!(load_count, 5);
 
         let validated = create_server_configs(converted_configs).unwrap();
         let Config::Server(server_config) = &validated.configs[0] else {
             panic!("expected Config::Server");
         };
 
-        let quic_settings = server_config.quic_settings.as_ref().unwrap();
-        assert!(quic_settings.cert.contains("BEGIN CERTIFICATE"));
-        assert!(quic_settings.key.contains("BEGIN PRIVATE KEY"));
+        let ServerProxyConfig::Tls { tls_targets, .. } = &server_config.protocol else {
+            panic!("expected TLS protocol");
+        };
+        let tls_config = tls_targets.get("example.com").unwrap();
+        assert!(tls_config.cert.contains("BEGIN CERTIFICATE"));
+        assert!(tls_config.key.contains("BEGIN PRIVATE KEY"));
+        assert!(
+            tls_config
+                .client_ca_certs
+                .iter()
+                .next()
+                .unwrap()
+                .contains("BEGIN CERTIFICATE")
+        );
 
-        if let ServerProxyConfig::Tls {
-            tls_targets,
-            shadowtls_targets,
-            ..
-        } = &server_config.protocol
-        {
-            let tls_config = tls_targets.get("example.com").unwrap();
-            assert!(tls_config.cert.contains("BEGIN CERTIFICATE"));
-            assert!(tls_config.key.contains("BEGIN PRIVATE KEY"));
-
-            let shadow_config = shadowtls_targets.get("shadow.com").unwrap();
-            if let ShadowTlsServerHandshakeConfig::Local(handshake) = &shadow_config.handshake {
-                assert!(handshake.cert.contains("BEGIN CERTIFICATE"));
-                assert!(handshake.key.contains("BEGIN PRIVATE KEY"));
-            }
-        }
+        let rule_selection = server_config.rules.iter().next().unwrap().clone();
+        let RuleConfig { action, .. } = rule_selection.unwrap_config();
+        let RuleActionConfig::Allow { client_chains, .. } = action else {
+            panic!("expected allow rule");
+        };
+        let chain = client_chains.iter().next().unwrap();
+        let ClientChainHop::Single(ConfigSelection::Config(chain_config)) =
+            chain.hops.iter().next().unwrap()
+        else {
+            panic!("expected inline client config");
+        };
+        let ClientProxyConfig::Tls(client_tls) = &chain_config.protocol else {
+            panic!("expected TLS client protocol");
+        };
+        assert!(
+            client_tls
+                .cert
+                .as_ref()
+                .unwrap()
+                .contains("BEGIN CERTIFICATE")
+        );
+        assert!(
+            client_tls
+                .key
+                .as_ref()
+                .unwrap()
+                .contains("BEGIN PRIVATE KEY")
+        );
     }
 
     #[test]
@@ -1819,18 +1609,11 @@ mod tests {
         assert!(validate_direct_connector_positions(&hops, 0).is_ok());
     }
 
-    fn http_proxy_config() -> ClientProxyConfig {
-        ClientProxyConfig::Http {
-            username: None,
-            password: None,
-            resolve_hostname: false,
-        }
-    }
-
-    fn socks_proxy_config() -> ClientProxyConfig {
-        ClientProxyConfig::Socks {
-            username: None,
-            password: None,
+    fn proxy_client_config() -> ClientProxyConfig {
+        ClientProxyConfig::Vless {
+            user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            udp_enabled: true,
+            h2mux: None,
         }
     }
 
@@ -1840,7 +1623,7 @@ mod tests {
         let hops = OneOrSome::Some(vec![
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())),
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig {
-                protocol: http_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             })),
         ]);
@@ -1853,11 +1636,11 @@ mod tests {
         // Proxy at hop 0, proxy at hop 1 - should be allowed
         let hops = OneOrSome::Some(vec![
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig {
-                protocol: http_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             })),
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig {
-                protocol: socks_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             })),
         ]);
@@ -1870,7 +1653,7 @@ mod tests {
         // Direct at hop 1 should be rejected
         let hops = OneOrSome::Some(vec![
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig {
-                protocol: http_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             })),
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())), // direct
@@ -1887,12 +1670,12 @@ mod tests {
         // Direct in the middle of a 3-hop chain should be rejected
         let hops = OneOrSome::Some(vec![
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig {
-                protocol: http_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             })),
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())), // direct
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig {
-                protocol: socks_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             })),
         ]);
@@ -1909,7 +1692,7 @@ mod tests {
         let hops = OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
             ConfigSelection::Config(ClientConfig::default()), // direct
             ConfigSelection::Config(ClientConfig {
-                protocol: http_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             }),
         ])));
@@ -1922,13 +1705,13 @@ mod tests {
         // Mixed pool at hop 1 with direct - should be rejected
         let hops = OneOrSome::Some(vec![
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig {
-                protocol: http_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             })),
             ClientChainHop::Pool(OneOrSome::Some(vec![
                 ConfigSelection::Config(ClientConfig::default()), // direct
                 ConfigSelection::Config(ClientConfig {
-                    protocol: socks_proxy_config(),
+                    protocol: proxy_client_config(),
                     ..Default::default()
                 }),
             ])),
@@ -1946,11 +1729,11 @@ mod tests {
         let hops = OneOrSome::Some(vec![
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())), // direct
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig {
-                protocol: http_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             })),
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig {
-                protocol: socks_proxy_config(),
+                protocol: proxy_client_config(),
                 ..Default::default()
             })),
         ]);
@@ -2100,11 +1883,12 @@ mod tests {
     async fn test_dns_udp_with_proxy_chain_rejected() {
         use crate::config::types::{ClientConfigGroup, ClientProxyConfig};
 
-        // Create a non-direct (socks5) chain - should be rejected for UDP.
-        let socks_config = ClientConfig {
-            protocol: ClientProxyConfig::Socks {
-                username: None,
-                password: None,
+        // Create a non-direct (VLESS) chain - should be rejected for UDP.
+        let proxy_config = ClientConfig {
+            protocol: ClientProxyConfig::Vless {
+                user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                udp_enabled: true,
+                h2mux: None,
             },
             ..Default::default()
         };
@@ -2112,7 +1896,7 @@ mod tests {
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-proxy".to_string(),
-                client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(proxy_config)),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
@@ -2174,11 +1958,12 @@ mod tests {
     async fn test_dns_h3_with_proxy_chain_rejected() {
         use crate::config::types::{ClientConfigGroup, ClientProxyConfig};
 
-        // Create a non-direct (socks5) chain - should be rejected for H3.
-        let socks_config = ClientConfig {
-            protocol: ClientProxyConfig::Socks {
-                username: None,
-                password: None,
+        // Create a non-direct (VLESS) chain - should be rejected for H3.
+        let proxy_config = ClientConfig {
+            protocol: ClientProxyConfig::Vless {
+                user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                udp_enabled: true,
+                h2mux: None,
             },
             ..Default::default()
         };
@@ -2186,7 +1971,7 @@ mod tests {
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-proxy".to_string(),
-                client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(proxy_config)),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
@@ -2493,13 +2278,13 @@ mod tests {
                     )
                     .unwrap(),
                 )),
-                protocol: ServerProxyConfig::Http {
-                    username: None,
-                    password: None,
+                protocol: ServerProxyConfig::Vless {
+                    user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                    udp_enabled: true,
+                    fallback: None,
                 },
                 transport: Transport::Tcp,
                 tcp_settings: None,
-                quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
                     servers: NoneOrSome::One(DnsServerSpec::Simple("my-dns".to_string())),
@@ -2541,13 +2326,13 @@ mod tests {
                     )
                     .unwrap(),
                 )),
-                protocol: ServerProxyConfig::Http {
-                    username: None,
-                    password: None,
+                protocol: ServerProxyConfig::Vless {
+                    user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                    udp_enabled: true,
+                    fallback: None,
                 },
                 transport: Transport::Tcp,
                 tcp_settings: None,
-                quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
                     servers: NoneOrSome::Some(vec![
@@ -2601,13 +2386,13 @@ mod tests {
                     )
                     .unwrap(),
                 )),
-                protocol: ServerProxyConfig::Http {
-                    username: None,
-                    password: None,
+                protocol: ServerProxyConfig::Vless {
+                    user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                    udp_enabled: true,
+                    fallback: None,
                 },
                 transport: Transport::Tcp,
                 tcp_settings: None,
-                quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
                     servers: NoneOrSome::Some(vec![
@@ -2652,13 +2437,13 @@ mod tests {
                 )
                 .unwrap(),
             )),
-            protocol: ServerProxyConfig::Http {
-                username: None,
-                password: None,
+            protocol: ServerProxyConfig::Vless {
+                user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                udp_enabled: true,
+                fallback: None,
             },
             transport: Transport::Tcp,
             tcp_settings: None,
-            quic_settings: None,
             rules: direct_allow_rule(),
             dns: Some(DnsConfig {
                 servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent-dns".to_string())),

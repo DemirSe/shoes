@@ -3,6 +3,7 @@
 // REALITY protocol: TLS obfuscation using X25519, HKDF-SHA256, AES-256-GCM, HMAC-SHA512
 
 mod common;
+mod fallback_rate_limit;
 mod reality_aead;
 mod reality_auth;
 mod reality_certificate;

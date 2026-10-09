@@ -68,81 +68,17 @@ path: "/tmp/shoes.sock"
 protocol: ServerProxyConfig
 
 # Transport layer (default: tcp)
-transport: tcp | quic
+transport: tcp
 
 # TCP settings (only when transport: tcp)
 tcp_settings:
   no_delay: true               # Default: true
-
-# QUIC settings (required when transport: quic)
-quic_settings:
-  cert: string                 # TLS certificate (path or named PEM)
-  key: string                  # TLS private key (path or named PEM)
-  alpn_protocols: [string]     # Optional ALPN protocols
-  client_ca_certs: [string]    # Optional client CA certificates
-  client_fingerprints: [string] # Optional client certificate fingerprints
-  num_endpoints: int           # Optional, 0 = auto (based on thread count)
 
 # Routing rules (default: allow-all-direct)
 rules: string | [RuleConfig]
 ```
 
 ## Server Protocols
-
-### HTTP
-```yaml
-protocol:
-  type: http
-  username: string?            # Optional authentication
-  password: string?
-```
-
-### SOCKS5
-```yaml
-protocol:
-  type: socks                  # Aliases: socks5
-  username: string?
-  password: string?
-  udp_enabled: true            # Default: true (enables UDP ASSOCIATE)
-```
-
-### Mixed (HTTP + SOCKS5)
-```yaml
-protocol:
-  type: mixed                  # Aliases: http+socks, socks+http
-  username: string?
-  password: string?
-  udp_enabled: true            # Default: true (enables UDP ASSOCIATE for SOCKS5)
-```
-
-Auto-detects HTTP or SOCKS5 protocol from the first byte of the connection.
-
-### Shadowsocks
-```yaml
-protocol:
-  type: shadowsocks            # Aliases: ss
-  cipher: string               # See supported ciphers below
-  password: string
-
-# Supported ciphers:
-# - aes-128-gcm
-# - aes-256-gcm
-# - chacha20-ietf-poly1305
-# - 2022-blake3-aes-128-gcm
-# - 2022-blake3-aes-256-gcm
-# - 2022-blake3-chacha20-ietf-poly1305
-```
-
-### VMess
-```yaml
-protocol:
-  type: vmess
-  cipher: string               # aes-128-gcm, chacha20-poly1305, none
-  user_id: string              # UUID
-  udp_enabled: true            # Default: true (enables XUDP)
-```
-
-**Note:** VMess AEAD mode is always enabled. The legacy `force_aead` field is deprecated and non-AEAD mode is no longer supported.
 
 ### VLESS
 ```yaml
@@ -151,26 +87,6 @@ protocol:
   user_id: string              # UUID
   udp_enabled: true            # Default: true (enables XUDP)
   fallback: string?            # Optional fallback destination for failed auth (e.g., "127.0.0.1:80")
-```
-
-### Trojan
-```yaml
-protocol:
-  type: trojan
-  password: string
-  shadowsocks:                 # Optional encryption layer
-    cipher: string
-    password: string
-```
-
-### Snell v3
-```yaml
-protocol:
-  type: snell
-  cipher: string               # aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305
-  password: string
-  udp_enabled: true            # Default: true
-  udp_num_sockets: 1           # Default: 1, sockets per UDP session
 ```
 
 ### TLS Server
@@ -211,92 +127,43 @@ protocol:
       protocol: ServerProxyConfig
       override_rules: [RuleConfig]
 
-  # ShadowTLS v3 targets (by SNI)
-  shadowtls_targets:
-    "example.com":
-      password: string
-      handshake:
-        # Local handshake (with own certificate):
-        cert: string
-        key: string
-        alpn_protocols: [string]
-        client_ca_certs: [string]
-        client_fingerprints: [string]
-        # OR Remote handshake (proxy to real server):
-        address: string        # e.g., "google.com:443"
-        client_proxies: [ClientConfig] # Optional proxies for handshake
-      protocol: ServerProxyConfig
-      override_rules: [RuleConfig]
-
   # Buffer size for TLS (optional, min 16384)
   tls_buffer_size: int
 ```
 
-### WebSocket
-```yaml
-protocol:
-  type: websocket              # Aliases: ws
-  targets:
-    - matching_path: string?   # Optional path filter (e.g., "/ws")
-      matching_headers:        # Optional header filters
-        X-Custom-Header: "value"
-      protocol: ServerProxyConfig
-      ping_type: ping-frame    # disabled | ping-frame | empty-frame
-      override_rules: [RuleConfig]
-```
+### REALITY transparent cover rate controls
 
-### Port Forward
-```yaml
-protocol:
-  type: forward                # Aliases: port_forward, portforward
-  targets: string | [string]   # Target address(es)
-```
+Each REALITY target accepts optional `limit_fallback_upload` and
+`limit_fallback_download` mappings. Each mapping has these unsigned integer fields:
 
-### Hysteria2
-```yaml
-protocol:
-  type: hysteria2
-  password: string
-  udp_enabled: true            # Default: true
-```
+- `after_bytes`: Initial bytes without throttling. The default is zero.
+- `bytes_per_sec`: Sustained bytes per second. Zero or an omitted mapping disables that direction.
+- `burst_bytes_per_sec`: Bucket capacity in bytes, despite the field name. Zero or omission uses `bytes_per_sec` as the capacity.
 
-### TUIC v5
-```yaml
-protocol:
-  type: tuic                   # Aliases: tuicv5
-  uuid: string                 # UUID
-  password: string
-  zero_rtt_handshake: false    # Default: false (enables 0-RTT for lower latency)
-```
+The bucket starts full at the threshold. It refills continuously at `bytes_per_sec`, up to its capacity.
+Upload means client to cover. Download means cover to client.
+Each forwarded connection has independent buckets. There is no shared traffic cap.
+Successful authenticated REALITY, Vision, and VLESS forwarding does not use these controls.
 
-### AnyTLS
-```yaml
-protocol:
-  type: anytls
-  users:                       # One or more users
-    - name: string?            # Optional display name
-      password: string         # User password
-  udp_enabled: true            # Default: true (enables UDP over TCP)
-  padding_scheme: [string]?    # Optional custom padding (e.g., ["stop=8", "0=30-30"])
-  fallback: string?            # Optional fallback destination for failed auth
-```
+Accounting uses bytes that the fallback writer accepts, including TLS record headers.
+Preread cover records, cover remainder bytes, and pending client bytes use the same accounting as live traffic.
+The initial ClientHello reaches the cover before authentication, without throttling.
+This bootstrap exclusion preserves the existing handshake sequence.
+Those already-forwarded bytes reduce the upload `after_bytes` allowance, but do not consume bucket tokens or incur later debt.
+The controls do not change the cover destination, SNI, or optional VLESS fallback.
 
-AnyTLS is a TLS-based multiplexing proxy protocol with traffic obfuscation. Should be used within TLS or Reality.
+Byte limits delay traffic. They do not promise that every reply byte arrives.
 
-### NaiveProxy
-```yaml
-protocol:
-  type: naiveproxy             # Aliases: naive
-  users:                       # One or more users
-    - name: string?            # Optional display name
-      username: string         # Basic Auth username
-      password: string         # Basic Auth password
-  padding: true                # Default: true (enables padding protocol)
-  udp_enabled: true            # Default: true (enables UDP over TCP)
-  fallback: string?            # Optional path to serve static files for probe resistance
-```
+The copy loop has two shutdown rules. A direction that reaches end-of-file shuts down its peer direction.
+The default rule fails that shutdown after five seconds.
+Fallback sessions use the progress-aware rule.
+That rule extends the deadline while either direction still moves bytes.
+A stall without progress then fails after five seconds.
+The rule also caps the total wait at sixty seconds after the first half-close.
+Bytes that stay unwritten at that point are lost.
 
-NaiveProxy implements HTTP/2 CONNECT with padding for censorship resistance. Should be used within TLS with `alpn_protocols: ["h2"]`.
+Normal shutdowns complete at once. The sixty-second limit applies only while a shutdown stays pending.
+Any write error still ends the copy at once. The error path can drop queued bytes in either direction.
 
 ## TUN Config
 
@@ -354,19 +221,11 @@ Used in rules to specify upstream proxies.
 ```yaml
 address: string                # Proxy server address (e.g., "proxy.example.com:1080")
 protocol: ClientProxyConfig
-transport: tcp | quic          # Default: tcp
+transport: tcp                 # Default: tcp
 bind_interface: string         # Optional, Linux/Android/Fuchsia only
 
 tcp_settings:
   no_delay: true
-
-quic_settings:
-  verify: true                 # Default: true
-  server_fingerprints: [string]
-  sni_hostname: string
-  alpn_protocols: [string]
-  cert: string                 # Client certificate for mTLS
-  key: string                  # Client key for mTLS
 ```
 
 ## Client Protocols
@@ -376,53 +235,6 @@ quic_settings:
 protocol:
   type: direct
 ```
-
-### HTTP
-```yaml
-protocol:
-  type: http
-  username: string?
-  password: string?
-```
-
-### SOCKS5
-```yaml
-protocol:
-  type: socks
-  username: string?
-  password: string?
-```
-
-### Shadowsocks
-```yaml
-protocol:
-  type: shadowsocks
-  cipher: string
-  password: string
-```
-
-### Snell
-```yaml
-protocol:
-  type: snell
-  cipher: string
-  password: string
-```
-
-### VMess
-```yaml
-protocol:
-  type: vmess
-  cipher: string
-  user_id: string
-  h2mux:                         # Optional h2mux multiplexing (see below)
-    max_connections: 4
-    min_streams: 4
-    max_streams: 0
-    padding: false
-```
-
-**Note:** VMess AEAD mode is always enabled. The legacy `aead` field is deprecated.
 
 ### VLESS
 ```yaml
@@ -436,24 +248,9 @@ protocol:
     padding: false
 ```
 
-### Trojan
-```yaml
-protocol:
-  type: trojan
-  password: string
-  shadowsocks:                 # Optional
-    cipher: string
-    password: string
-  h2mux:                         # Optional h2mux multiplexing (see below)
-    max_connections: 4
-    min_streams: 4
-    max_streams: 0
-    padding: false
-```
-
 ### H2MUX Multiplexing
 
-H2MUX multiplexes multiple proxy streams over a single HTTP/2 connection, reducing connection overhead. Compatible with sing-box. Available for VMess, VLESS, and Trojan client protocols.
+H2MUX multiplexes multiple proxy streams over a single HTTP/2 connection, reducing connection overhead. Compatible with sing-box. Available for the VLESS client protocol.
 
 ```yaml
 h2mux:
@@ -494,52 +291,6 @@ protocol:
 
 **Reality cipher suites:** Valid values are `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`. If not specified, all three are offered/supported.
 
-### ShadowTLS Client
-```yaml
-protocol:
-  type: shadowtls
-  password: string
-  sni_hostname: string?        # Optional SNI override
-  protocol: ClientProxyConfig
-```
-
-### WebSocket Client
-```yaml
-protocol:
-  type: websocket
-  matching_path: string?
-  matching_headers:
-    header_name: string
-  ping_type: ping-frame        # disabled | ping-frame | empty-frame
-  protocol: ClientProxyConfig
-```
-
-### Port Forward (No-op)
-```yaml
-protocol:
-  type: portforward            # Aliases: noop
-```
-
-Passes through the raw connection without protocol wrapping. Useful for testing or transparent proxying.
-
-### AnyTLS Client
-```yaml
-protocol:
-  type: anytls
-  password: string             # User password
-  udp_enabled: true            # Default: true (enables UDP over TCP)
-  padding_scheme: [string]?    # Optional custom padding scheme
-```
-
-### NaiveProxy Client
-```yaml
-protocol:
-  type: naiveproxy             # Aliases: naive
-  username: string             # Basic Auth username
-  password: string             # Basic Auth password
-  padding: true                # Default: true (enables padding protocol)
-```
-
 ## Rules System
 
 Rules determine how incoming connections are routed.
@@ -562,9 +313,10 @@ Client chains define how traffic is routed through upstream proxies. Each chain 
 # Single proxy (simplest form)
 client_chain: my-proxy-group           # Reference a named group
 client_chain:                          # Or inline config
-  address: "proxy.example.com:1080"
+  address: "proxy.example.com:443"
   protocol:
-    type: socks
+    type: vless
+    user_id: "550e8400-e29b-41d4-a716-446655440000"
 
 # Multi-hop chain (traffic goes: client -> hop1 -> hop2 -> target)
 client_chain:
@@ -627,9 +379,10 @@ rules:
   - masks: "0.0.0.0/0"
     action: allow
     client_chain:
-      address: "proxy.example.com:1080"
+      address: "proxy.example.com:443"
       protocol:
-        type: socks
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
 ```
 
 ## Named Groups
@@ -638,17 +391,20 @@ rules:
 ```yaml
 - client_group: my-upstream
   client_proxies:              # Define proxies in this group
-    - address: "proxy1.example.com:1080"
+    - address: "proxy1.example.com:443"
       protocol:
-        type: socks
-    - address: "proxy2.example.com:1080"
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
+    - address: "proxy2.example.com:443"
       protocol:
-        type: socks
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
 
 # Reference in rules
 - address: "0.0.0.0:8080"
   protocol:
-    type: http
+    type: vless
+    user_id: "550e8400-e29b-41d4-a716-446655440000"
   rules:
     - masks: "0.0.0.0/0"
       action: allow
@@ -671,7 +427,8 @@ rules:
 # Reference in server config
 - address: "0.0.0.0:8080"
   protocol:
-    type: http
+    type: vless
+    user_id: "550e8400-e29b-41d4-a716-446655440000"
   rules: standard-rules        # Reference by name
 ```
 
@@ -700,7 +457,8 @@ Define certificates once and reference throughout configuration.
         cert: my-cert          # Reference by name
         key: my-key
         protocol:
-          type: http
+          type: vless
+          user_id: "550e8400-e29b-41d4-a716-446655440000"
 ```
 
 ## Advanced Features
@@ -743,7 +501,7 @@ protocol:
 
 ### XUDP Multiplexing
 
-Automatically enabled for VMess and VLESS when `udp_enabled: true`. Multiplexes UDP traffic over a single connection.
+Automatically enabled for VLESS when `udp_enabled: true`. Multiplexes UDP traffic over a single connection.
 
 ### Proxy Chaining
 
@@ -755,9 +513,8 @@ client_chain:
   protocol:
     type: tls
     protocol:
-      type: vmess
-      cipher: aes-128-gcm
-      user_id: "uuid"
+      type: vless
+      user_id: "550e8400-e29b-41d4-a716-446655440000"
 ```
 
 **Multi-hop chains** (route through multiple proxies sequentially):
@@ -765,9 +522,10 @@ client_chain:
 ```yaml
 client_chain:
   chain:
-    - address: "proxy1.example.com:1080"
+    - address: "proxy1.example.com:443"
       protocol:
-        type: socks
+        type: vless
+        user_id: "550e8400-e29b-41d4-a716-446655440000"
     - address: "proxy2.example.com:443"
       protocol:
         type: tls
@@ -817,8 +575,8 @@ OPTIONS:
   --no-reload          Disable hot-reloading
 
 COMMANDS:
-  generate-reality-keypair                       Generate Reality X25519 keypair
-  generate-shadowsocks-2022-password <cipher>    Generate Shadowsocks 2022 password
+  generate-reality-keypair    Generate Reality X25519 keypair
+  generate-vless-user-id      Generate a random VLESS user ID (UUID v4)
 ```
 
 ## Tips
@@ -830,14 +588,9 @@ COMMANDS:
 shoes generate-reality-keypair
 ```
 
-**Shadowsocks 2022 password:**
+**VLESS user ID:**
 ```bash
-shoes generate-shadowsocks-2022-password 2022-blake3-aes-256-gcm
-```
-
-**UUID:**
-```bash
-uuidgen
+shoes generate-vless-user-id
 ```
 
 **TLS certificate fingerprint:**
@@ -858,8 +611,7 @@ openssl x509 -in cert.pem -noout -fingerprint -sha256
 
 - Enable `vision: true` for TLS-in-TLS scenarios
 - Use `tcp_settings.no_delay: true` for low latency
-- Set `quic_settings.num_endpoints` to match worker threads
-- Use QUIC transport for high-latency or lossy networks
+- Keep the TLS buffer size at or above the 16 KiB minimum
 
 ### Common Issues
 

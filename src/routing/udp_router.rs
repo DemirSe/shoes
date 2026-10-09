@@ -289,9 +289,9 @@ struct PendingResponse {
 
 /// Server stream variants - unified via enum
 pub enum ServerStream {
-    /// SOCKS5 UDP, Shadowsocks UoT, etc.
+    /// h2mux `packet_addr` streams, etc.
     Targeted(Box<dyn AsyncTargetedMessageStream>),
-    /// XUDP (VLESS/VMess)
+    /// XUDP (VLESS)
     Session(Box<dyn AsyncSessionMessageStream>),
 }
 
@@ -1575,8 +1575,9 @@ mod tests {
     async fn empty_router_finishes_on_peer_eof() {
         let (stream, peer) = tokio::io::duplex(1024);
         drop(peer);
-        let mut server =
-            ServerStream::Targeted(Box::new(crate::uot::UotV1ServerStream::new_uot(stream)));
+        let mut server = ServerStream::Targeted(Box::new(
+            crate::uot::SocksPacketAddrStream::new_socks(stream),
+        ));
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
         tokio::time::timeout(
@@ -1591,8 +1592,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn eof_drains_accepted_setup_but_not_forever() {
         let (stream, _peer) = tokio::io::duplex(1024);
-        let mut server =
-            ServerStream::Targeted(Box::new(crate::uot::UotV1ServerStream::new_uot(stream)));
+        let mut server = ServerStream::Targeted(Box::new(
+            crate::uot::SocksPacketAddrStream::new_socks(stream),
+        ));
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
         let mut router = UdpRouter::new(&mut server, selector, resolver, false);
@@ -1634,8 +1636,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn pending_shutdowns_are_bounded_and_expire() {
         let (stream, _peer) = tokio::io::duplex(1024);
-        let mut server =
-            ServerStream::Targeted(Box::new(crate::uot::UotV1ServerStream::new_uot(stream)));
+        let mut server = ServerStream::Targeted(Box::new(
+            crate::uot::SocksPacketAddrStream::new_socks(stream),
+        ));
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
         let mut router = UdpRouter::new(&mut server, selector, resolver, false);

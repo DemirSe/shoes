@@ -301,6 +301,43 @@ use super::test_servers::{self, TlsVersion};
 /// UUID used across all tests for consistency
 pub const TEST_UUID: &str = "b85798ef-e9dc-46a4-9a87-8da4499d36d0";
 
+/// Build the stock sing-box HTTP entry that fronts a Shoes VLESS server.
+///
+/// The removed Shoes HTTP proxy front is replaced by this stock entry, so tests
+/// keep dialing an HTTP proxy surface while the retained Shoes client runs
+/// behind the VLESS front.
+pub fn stock_vless_entry_config(
+    entry_ip: &str,
+    entry_port: u16,
+    front_ip: &str,
+    front_port: u16,
+) -> String {
+    format!(
+        r#"{{
+  "log": {{ "level": "debug" }},
+  "inbounds": [
+    {{
+      "type": "http",
+      "tag": "http-in",
+      "listen": "{}",
+      "listen_port": {}
+    }}
+  ],
+  "outbounds": [
+    {{
+      "type": "vless",
+      "tag": "vless-out",
+      "server": "{}",
+      "server_port": {},
+      "uuid": "{}"
+    }}
+  ],
+  "route": {{ "final": "vless-out" }}
+}}"#,
+        entry_ip, entry_port, front_ip, front_port, TEST_UUID
+    )
+}
+
 /// Proxy role in the test chain
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProxyRole {
@@ -3193,13 +3230,33 @@ impl ProxyTestFixture {
             }
         }
 
+        // Retained Shoes REALITY clients are fronted by a VLESS server. Start a
+        // stock sing-box HTTP entry in front of the chain entry so tests keep
+        // dialing an HTTP proxy surface.
+        let mut stock_entry = None;
+        if let Some(first) = proxies_clone.first()
+            && matches!(
+                &first.proxy_type,
+                ProxyType::ShoesRealityClient { .. }
+                    | ProxyType::ShoesRealityVisionClient { .. }
+                    | ProxyType::ShoesH2muxVlessClient { .. }
+            )
+        {
+            let (entry_ip, entry_port) = self.ports.get_listener_port();
+            let config = stock_vless_entry_config(&entry_ip, entry_port, &first.ip, first.port);
+            let (guard, config_file) = start_singbox_server(&config)?;
+            guards.push(guard);
+            config_files.push(config_file);
+            stock_entry = Some((entry_ip, entry_port));
+        }
+
         // Wait for all listener ports to be ready
         self.ports.wait_for_all_ports().await?;
 
-        // Find entry IP and port (first proxy in chain)
+        // Find entry IP and port (first proxy in chain, or its stock HTTP entry)
         let first_proxy = self.proxies.first().ok_or("No proxies configured")?;
-        let entry_ip = first_proxy.ip.clone();
-        let entry_port = first_proxy.port;
+        let (entry_ip, entry_port) =
+            stock_entry.unwrap_or_else(|| (first_proxy.ip.clone(), first_proxy.port));
 
         let local_server_ip = self.local_server.as_ref().map(|s| s.ip.clone());
         let local_server_port = self.local_server.as_ref().map(|s| s.port);
@@ -3220,6 +3277,13 @@ impl ProxyTestFixture {
             tun_interface,
             tun_virtual_server_ip,
         })
+    }
+
+    /// Generate the Shoes configs for the configured proxies without starting any
+    /// process. Used by offline config regressions for retained fixtures.
+    pub fn preview_shoes_configs(&mut self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        self.wire_proxy_chain();
+        self.generate_shoes_configs()
     }
 
     /// Generate shoes config for all shoes proxies
@@ -3375,12 +3439,13 @@ impl ProxyTestFixture {
 
 - address: "{}:{}"
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
   rule:
     mask: "0.0.0.0/0"
     action: allow
     client_proxy: default"#,
-                    upstream_ip, upstream_port, TEST_UUID, proxy.ip, proxy.port
+                    upstream_ip, upstream_port, TEST_UUID, proxy.ip, proxy.port, TEST_UUID
                 )),
                 ProxyType::ShoesVmessServer { cipher } => Some(format!(
                     r#"- address: "{}:{}"
@@ -3589,7 +3654,8 @@ impl ProxyTestFixture {
 
 - address: "{}:{}"
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
   rule:
     mask: "0.0.0.0/0"
     action: allow
@@ -3601,7 +3667,8 @@ impl ProxyTestFixture {
                         config.server_name,
                         inner_protocol_config,
                         proxy.ip,
-                        proxy.port
+                        proxy.port,
+                        TEST_UUID
                     ))
                 }
                 ProxyType::ShoesRealityVisionServer { config } => {
@@ -3653,7 +3720,8 @@ impl ProxyTestFixture {
 
 - address: "{}:{}"
   protocol:
-    type: http
+    type: vless
+    user_id: "{}"
   rule:
     mask: "0.0.0.0/0"
     action: allow
@@ -3665,7 +3733,8 @@ impl ProxyTestFixture {
                         config.server_name,
                         TEST_UUID,
                         proxy.ip,
-                        proxy.port
+                        proxy.port,
+                        TEST_UUID
                     ))
                 }
                 ProxyType::ShoesShadowTlsLocalServer { password } => {

@@ -1,7 +1,5 @@
 //! Client configuration types.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::address::NetLocation;
@@ -11,9 +9,7 @@ use crate::option_util::{NoneOrOne, NoneOrSome};
 use super::common::{
     default_reality_client_short_id, default_true, is_false, is_true, unspecified_address,
 };
-use super::server::WebsocketPingType;
-use super::shadowsocks::ShadowsocksConfig;
-use super::transport::{ClientQuicConfig, TcpConfig, Transport};
+use super::transport::{TcpConfig, Transport};
 
 /// Configuration for h2mux (HTTP/2 multiplexing) on protocols that support it.
 ///
@@ -52,145 +48,11 @@ impl H2MuxConfig {
     }
 }
 
-/// Custom deserializer for ClientProxyConfig::Shadowsocks
-fn deserialize_shadowsocks_client<'de, D>(
-    deserializer: D,
-) -> Result<(ShadowsocksConfig, bool), D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct ShadowsocksClientTemp {
-        cipher: String,
-        password: String,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-    }
-
-    let temp = ShadowsocksClientTemp::deserialize(deserializer)?;
-    let config =
-        ShadowsocksConfig::from_fields(&temp.cipher, &temp.password).map_err(Error::custom)?;
-
-    Ok((config, temp.udp_enabled))
-}
-
-/// Custom serializer for ClientProxyConfig::Shadowsocks - flattens config fields
-fn serialize_shadowsocks_client<S>(
-    config: &ShadowsocksConfig,
-    udp_enabled: &bool,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::ser::SerializeStruct;
-
-    // Only serialize udp_enabled if it's not the default (true)
-    let field_count = if *udp_enabled { 2 } else { 3 };
-    let mut state = serializer.serialize_struct("Shadowsocks", field_count)?;
-    config.serialize_fields(&mut state)?;
-    if !*udp_enabled {
-        state.serialize_field("udp_enabled", udp_enabled)?;
-    }
-    state.end()
-}
-
-/// Custom deserializer for ClientProxyConfig::Snell - flattens config fields
-fn deserialize_snell_client<'de, D>(deserializer: D) -> Result<(ShadowsocksConfig, bool), D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct SnellClientTemp {
-        cipher: String,
-        password: String,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-    }
-
-    let temp = SnellClientTemp::deserialize(deserializer)?;
-    let config =
-        ShadowsocksConfig::from_fields(&temp.cipher, &temp.password).map_err(Error::custom)?;
-
-    Ok((config, temp.udp_enabled))
-}
-
-/// Custom serializer for ClientProxyConfig::Snell - flattens config fields
-fn serialize_snell_client<S>(
-    config: &ShadowsocksConfig,
-    udp_enabled: &bool,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    use serde::ser::SerializeStruct;
-
-    // Only serialize udp_enabled if it's not the default (true)
-    let field_count = if *udp_enabled { 2 } else { 3 };
-    let mut state = serializer.serialize_struct("Snell", field_count)?;
-    config.serialize_fields(&mut state)?;
-    if !*udp_enabled {
-        state.serialize_field("udp_enabled", udp_enabled)?;
-    }
-    state.end()
-}
-
-/// Custom deserializer for ClientProxyConfig::Vmess that validates legacy aead field
-fn deserialize_vmess_client<'de, D>(
-    deserializer: D,
-) -> Result<(String, String, bool, Option<H2MuxConfig>), D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct VmessClientTemp {
-        cipher: String,
-        user_id: String,
-        #[serde(default, alias = "force_aead")]
-        aead: Option<bool>,
-        #[serde(default = "default_true")]
-        udp_enabled: bool,
-        #[serde(default)]
-        h2mux: Option<H2MuxConfig>,
-    }
-
-    let temp = VmessClientTemp::deserialize(deserializer)?;
-
-    // Check if aead/force_aead was explicitly set
-    if let Some(aead_value) = temp.aead {
-        if !aead_value {
-            return Err(Error::custom(
-                "Non-AEAD VMess mode (aead=false or force_aead=false) is no longer supported. \
-                 Please remove the aead/force_aead field from your configuration, or set it to true.",
-            ));
-        }
-        // Warn about deprecated field
-        log::warn!(
-            "The 'aead'/'force_aead' field in VMess client configuration is deprecated and will be removed in a future version. \
-             AEAD mode is now always enabled. Please remove this field from your configuration."
-        );
-    }
-
-    Ok((temp.cipher, temp.user_id, temp.udp_enabled, temp.h2mux))
-}
-
-/// Custom deserializer for TlsClientConfig that handles deprecated shadowtls_password field
+/// Custom deserializer for TlsClientConfig.
 fn deserialize_tls_client_config<'de, D>(deserializer: D) -> Result<TlsClientConfig, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
-
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct TlsClientConfigTemp {
@@ -209,50 +71,12 @@ where
         #[serde(default)]
         cert: Option<String>,
         #[serde(default)]
-        shadowtls_password: Option<String>,
-        #[serde(default)]
         vision: bool,
         protocol: Box<ClientProxyConfig>,
     }
 
     let temp = TlsClientConfigTemp::deserialize(deserializer)?;
 
-    // Check for mutually exclusive fields
-    if temp.vision && temp.shadowtls_password.is_some() {
-        return Err(Error::custom(
-            "TLS client config cannot have both vision=true and shadowtls_password set. \
-             Vision and ShadowTLS are incompatible. \
-             Use either 'vision: true' with regular TLS, or 'type: shadowtls' for ShadowTLS.",
-        ));
-    }
-
-    // Check if deprecated shadowtls_password was used
-    if let Some(password) = temp.shadowtls_password {
-        log::warn!(
-            "The 'shadowtls_password' field in TLS client configuration is deprecated. \
-             Please use 'type: shadowtls' with 'password' field instead. \
-             This field will be removed in a future version."
-        );
-
-        // Transform to ShadowTLS variant internally by wrapping protocol
-        return Ok(TlsClientConfig {
-            verify: temp.verify,
-            server_fingerprints: temp.server_fingerprints,
-            sni_hostname: temp.sni_hostname.clone(),
-            alpn_protocols: temp.alpn_protocols,
-            tls_buffer_size: temp.tls_buffer_size,
-            key: temp.key,
-            cert: temp.cert,
-            vision: false,
-            protocol: Box::new(ClientProxyConfig::ShadowTls {
-                password,
-                sni_hostname: temp.sni_hostname.into_option(),
-                protocol: temp.protocol,
-            }),
-        });
-    }
-
-    // Normal case - no shadowtls_password
     Ok(TlsClientConfig {
         verify: temp.verify,
         server_fingerprints: temp.server_fingerprints,
@@ -289,8 +113,6 @@ pub struct ClientConfig {
     pub transport: Transport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_settings: Option<TcpConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quic_settings: Option<ClientQuicConfig>,
 }
 
 impl Default for ClientConfig {
@@ -301,7 +123,6 @@ impl Default for ClientConfig {
             protocol: ClientProxyConfig::Direct,
             transport: Transport::default(),
             tcp_settings: None,
-            quic_settings: None,
         }
     }
 }
@@ -310,52 +131,10 @@ impl Default for ClientConfig {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientProxyConfig {
     Direct,
-    Http {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
-        /// When true, resolve hostnames to IP addresses before passing to HTTP CONNECT.
-        /// Used when the upstream proxy blocks by hostname.
-        #[serde(default, skip_serializing_if = "is_false")]
-        resolve_hostname: bool,
-    },
-    #[serde(alias = "socks5")]
-    Socks {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        username: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
-    },
-    #[serde(
-        alias = "ss",
-        deserialize_with = "deserialize_shadowsocks_client",
-        serialize_with = "serialize_shadowsocks_client"
-    )]
-    Shadowsocks {
-        config: ShadowsocksConfig,
-        udp_enabled: bool,
-    },
-    #[serde(
-        deserialize_with = "deserialize_snell_client",
-        serialize_with = "serialize_snell_client"
-    )]
-    Snell {
-        config: ShadowsocksConfig,
-        udp_enabled: bool,
-    },
     Vless {
         user_id: String,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
-        /// H2MUX multiplexing configuration
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        h2mux: Option<H2MuxConfig>,
-    },
-    Trojan {
-        password: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        shadowsocks: Option<ShadowsocksConfig>,
         /// H2MUX multiplexing configuration
         #[serde(default, skip_serializing_if = "Option::is_none")]
         h2mux: Option<H2MuxConfig>,
@@ -384,57 +163,8 @@ pub enum ClientProxyConfig {
 
         protocol: Box<ClientProxyConfig>,
     },
-    #[serde(alias = "shadowtls")]
-    ShadowTls {
-        /// ShadowTLS password for authentication
-        password: String,
-
-        /// Optional SNI hostname override
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sni_hostname: Option<String>,
-
-        /// Inner protocol (typically VLESS, Trojan, etc.)
-        protocol: Box<ClientProxyConfig>,
-    },
     #[serde(deserialize_with = "deserialize_tls_variant")]
     Tls(TlsClientConfig),
-    #[serde(deserialize_with = "deserialize_vmess_client")]
-    Vmess {
-        cipher: String,
-        user_id: String,
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
-        udp_enabled: bool,
-        /// H2MUX multiplexing configuration
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        h2mux: Option<H2MuxConfig>,
-    },
-    #[serde(alias = "ws")]
-    Websocket(WebsocketClientConfig),
-    #[serde(alias = "noop")]
-    PortForward,
-    /// AnyTLS outbound protocol
-    Anytls {
-        /// Authentication password
-        password: String,
-        /// UDP over TCP support (default: true)
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
-        udp_enabled: bool,
-        /// Custom padding scheme (optional, uses default if not specified)
-        /// Each line is a key=value pair like "stop=8" or "0=30-30"
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        padding_scheme: Option<Vec<String>>,
-    },
-    /// NaiveProxy client protocol (HTTP/2 CONNECT with padding)
-    #[serde(alias = "naive")]
-    Naiveproxy {
-        /// Username for Basic Auth
-        username: String,
-        /// Password for Basic Auth
-        password: String,
-        /// Enable padding protocol (default: true)
-        #[serde(default = "default_true", skip_serializing_if = "is_true")]
-        padding: bool,
-    },
 }
 
 impl ClientProxyConfig {
@@ -446,20 +176,9 @@ impl ClientProxyConfig {
     pub fn protocol_name(&self) -> &str {
         match self {
             ClientProxyConfig::Direct => "Direct",
-            ClientProxyConfig::Http { .. } => "HTTP",
-            ClientProxyConfig::Socks { .. } => "SOCKS5",
-            ClientProxyConfig::Shadowsocks { .. } => "Shadowsocks",
-            ClientProxyConfig::Snell { .. } => "Snell",
             ClientProxyConfig::Vless { .. } => "VLESS",
-            ClientProxyConfig::Trojan { .. } => "Trojan",
             ClientProxyConfig::Reality { .. } => "Reality",
             ClientProxyConfig::Tls(..) => "TLS",
-            ClientProxyConfig::ShadowTls { .. } => "ShadowTLS",
-            ClientProxyConfig::Vmess { .. } => "VMess",
-            ClientProxyConfig::Websocket(..) => "WebSocket",
-            ClientProxyConfig::PortForward => "PortForward",
-            ClientProxyConfig::Anytls { .. } => "AnyTLS",
-            ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",
         }
     }
 }
@@ -498,33 +217,24 @@ pub struct TlsClientConfig {
     pub protocol: Box<ClientProxyConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WebsocketClientConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matching_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matching_headers: Option<HashMap<String, String>>,
-    #[serde(default, skip_serializing_if = "WebsocketPingType::is_default")]
-    pub ping_type: WebsocketPingType,
-    pub protocol: Box<ClientProxyConfig>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    const TEST_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
     fn create_test_client_config() -> ClientConfig {
         ClientConfig {
             bind_interface: NoneOrOne::One("eth0".to_string()),
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
-            protocol: ClientProxyConfig::Socks {
-                username: Some("client_user".to_string()),
-                password: Some("client_pass".to_string()),
+            protocol: ClientProxyConfig::Vless {
+                user_id: TEST_UUID.to_string(),
+                udp_enabled: true,
+                h2mux: None,
             },
             transport: Transport::Tcp,
             tcp_settings: None,
-            quic_settings: None,
         }
     }
 
@@ -537,25 +247,60 @@ mod tests {
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
         assert!(matches!(
             deserialized.protocol,
-            ClientProxyConfig::Socks { .. }
+            ClientProxyConfig::Vless { .. }
         ));
     }
 
     #[test]
-    fn test_rejects_unknown_field_in_vmess_client() {
-        // Test ClientProxyConfig::Vmess directly
+    fn test_rejects_retired_client_protocol_types() {
+        for protocol_type in [
+            "http",
+            "socks",
+            "socks5",
+            "shadowsocks",
+            "ss",
+            "snell",
+            "trojan",
+            "shadowtls",
+            "vmess",
+            "websocket",
+            "ws",
+            "portforward",
+            "noop",
+            "anytls",
+            "naiveproxy",
+            "naive",
+        ] {
+            let yaml = format!("type: {protocol_type}\n");
+            let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(&yaml);
+            let err = result
+                .expect_err(&format!(
+                    "retired client protocol {protocol_type} must be rejected"
+                ))
+                .to_string();
+            assert!(
+                err.contains("unknown variant"),
+                "error for {protocol_type} should name the unknown variant, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rejects_shadowtls_password_in_tls_client() {
         let yaml = r#"
-type: vmess
-cipher: aes-128-gcm
-user_id: "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4"
-unknown_option: true
+type: tls
+shadowtls_password: "secret"
+protocol:
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#;
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result
+            .expect_err("deprecated shadowtls_password must be rejected")
+            .to_string();
         assert!(
-            err.contains("unknown field `unknown_option`"),
-            "Error should mention unknown field: {err}"
+            err.contains("shadowtls_password"),
+            "Error should mention the removed field: {err}"
         );
     }
 
@@ -567,7 +312,8 @@ type: tls
 verify: true
 wrong_field: "oops"
 protocol:
-  type: socks
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#;
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err());
@@ -584,7 +330,7 @@ protocol:
         let yaml = r#"
 address: "127.0.0.1:9090"
 protocol:
-  type: socks
+  type: direct
 invalid_client_field: "bad"
 "#;
         let result: Result<ClientConfig, _> = serde_yaml::from_str(yaml);
@@ -607,37 +353,68 @@ type: direct
     }
 
     #[test]
-    fn test_client_proxy_config_socks() {
+    fn test_client_proxy_config_vless_with_h2mux() {
         let yaml = r#"
-type: socks
-username: "user"
-password: "pass"
+type: vless
+user_id: "550e8400-e29b-41d4-a716-446655440000"
+h2mux:
+  max_connections: 4
+  min_streams: 1
 "#;
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ClientProxyConfig::Socks { .. }));
+        let ClientProxyConfig::Vless { h2mux, .. } = result.unwrap() else {
+            panic!("expected VLESS");
+        };
+        let options = h2mux.expect("h2mux config").to_options();
+        assert_eq!(options.max_connections, 4);
+        assert_eq!(options.min_streams, 1);
     }
 
     #[test]
-    fn test_client_proxy_config_http() {
+    fn test_client_proxy_config_tls_vision_vless() {
         let yaml = r#"
-type: http
-"#;
-        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ClientProxyConfig::Http { .. }));
-    }
-
-    #[test]
-    fn test_websocket_client_config() {
-        let yaml = r#"
-type: websocket
-matching_path: "/ws"
+type: tls
+sni_hostname: "test.local"
+verify: false
+vision: true
 protocol:
-  type: direct
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
 "#;
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ClientProxyConfig::Websocket(_)));
+        let ClientProxyConfig::Tls(tls) = result.unwrap() else {
+            panic!("expected TLS");
+        };
+        assert!(tls.vision);
+        assert!(matches!(
+            tls.protocol.as_ref(),
+            ClientProxyConfig::Vless { .. }
+        ));
+    }
+
+    #[test]
+    fn test_client_proxy_config_reality_vision_vless() {
+        let yaml = r#"
+type: reality
+public_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+short_id: "0123456789abcdef"
+sni_hostname: "example.com"
+vision: true
+protocol:
+  type: vless
+  user_id: "550e8400-e29b-41d4-a716-446655440000"
+"#;
+        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_ok());
+        let ClientProxyConfig::Reality {
+            vision, protocol, ..
+        } = result.unwrap()
+        else {
+            panic!("expected Reality");
+        };
+        assert!(vision);
+        assert!(matches!(protocol.as_ref(), ClientProxyConfig::Vless { .. }));
     }
 }

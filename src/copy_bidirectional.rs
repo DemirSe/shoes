@@ -20,8 +20,24 @@ use crate::util::allocate_vec;
 const DEFAULT_BUF_SIZE: usize = 16384;
 const MAX_COPY_BYTES_PER_POLL: usize = 1024 * 1024;
 
+// The two shutdown policies are separate entry points, so each one is a separate
+// compile-time instantiation. The ordinary instantiation carries no progress
+// counters and no drain checks.
+//
+// - `copy_bidirectional` fails a stalled half-close shutdown after
+//   `SHUTDOWN_TIMEOUT`.
+// - `copy_bidirectional_with_progress_aware_shutdown` extends that deadline while
+//   either direction still moves bytes, up to `SHUTDOWN_DRAIN_LIMIT` from the first
+//   half-close. Fallback REALITY sessions use it so queued, rate-limited reply data
+//   drains.
+
+/// Total time a progress-aware transfer may wait on a stalled shutdown. Progress
+/// cannot extend the wait past this limit, so a peer that never reaches EOF cannot
+/// defer cleanup forever.
+const SHUTDOWN_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug)]
-struct CopyBuffer {
+struct CopyBuffer<const TRACK_PROGRESS: bool> {
     read_done: bool,
     need_flush: bool,
     need_write_ping: bool,
@@ -29,9 +45,13 @@ struct CopyBuffer {
     cache_length: usize,
     size: usize,
     buf: Box<[u8]>,
+    /// Counts completed reads, writes, flushes, and pings. Only
+    /// `TRACK_PROGRESS` transfers read the count. The `false` instantiation
+    /// never writes it and never compares it.
+    progress: u64,
 }
 
-impl CopyBuffer {
+impl<const TRACK_PROGRESS: bool> CopyBuffer<TRACK_PROGRESS> {
     pub fn new(size: usize, need_initial_flush: bool) -> Self {
         let buf = allocate_vec(size);
         Self {
@@ -42,6 +62,16 @@ impl CopyBuffer {
             cache_length: 0,
             size,
             buf: buf.into_boxed_slice(),
+            progress: 0,
+        }
+    }
+
+    /// Records one completed read, write, flush, or ping. The check disappears
+    /// from the ordinary instantiation at compile time.
+    #[inline(always)]
+    fn note_progress(&mut self) {
+        if TRACK_PROGRESS {
+            self.progress += 1;
         }
     }
 
@@ -61,6 +91,7 @@ impl CopyBuffer {
             ready!(writer.as_mut().poll_flush(cx))?;
             self.need_flush = false;
             coop.made_progress();
+            self.note_progress();
         }
         let mut copied = 0;
 
@@ -90,6 +121,7 @@ impl CopyBuffer {
                         } else {
                             self.cache_length += n;
                             coop.made_progress();
+                            self.note_progress();
                         }
                     }
                     Poll::Pending => {
@@ -109,6 +141,7 @@ impl CopyBuffer {
                             if written {
                                 self.need_flush = true;
                                 coop.made_progress();
+                                self.note_progress();
                             }
                         }
                         Poll::Pending => {
@@ -151,6 +184,7 @@ impl CopyBuffer {
                             }
                             self.need_flush = true;
                             coop.made_progress();
+                            self.note_progress();
                         }
                     }
                     Poll::Pending => {
@@ -167,6 +201,7 @@ impl CopyBuffer {
                 ready!(writer.as_mut().poll_flush(cx))?;
                 self.need_flush = false;
                 coop.made_progress();
+                self.note_progress();
             }
 
             // If we've written all the data and we've seen EOF, finish the transfer.
@@ -192,20 +227,26 @@ enum TransferState {
     Done,
 }
 
-struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
+struct CopyBidirectional<'a, A: ?Sized, B: ?Sized, const TRACK_PROGRESS: bool> {
     a: &'a mut A,
     b: &'a mut B,
-    a_buf: CopyBuffer,
-    b_buf: CopyBuffer,
+    a_buf: CopyBuffer<TRACK_PROGRESS>,
+    b_buf: CopyBuffer<TRACK_PROGRESS>,
     a_to_b: TransferState,
     b_to_a: TransferState,
     sleep_future: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// When the first direction stopped reading and requested a shutdown.
+    shutdown_started: Option<tokio::time::Instant>,
 }
 
-fn transfer_one_direction<A, B>(
+fn shutdown_timeout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "stream shutdown timed out")
+}
+
+fn transfer_one_direction<A, B, const TRACK_PROGRESS: bool>(
     cx: &mut Context<'_>,
     state: &mut TransferState,
-    buf: &mut CopyBuffer,
+    buf: &mut CopyBuffer<TRACK_PROGRESS>,
     r: &mut A,
     w: &mut B,
 ) -> Poll<io::Result<()>>
@@ -230,11 +271,14 @@ where
                     *state = TransferState::Done;
                 }
                 Poll::Pending => {
+                    if TRACK_PROGRESS {
+                        // The caller reconciles peer progress first, then polls or
+                        // resets this deadline. Deciding here would cancel data that
+                        // the peer direction moves in the same poll.
+                        return Poll::Pending;
+                    }
                     ready!(deadline.as_mut().poll(cx));
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "stream shutdown timed out",
-                    )));
+                    return Poll::Ready(Err(shutdown_timeout_error()));
                 }
             },
             TransferState::Done => return Poll::Ready(Ok(())),
@@ -242,7 +286,7 @@ where
     }
 }
 
-impl<A, B> Future for CopyBidirectional<'_, A, B>
+impl<A, B, const TRACK_PROGRESS: bool> Future for CopyBidirectional<'_, A, B, TRACK_PROGRESS>
 where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
@@ -258,6 +302,7 @@ where
             a_to_b,
             b_to_a,
             sleep_future,
+            shutdown_started,
         } = &mut *self;
 
         if let Some(sleep) = sleep_future {
@@ -273,10 +318,69 @@ where
             }
         }
 
-        let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
-        let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
+        // The counter reads exist only in the opt-in instantiation.
+        let progress_before = if TRACK_PROGRESS {
+            (a_buf.progress, b_buf.progress)
+        } else {
+            (0, 0)
+        };
+        let a_to_b_result = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
+        let b_to_a_result = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
-        match (a_to_b, b_to_a) {
+        if TRACK_PROGRESS {
+            // A genuine I/O error ends the transfer at once; it is never deferred.
+            let failed = matches!(a_to_b_result, Poll::Ready(Err(_)))
+                || matches!(b_to_a_result, Poll::Ready(Err(_)));
+            if !failed {
+                let now = tokio::time::Instant::now();
+                let stalled = matches!(*a_to_b, TransferState::ShuttingDown(_))
+                    || matches!(*b_to_a, TransferState::ShuttingDown(_));
+                let progressed = (a_buf.progress, b_buf.progress) != progress_before;
+                match (stalled, *shutdown_started) {
+                    // The drain limit covers one shutdown phase, so a later half-close
+                    // after a completed shutdown starts a fresh limit.
+                    (true, None) => *shutdown_started = Some(now),
+                    (false, _) => *shutdown_started = None,
+                    (true, Some(_)) => {}
+                }
+                if stalled {
+                    let drain_limit =
+                        shutdown_started.map(|started| started + SHUTDOWN_DRAIN_LIMIT);
+                    // A pending shutdown keeps its deadline while the copy still moves
+                    // bytes. Every timer, including one created after the last progress
+                    // event, stays inside the phase cap.
+                    for state in [&mut *a_to_b, &mut *b_to_a] {
+                        if let TransferState::ShuttingDown(deadline) = state {
+                            let current = deadline.deadline();
+                            let keep = if progressed {
+                                now + crate::util::SHUTDOWN_TIMEOUT
+                            } else {
+                                current
+                            };
+                            let bounded = drain_limit.map_or(keep, |limit| keep.min(limit));
+                            if bounded != current {
+                                deadline.as_mut().reset(bounded);
+                            }
+                        }
+                    }
+                    // The no-progress timeout and the phase cap are decided only after
+                    // both directions and this reconciliation have run. Polling the
+                    // timers here also registers their wakers.
+                    let mut expired = false;
+                    for state in [&mut *a_to_b, &mut *b_to_a] {
+                        if let TransferState::ShuttingDown(deadline) = state {
+                            expired |= deadline.as_mut().poll(cx).is_ready();
+                        }
+                    }
+                    let capped = drain_limit.is_some_and(|limit| now >= limit);
+                    if capped || (!progressed && expired) {
+                        return Poll::Ready(Err(shutdown_timeout_error()));
+                    }
+                }
+            }
+        }
+
+        match (a_to_b_result, b_to_a_result) {
             (Poll::Ready(Err(e)), _) | (_, Poll::Ready(Err(e))) => Poll::Ready(Err(e)),
             (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
             _ => Poll::Pending,
@@ -328,11 +432,64 @@ where
     .await
 }
 
+/// Copies data in both directions between `a` and `b` and lets a stalled half-close
+/// wait for the peer direction to drain.
+///
+/// The ordinary [`copy_bidirectional()`] fails a stalled shutdown after
+/// `SHUTDOWN_TIMEOUT`. This variant extends that deadline while either direction
+/// still moves bytes, up to `SHUTDOWN_DRAIN_LIMIT` from the first half-close.
+/// Fallback REALITY sessions use it, so a rate-limited reply can drain before
+/// cleanup.
+///
+pub(crate) async fn copy_bidirectional_with_progress_aware_shutdown<A, B>(
+    a: &mut A,
+    b: &mut B,
+    a_need_initial_flush: bool,
+    b_need_initial_flush: bool,
+) -> io::Result<()>
+where
+    A: AsyncStream + ?Sized,
+    B: AsyncStream + ?Sized,
+{
+    copy_bidirectional_with_options::<A, B, true>(
+        a,
+        b,
+        a_need_initial_flush,
+        b_need_initial_flush,
+        DEFAULT_BUF_SIZE,
+        DEFAULT_BUF_SIZE,
+    )
+    .await
+}
+
 /// Copies data in both directions between `a` and `b` using buffers of the specified size.
 ///
 /// This method is the same as the [`copy_bidirectional()`], except that it allows you to set the
 /// size of the internal buffers used when copying data.
 pub async fn copy_bidirectional_with_sizes<A, B>(
+    a: &mut A,
+    b: &mut B,
+    a_need_initial_flush: bool,
+    b_need_initial_flush: bool,
+    a_to_b_buf_size: usize,
+    b_to_a_buf_size: usize,
+) -> io::Result<()>
+where
+    A: AsyncStream + ?Sized,
+    B: AsyncStream + ?Sized,
+{
+    copy_bidirectional_with_options::<A, B, false>(
+        a,
+        b,
+        a_need_initial_flush,
+        b_need_initial_flush,
+        a_to_b_buf_size,
+        b_to_a_buf_size,
+    )
+    .await
+}
+
+async fn copy_bidirectional_with_options<A, B, const TRACK_PROGRESS: bool>(
     a: &mut A,
     b: &mut B,
     a_need_initial_flush: bool,
@@ -360,11 +517,12 @@ where
         // this is correctly reversed - CopyBuffer will copy from a (reader) to b (writer) using
         // a_buf, which means that the need_flush signal is for the writer (b), and vice versa for
         // b_buf.
-        a_buf: CopyBuffer::new(a_to_b_buf_size, b_need_initial_flush),
-        b_buf: CopyBuffer::new(b_to_a_buf_size, a_need_initial_flush),
+        a_buf: CopyBuffer::<TRACK_PROGRESS>::new(a_to_b_buf_size, b_need_initial_flush),
+        b_buf: CopyBuffer::<TRACK_PROGRESS>::new(b_to_a_buf_size, a_need_initial_flush),
         a_to_b: TransferState::Running,
         b_to_a: TransferState::Running,
         sleep_future,
+        shutdown_started: None,
     }
     .await
 }
@@ -388,7 +546,6 @@ pub(crate) mod tests {
     pub(crate) struct Capture {
         pub(crate) data: Vec<u8>,
         pub(crate) first_write_offer: Vec<u8>,
-        pub(crate) bytes_before_shutdown: usize,
         writes: Vec<usize>,
         flushes: usize,
         write_release: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -402,6 +559,7 @@ pub(crate) mod tests {
         block_flush: bool,
         pending_at_eof: bool,
         write_limit: Option<usize>,
+        preferred_write_size: Option<std::num::NonZeroUsize>,
         write_flush_release: Option<tokio::sync::oneshot::Receiver<()>>,
     }
 
@@ -475,7 +633,11 @@ pub(crate) mod tests {
         }
     }
 
-    impl AsyncStream for MemoryStream {}
+    impl AsyncStream for MemoryStream {
+        fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
+            self.preferred_write_size
+        }
+    }
 
     struct WakeCount(AtomicUsize);
 
@@ -483,134 +645,6 @@ pub(crate) mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    pub(crate) fn quota_test_payload() -> Vec<u8> {
-        let quota = MAX_COPY_BYTES_PER_POLL;
-        let payload: Vec<u8> = (0..2 * quota + 37)
-            .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
-            .collect();
-        assert!(payload[..quota] != payload[quota..2 * quota]);
-        payload
-    }
-
-    pub(crate) async fn copy_response_with_flush_pressure<W, F>(
-        make_writer: impl FnOnce(Box<dyn AsyncStream>) -> F,
-        payload: &[u8],
-    ) -> Capture
-    where
-        W: AsyncStream,
-        F: Future<Output = W>,
-    {
-        let (write_release, blocked_write) = tokio::sync::oneshot::channel();
-        let sink = MemoryStream {
-            write_limit: Some(7),
-            ..Default::default()
-        };
-        let capture = sink.output.clone();
-        capture.lock().unwrap().write_release = Some(blocked_write);
-        let mut writer = make_writer(Box::new(sink)).await;
-        let mut reader = MemoryStream {
-            pending_at_eof: true,
-            ..Default::default()
-        };
-        let mut buffer = CopyBuffer::new(copy_buffer_size(DEFAULT_BUF_SIZE, &writer), true);
-        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
-        let waker = std::task::Waker::from(wakes.clone());
-        let mut cx = Context::from_waker(&waker);
-
-        // Models an outer TLS handshake flush before any response body is available.
-        let (initial_release, blocked_initial_flush) = tokio::sync::oneshot::channel();
-        capture.lock().unwrap().flush_release = Some(blocked_initial_flush);
-        for _ in 0..2 {
-            assert!(
-                buffer
-                    .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
-                    .is_pending()
-            );
-            assert!(capture.lock().unwrap().data.is_empty());
-        }
-        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
-        initial_release.send(()).unwrap();
-        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
-        assert!(
-            buffer
-                .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
-                .is_pending()
-        );
-        assert!(!buffer.need_flush);
-        for _ in 0..2 {
-            writer.flush().await.unwrap();
-            assert!(capture.lock().unwrap().data.is_empty());
-        }
-
-        reader.input = std::io::Cursor::new(payload.to_vec());
-        if !payload.is_empty() {
-            assert!(
-                buffer
-                    .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
-                    .is_pending()
-            );
-            assert_eq!(capture.lock().unwrap().data.len(), 7);
-            assert!(buffer.need_flush);
-            let position = reader.input.position();
-
-            let (flush_release, blocked_flush) = tokio::sync::oneshot::channel();
-            capture.lock().unwrap().flush_release = Some(blocked_flush);
-            write_release.send(()).unwrap();
-            for _ in 0..2 {
-                assert!(
-                    buffer
-                        .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
-                        .is_pending()
-                );
-                assert_eq!(reader.input.position(), position);
-                assert!(buffer.need_flush);
-            }
-            // Only poll_flush can register this wake; the write gate is already open.
-            wakes.0.store(0, Ordering::Relaxed);
-            flush_release.send(()).unwrap();
-            assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
-        } else {
-            write_release.send(()).unwrap();
-        }
-        let mut quota_yields = 0;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            std::future::poll_fn(|cx| {
-                let result = buffer.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer));
-                assert!(result.is_pending(), "copy did not suspend: {result:?}");
-                if buffer.cache_length > 0 || buffer.need_flush {
-                    return Poll::Pending;
-                }
-                if reader.input.position() as usize == payload.len() {
-                    return Poll::Ready(());
-                }
-                quota_yields += 1;
-                Poll::Pending
-            }),
-        )
-        .await
-        .expect("copier did not resume after quota or flush pressure");
-        if payload.len() > 2 * MAX_COPY_BYTES_PER_POLL {
-            assert!(quota_yields > 0);
-        }
-
-        {
-            let mut output = capture.lock().unwrap();
-            output.bytes_before_shutdown = output.data.len();
-        }
-        reader.pending_at_eof = false;
-        let mut state = TransferState::Running;
-        std::future::poll_fn(|cx| {
-            transfer_one_direction(cx, &mut state, &mut buffer, &mut reader, &mut writer)
-        })
-        .await
-        .unwrap();
-        let wire_len = capture.lock().unwrap().data.len();
-        writer.flush().await.unwrap();
-        assert_eq!(capture.lock().unwrap().data.len(), wire_len);
-        std::mem::take(&mut *capture.lock().unwrap())
     }
 
     #[tokio::test]
@@ -627,7 +661,7 @@ pub(crate) mod tests {
             write_limit: Some(1023),
             ..Default::default()
         };
-        let mut buffer = CopyBuffer::new(DEFAULT_BUF_SIZE, false);
+        let mut buffer = CopyBuffer::<false>::new(DEFAULT_BUF_SIZE, false);
         assert!(
             buffer
                 .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
@@ -649,6 +683,44 @@ pub(crate) mod tests {
         assert_eq!(output.flushes, 4);
     }
 
+    #[test]
+    fn ordinary_copy_leaves_the_progress_counter_untouched() {
+        let mut reader = MemoryStream {
+            input: std::io::Cursor::new(vec![7; 64]),
+            ..Default::default()
+        };
+        let mut writer = MemoryStream::default();
+        let mut buffer = CopyBuffer::<false>::new(DEFAULT_BUF_SIZE, false);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(
+            buffer.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer)),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            buffer.progress, 0,
+            "ordinary copies must not update the progress counter"
+        );
+    }
+
+    #[test]
+    fn progress_aware_copy_counts_progress() {
+        let mut reader = MemoryStream {
+            input: std::io::Cursor::new(vec![7; 64]),
+            ..Default::default()
+        };
+        let mut writer = MemoryStream::default();
+        let mut buffer = CopyBuffer::<true>::new(DEFAULT_BUF_SIZE, false);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(
+            buffer.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer)),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(
+            buffer.progress > 0,
+            "the progress-aware instantiation must count its progress"
+        );
+    }
+
     #[tokio::test]
     async fn write_pressure_resumes_after_a_pending_flush_wakes() {
         let payload: Vec<u8> = (0..128).collect();
@@ -662,7 +734,7 @@ pub(crate) mod tests {
             write_flush_release: Some(blocked),
             ..Default::default()
         };
-        let mut buffer = CopyBuffer::new(32, false);
+        let mut buffer = CopyBuffer::<false>::new(32, false);
         let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
         let waker = std::task::Waker::from(wakes.clone());
         let mut cx = Context::from_waker(&waker);
@@ -701,7 +773,7 @@ pub(crate) mod tests {
             block_flush: true,
             ..Default::default()
         };
-        let mut buffer = CopyBuffer::new(DEFAULT_BUF_SIZE, true);
+        let mut buffer = CopyBuffer::<false>::new(DEFAULT_BUF_SIZE, true);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(
             buffer
@@ -748,7 +820,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let mut writer = MemoryStream::default();
-        let mut buffer = CopyBuffer::new(DEFAULT_BUF_SIZE, false);
+        let mut buffer = CopyBuffer::<false>::new(DEFAULT_BUF_SIZE, false);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(
             buffer
@@ -761,26 +833,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_shadowsocks_copy_avoids_one_byte_records() {
-        use crate::shadowsocks::{
-            DefaultKey, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
+    async fn copy_respects_preferred_write_size_and_avoids_tiny_writes() {
+        let preferred = std::num::NonZeroUsize::new(16383).unwrap();
+        let sink = MemoryStream {
+            preferred_write_size: Some(preferred),
+            ..Default::default()
         };
-
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new("test", 32)));
-        let encrypted = |stream: MemoryStream| {
-            ShadowsocksStream::new(
-                Box::new(stream),
-                ShadowsocksStreamType::Aead,
-                &aws_lc_rs::aead::AES_256_GCM,
-                32,
-                key.clone(),
-                None,
-            )
-        };
-        let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i ^ (i >> 8)) as u8).collect();
-        let sink = MemoryStream::default();
         let capture = sink.output.clone();
-        let mut writer: Box<dyn AsyncStream> = Box::new(encrypted(sink));
+        let mut writer: Box<dyn AsyncStream> = Box::new(sink);
         writer.write_all(b"warm").await.unwrap();
         writer.flush().await.unwrap();
         capture.lock().unwrap().writes.clear();
@@ -789,6 +849,7 @@ pub(crate) mod tests {
         assert_eq!(copy_buffer_size(1024, &writer), 1024);
         assert_eq!(copy_buffer_size(16384, &MemoryStream::default()), 16384);
 
+        let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i ^ (i >> 8)) as u8).collect();
         let mut source = MemoryStream {
             input: std::io::Cursor::new(payload.clone()),
             ..Default::default()
@@ -802,14 +863,8 @@ pub(crate) mod tests {
             assert!(!captured.writes.contains(&35));
             captured.data.clone()
         };
-        let mut reader = encrypted(MemoryStream {
-            input: std::io::Cursor::new(wire),
-            ..Default::default()
-        });
-        let mut decoded = Vec::new();
-        reader.read_to_end(&mut decoded).await.unwrap();
-        assert_eq!(&decoded[..4], b"warm");
-        assert_eq!(&decoded[4..], payload);
+        assert_eq!(&wire[..4], b"warm");
+        assert_eq!(&wire[4..], payload);
     }
 
     struct StalledShutdown;
@@ -887,5 +942,423 @@ pub(crate) mod tests {
         client.read_to_end(&mut response).await.unwrap();
         assert_eq!(response, b"response");
         copy.await.unwrap().unwrap();
+    }
+
+    /// Reader behavior for the shutdown-policy probes.
+    #[derive(Clone, Copy)]
+    enum PeerReads {
+        /// Report EOF immediately.
+        Eof,
+        /// Release one byte per interval, then report EOF.
+        Drip {
+            remaining: usize,
+            interval: std::time::Duration,
+        },
+        /// Release one byte per interval, then wait one more interval before EOF.
+        DripThenPause {
+            remaining: usize,
+            interval: std::time::Duration,
+        },
+        /// Always release another kilobyte, and never report EOF.
+        Endless,
+    }
+
+    /// Writer behavior for the shutdown-policy probes.
+    #[derive(Clone, Copy)]
+    enum PeerWrites {
+        /// Accept every offered byte, up to `limit` bytes per call.
+        Accept { limit: usize },
+        /// Never accept data.
+        Pending,
+    }
+
+    /// Shutdown behavior for the shutdown-policy probes.
+    #[derive(Clone, Copy)]
+    enum PeerShutdown {
+        /// Complete the shutdown at once.
+        Ready,
+        /// Never complete the shutdown.
+        Pending,
+        /// Stay pending until the given instant, then complete.
+        At(tokio::time::Instant),
+    }
+
+    struct ProbePeer {
+        reads: PeerReads,
+        writes: PeerWrites,
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        shutdown: PeerShutdown,
+        shutdown_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        captured: Arc<AtomicUsize>,
+        read_calls: Arc<AtomicUsize>,
+    }
+
+    impl ProbePeer {
+        fn new(reads: PeerReads, writes: PeerWrites, shutdown: PeerShutdown) -> Self {
+            Self {
+                reads,
+                writes,
+                sleep: None,
+                shutdown,
+                shutdown_sleep: None,
+                captured: Arc::new(AtomicUsize::new(0)),
+                read_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl AsyncRead for ProbePeer {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let me = self.get_mut();
+            me.read_calls.fetch_add(1, Ordering::Relaxed);
+            match &mut me.reads {
+                PeerReads::Eof => Poll::Ready(Ok(())),
+                PeerReads::Endless => {
+                    let chunk = buf.remaining().min(1024);
+                    buf.put_slice(&[0; 1024][..chunk]);
+                    Poll::Ready(Ok(()))
+                }
+                PeerReads::Drip {
+                    remaining,
+                    interval,
+                } => {
+                    if *remaining == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    if let Some(sleep) = me.sleep.as_mut() {
+                        ready!(sleep.as_mut().poll(cx));
+                    }
+                    me.sleep = None;
+                    buf.put_slice(&[0]);
+                    *remaining -= 1;
+                    let interval = *interval;
+                    me.sleep = Some(Box::pin(tokio::time::sleep(interval)));
+                    Poll::Ready(Ok(()))
+                }
+                PeerReads::DripThenPause {
+                    remaining,
+                    interval,
+                } => {
+                    if *remaining == 0 {
+                        if let Some(sleep) = me.sleep.as_mut() {
+                            ready!(sleep.as_mut().poll(cx));
+                        }
+                        me.sleep = None;
+                        return Poll::Ready(Ok(()));
+                    }
+                    if let Some(sleep) = me.sleep.as_mut() {
+                        ready!(sleep.as_mut().poll(cx));
+                    }
+                    me.sleep = None;
+                    buf.put_slice(&[0]);
+                    *remaining -= 1;
+                    let interval = *interval;
+                    me.sleep = Some(Box::pin(tokio::time::sleep(interval)));
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+
+    impl AsyncWrite for ProbePeer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let me = self.get_mut();
+            match me.writes {
+                PeerWrites::Accept { limit } => {
+                    let accepted = data.len().min(limit);
+                    me.captured.fetch_add(accepted, Ordering::Relaxed);
+                    Poll::Ready(Ok(accepted))
+                }
+                PeerWrites::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let me = self.get_mut();
+            match me.shutdown {
+                PeerShutdown::Ready => Poll::Ready(Ok(())),
+                PeerShutdown::Pending => Poll::Pending,
+                PeerShutdown::At(at) => {
+                    if tokio::time::Instant::now() >= at {
+                        return Poll::Ready(Ok(()));
+                    }
+                    if me.shutdown_sleep.is_none() {
+                        me.shutdown_sleep = Some(Box::pin(tokio::time::sleep_until(at)));
+                    }
+                    if let Some(sleep) = me.shutdown_sleep.as_mut() {
+                        ready!(sleep.as_mut().poll(cx));
+                    }
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+
+    impl AsyncPing for ProbePeer {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for ProbePeer {}
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_aware_shutdown_waits_for_a_dripping_peer() {
+        const REPLY_BYTES: usize = 8;
+        let run = |progress_aware: bool| async move {
+            let mut stalled = ProbePeer::new(
+                PeerReads::Eof,
+                PeerWrites::Accept { limit: usize::MAX },
+                PeerShutdown::Pending,
+            );
+            let captured = stalled.captured.clone();
+            let mut drip = ProbePeer::new(
+                PeerReads::Drip {
+                    remaining: REPLY_BYTES,
+                    interval: std::time::Duration::from_secs(1),
+                },
+                PeerWrites::Accept { limit: usize::MAX },
+                PeerShutdown::Pending,
+            );
+            let started = tokio::time::Instant::now();
+            let error = if progress_aware {
+                copy_bidirectional_with_progress_aware_shutdown(
+                    &mut stalled,
+                    &mut drip,
+                    false,
+                    false,
+                )
+                .await
+            } else {
+                copy_bidirectional(&mut stalled, &mut drip, false, false).await
+            }
+            .unwrap_err();
+            (
+                error.kind(),
+                captured.load(Ordering::Relaxed),
+                started.elapsed(),
+            )
+        };
+
+        let (kind, delivered, elapsed) = run(false).await;
+        assert_eq!(kind, io::ErrorKind::TimedOut);
+        assert_eq!(elapsed, crate::util::SHUTDOWN_TIMEOUT);
+        assert!(
+            delivered < REPLY_BYTES,
+            "the fixed deadline must abandon the queued reply, delivered {delivered}/{REPLY_BYTES}"
+        );
+
+        let (kind, delivered, elapsed) = run(true).await;
+        assert_eq!(kind, io::ErrorKind::TimedOut);
+        assert_eq!(
+            delivered, REPLY_BYTES,
+            "the progress-aware policy must deliver the queued reply first"
+        );
+        assert_eq!(elapsed, std::time::Duration::from_secs(12));
+    }
+
+    /// Boundary: the stalled direction's deadline expires in the same poll that
+    /// moves a reply byte. The queued third byte must survive that poll.
+    #[tokio::test(start_paused = true)]
+    async fn progress_aware_deferred_timeout_keeps_a_slow_reply_stalled_first() {
+        const REPLY_BYTES: usize = 3;
+        let mut stalled = ProbePeer::new(
+            PeerReads::Eof,
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Pending,
+        );
+        let captured = stalled.captured.clone();
+        let mut drip = ProbePeer::new(
+            PeerReads::Drip {
+                remaining: REPLY_BYTES,
+                interval: std::time::Duration::from_secs(5),
+            },
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Pending,
+        );
+        let started = tokio::time::Instant::now();
+        let error =
+            copy_bidirectional_with_progress_aware_shutdown(&mut stalled, &mut drip, false, false)
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(captured.load(Ordering::Relaxed), REPLY_BYTES);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(15));
+    }
+
+    /// Boundary: the same expiry with the directions swapped, so the stalled
+    /// direction is polled second.
+    #[tokio::test(start_paused = true)]
+    async fn progress_aware_deferred_timeout_keeps_a_slow_reply_stalled_second() {
+        const REPLY_BYTES: usize = 3;
+        let mut drip = ProbePeer::new(
+            PeerReads::Drip {
+                remaining: REPLY_BYTES,
+                interval: std::time::Duration::from_secs(5),
+            },
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Pending,
+        );
+        let mut stalled = ProbePeer::new(
+            PeerReads::Eof,
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Pending,
+        );
+        let captured = stalled.captured.clone();
+        let started = tokio::time::Instant::now();
+        let error =
+            copy_bidirectional_with_progress_aware_shutdown(&mut drip, &mut stalled, false, false)
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(captured.load(Ordering::Relaxed), REPLY_BYTES);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(15));
+    }
+
+    /// Boundary: a pending shutdown created after the last progress event must not
+    /// outlive the phase cap, even when the earlier shutdown completes at the cap.
+    #[tokio::test(start_paused = true)]
+    async fn progress_aware_phase_cap_bounds_a_later_pending_shutdown() {
+        const REPLY_BYTES: usize = 59;
+        // The first pending shutdown has waited since t=0 and completes at the cap.
+        let mut drip = ProbePeer::new(
+            PeerReads::DripThenPause {
+                remaining: REPLY_BYTES,
+                interval: std::time::Duration::from_secs(1),
+            },
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::At(tokio::time::Instant::now() + std::time::Duration::from_secs(60)),
+        );
+        // The second pending shutdown appears at t=59, when the drip reaches EOF.
+        let mut eof = ProbePeer::new(
+            PeerReads::Eof,
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Pending,
+        );
+        let captured = eof.captured.clone();
+        let started = tokio::time::Instant::now();
+        let error =
+            copy_bidirectional_with_progress_aware_shutdown(&mut drip, &mut eof, false, false)
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(captured.load(Ordering::Relaxed), REPLY_BYTES);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_aware_drain_stops_at_the_progress_limit() {
+        let mut stalled = ProbePeer::new(
+            PeerReads::Eof,
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Pending,
+        );
+        let mut endless = ProbePeer::new(
+            PeerReads::Endless,
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Pending,
+        );
+        let captured = stalled.captured.clone();
+        let mut copy = Box::pin(copy_bidirectional_with_progress_aware_shutdown(
+            &mut stalled,
+            &mut endless,
+            false,
+            false,
+        ));
+        let started = tokio::time::Instant::now();
+        let mut polls = 0u32;
+        let error = loop {
+            if let Poll::Ready(result) = futures::poll!(copy.as_mut()) {
+                break result.unwrap_err();
+            }
+            polls += 1;
+            assert!(polls <= 65, "the shutdown drain outlived its limit");
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(60));
+        assert!(
+            captured.load(Ordering::Relaxed) > 0,
+            "the endless peer must make progress for this case to apply"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_aware_drain_limit_restarts_for_a_later_half_close() {
+        let mut stalled = ProbePeer::new(
+            PeerReads::Eof,
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Pending,
+        );
+        let captured = stalled.captured.clone();
+        let mut drip = ProbePeer::new(
+            PeerReads::Drip {
+                remaining: 3,
+                interval: std::time::Duration::from_secs(31),
+            },
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Ready,
+        );
+        let started = tokio::time::Instant::now();
+        let error =
+            copy_bidirectional_with_progress_aware_shutdown(&mut stalled, &mut drip, false, false)
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(captured.load(Ordering::Relaxed), 3);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(67));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_aware_shutdown_needs_progress_to_extend_the_deadline() {
+        let mut stalled =
+            ProbePeer::new(PeerReads::Eof, PeerWrites::Pending, PeerShutdown::Pending);
+        let mut endless = ProbePeer::new(
+            PeerReads::Endless,
+            PeerWrites::Accept { limit: usize::MAX },
+            PeerShutdown::Pending,
+        );
+        let read_calls = endless.read_calls.clone();
+        let mut copy = Box::pin(copy_bidirectional_with_progress_aware_shutdown(
+            &mut stalled,
+            &mut endless,
+            false,
+            false,
+        ));
+        let started = tokio::time::Instant::now();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..4 {
+            assert!(copy.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(
+            read_calls.load(Ordering::Relaxed) <= 32,
+            "a stalled shutdown kept reading an endless peer"
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), copy.as_mut())
+            .await
+            .expect("the stalled shutdown had no deadline")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), crate::util::SHUTDOWN_TIMEOUT);
+        assert!(
+            read_calls.load(Ordering::Relaxed) <= 32,
+            "reaching the deadline must not spin on the endless peer"
+        );
     }
 }

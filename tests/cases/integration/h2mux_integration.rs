@@ -118,23 +118,6 @@ async fn send_tcp_via_socks5(
     }
 }
 
-/// Sends a request without relying on the peer to propagate a TCP half-close.
-async fn send_tcp_stream_via_socks5(
-    socks_ip: &str,
-    socks_port: u16,
-    target_host: &str,
-    target_port: u16,
-    payload: &[u8],
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut tcp = connect_tcp_via_socks5(socks_ip, socks_port, target_host, target_port).await?;
-    tcp.write_all(payload).await?;
-
-    let mut response = vec![0; payload.len()];
-    timeout(Duration::from_secs(10), tcp.read_exact(&mut response)).await??;
-    tcp.shutdown().await?;
-    Ok(response)
-}
-
 // H2MUX TCP Integration Tests
 
 /// Test h2mux TCP with VLESS: sing-box client -> shoes server
@@ -945,234 +928,7 @@ async fn test_h2mux_vless_udp_disabled() -> Result<(), Box<dyn std::error::Error
 
 // H2MUX Shadowsocks Tests
 
-const TEST_SS_PASSWORD: &str = "test-shadowsocks-password";
-
-/// Test h2mux TCP with Shadowsocks: sing-box client -> shoes server
-#[tokio::test]
-async fn test_h2mux_shadowsocks_tcp_basic() -> Result<(), Box<dyn std::error::Error>> {
-    let mut port_helper = PortHelper::new();
-    let (shoes_ip, shoes_port) = port_helper.get_localhost_listener_port();
-    let (singbox_socks_ip, singbox_socks_port) = port_helper.get_listener_port();
-    let (tcp_echo_ip, tcp_echo_port) = port_helper.get_port();
-
-    eprintln!(
-        "[TEST] H2MUX Shadowsocks TCP: shoes={}, sing-box SOCKS={}, TCP echo={}",
-        shoes_port, singbox_socks_port, tcp_echo_port
-    );
-
-    // Start TCP echo server
-    let _tcp_echo_server = start_tcp_eof_echo_server(&tcp_echo_ip, tcp_echo_port).await?;
-
-    // Start shoes Shadowsocks server (no TLS needed)
-    let shoes_config = format!(
-        r#"- address: "{}:{}"
-  protocol:
-    type: shadowsocks
-    cipher: aes-128-gcm
-    password: "{}"
-    udp_enabled: true"#,
-        shoes_ip, shoes_port, TEST_SS_PASSWORD,
-    );
-    let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
-
-    // sing-box config: SOCKS inbound -> Shadowsocks outbound with h2mux multiplexing
-    let singbox_config = format!(
-        r#"{{
-  "log": {{ "level": "debug" }},
-  "inbounds": [{{ "type": "socks", "tag": "socks-in", "listen": "{}", "listen_port": {} }}],
-  "outbounds": [{{
-    "type": "shadowsocks",
-    "tag": "ss-out",
-    "server": "{}",
-    "server_port": {},
-    "method": "aes-128-gcm",
-    "password": "{}",
-    "multiplex": {{ "enabled": true, "protocol": "h2mux", "max_connections": 1, "min_streams": 1, "max_streams": 0 }}
-  }}],
-  "route": {{ "final": "ss-out" }}
-}}"#,
-        singbox_socks_ip, singbox_socks_port, shoes_ip, shoes_port, TEST_SS_PASSWORD
-    );
-    let (_singbox_guard, _singbox_config_file) = start_singbox_server(&singbox_config)?;
-
-    // Wait for servers to start
-    port_helper.wait_for_all_ports().await?;
-    sleep(Duration::from_millis(500)).await;
-
-    // Send test request via SOCKS5
-    let response = send_tcp_via_socks5(
-        &singbox_socks_ip,
-        singbox_socks_port,
-        &tcp_echo_ip,
-        tcp_echo_port,
-        b"H2MUX Shadowsocks TCP Test!",
-    )
-    .await?;
-
-    let response_str = std::str::from_utf8(&response)?;
-    eprintln!("[TEST] Response: {:?}", response_str);
-    assert!(response_str.contains("H2MUX Shadowsocks TCP Test!"));
-    assert!(response_str.ends_with(" [ECHO]"));
-
-    eprintln!("[TEST] H2MUX Shadowsocks TCP basic test passed!");
-    Ok(())
-}
-
-/// Test h2mux UDP with Shadowsocks: sing-box client -> shoes server
-#[tokio::test]
-async fn test_h2mux_shadowsocks_udp_basic() -> Result<(), Box<dyn std::error::Error>> {
-    let mut port_helper = PortHelper::new();
-    let (shoes_ip, shoes_port) = port_helper.get_localhost_listener_port();
-    let (singbox_socks_ip, singbox_socks_port) = port_helper.get_listener_port();
-    let (udp_echo_ip, udp_echo_port) = port_helper.get_port();
-
-    eprintln!(
-        "[TEST] H2MUX Shadowsocks UDP: shoes={}, sing-box SOCKS={}, UDP echo={}",
-        shoes_port, singbox_socks_port, udp_echo_port
-    );
-
-    // Start UDP echo server
-    let _echo_server = start_udp_echo_server(&udp_echo_ip, udp_echo_port).await?;
-
-    // Start shoes Shadowsocks server with UDP enabled
-    let shoes_config = format!(
-        r#"- address: "{}:{}"
-  protocol:
-    type: shadowsocks
-    cipher: aes-128-gcm
-    password: "{}"
-    udp_enabled: true"#,
-        shoes_ip, shoes_port, TEST_SS_PASSWORD,
-    );
-    let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
-
-    // sing-box config: SOCKS inbound -> Shadowsocks outbound with h2mux
-    let singbox_config = format!(
-        r#"{{
-  "log": {{ "level": "debug" }},
-  "inbounds": [{{ "type": "socks", "tag": "socks-in", "listen": "{}", "listen_port": {} }}],
-  "outbounds": [{{
-    "type": "shadowsocks",
-    "tag": "ss-out",
-    "server": "{}",
-    "server_port": {},
-    "method": "aes-128-gcm",
-    "password": "{}",
-    "multiplex": {{ "enabled": true, "protocol": "h2mux", "max_connections": 1, "min_streams": 1, "max_streams": 0 }}
-  }}],
-  "route": {{ "final": "ss-out" }}
-}}"#,
-        singbox_socks_ip, singbox_socks_port, shoes_ip, shoes_port, TEST_SS_PASSWORD
-    );
-    let (_singbox_guard, _singbox_config_file) = start_singbox_server(&singbox_config)?;
-
-    // Wait for servers
-    port_helper.wait_for_all_ports().await?;
-    sleep(Duration::from_millis(500)).await;
-
-    // Use SOCKS5 UDP ASSOCIATE
-    let association = Socks5UdpAssociation::connect(&singbox_socks_ip, singbox_socks_port).await?;
-    let target: SocketAddr = format!("{udp_echo_ip}:{udp_echo_port}").parse()?;
-
-    // Send test packet
-    let response = association
-        .send_to(target, b"H2MUX Shadowsocks UDP Test!")
-        .await?;
-
-    let response_str = std::str::from_utf8(&response)?;
-    eprintln!("[TEST] Response: {:?}", response_str);
-    assert!(response_str.contains("H2MUX Shadowsocks UDP Test!"));
-    assert!(response_str.ends_with(" [ECHO]"));
-
-    eprintln!("[TEST] H2MUX Shadowsocks UDP basic test passed!");
-    Ok(())
-}
-
 // H2MUX Trojan Tests
-
-const TEST_TROJAN_PASSWORD: &str = "test-trojan-password";
-
-/// Test h2mux TCP with Trojan: sing-box client -> shoes server
-#[tokio::test]
-async fn test_h2mux_trojan_tcp_basic() -> Result<(), Box<dyn std::error::Error>> {
-    let mut port_helper = PortHelper::new();
-    let (shoes_ip, shoes_port) = port_helper.get_localhost_listener_port();
-    let (singbox_socks_ip, singbox_socks_port) = port_helper.get_listener_port();
-    let (tcp_echo_ip, tcp_echo_port) = port_helper.get_port();
-
-    eprintln!(
-        "[TEST] H2MUX Trojan TCP: shoes={}, sing-box SOCKS={}, TCP echo={}",
-        shoes_port, singbox_socks_port, tcp_echo_port
-    );
-
-    // Start TCP echo server
-    let _tcp_echo_server = start_tcp_eof_echo_server(&tcp_echo_ip, tcp_echo_port).await?;
-
-    // Generate self-signed test certificate
-    let (cert_path, key_path) = generate_test_cert_files()?;
-
-    // Start shoes Trojan server (TLS + Trojan inner)
-    let shoes_config = format!(
-        r#"- address: "{}:{}"
-  protocol:
-    type: tls
-    tls_targets:
-      "test.local":
-        cert: {}
-        key: {}
-        protocol:
-          type: trojan
-          password: "{}""#,
-        shoes_ip,
-        shoes_port,
-        AsRef::<Path>::as_ref(&cert_path).to_str().unwrap(),
-        AsRef::<Path>::as_ref(&key_path).to_str().unwrap(),
-        TEST_TROJAN_PASSWORD,
-    );
-    let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
-
-    // sing-box config: SOCKS inbound -> Trojan outbound with h2mux multiplexing
-    let singbox_config = format!(
-        r#"{{
-  "log": {{ "level": "debug" }},
-  "inbounds": [{{ "type": "socks", "tag": "socks-in", "listen": "{}", "listen_port": {} }}],
-  "outbounds": [{{
-    "type": "trojan",
-    "tag": "trojan-out",
-    "server": "{}",
-    "server_port": {},
-    "password": "{}",
-    "tls": {{ "enabled": true, "server_name": "test.local", "insecure": true }},
-    "multiplex": {{ "enabled": true, "protocol": "h2mux", "max_connections": 1, "min_streams": 1, "max_streams": 0 }}
-  }}],
-  "route": {{ "final": "trojan-out" }}
-}}"#,
-        singbox_socks_ip, singbox_socks_port, shoes_ip, shoes_port, TEST_TROJAN_PASSWORD
-    );
-    let (_singbox_guard, _singbox_config_file) = start_singbox_server(&singbox_config)?;
-
-    // Wait for servers to start
-    port_helper.wait_for_all_ports().await?;
-    sleep(Duration::from_millis(500)).await;
-
-    // Send test request via SOCKS5
-    let response = send_tcp_via_socks5(
-        &singbox_socks_ip,
-        singbox_socks_port,
-        &tcp_echo_ip,
-        tcp_echo_port,
-        b"H2MUX Trojan TCP Test!",
-    )
-    .await?;
-
-    let response_str = std::str::from_utf8(&response)?;
-    eprintln!("[TEST] Response: {:?}", response_str);
-    assert!(response_str.contains("H2MUX Trojan TCP Test!"));
-    assert!(response_str.ends_with(" [ECHO]"));
-
-    eprintln!("[TEST] H2MUX Trojan TCP basic test passed!");
-    Ok(())
-}
 
 // H2MUX with Padding Tests
 
@@ -1382,7 +1138,8 @@ fn test_h2mux_client_config_parsing() {
     let yaml = r#"
 - address: "127.0.0.1:8080"
   protocol:
-    type: socks
+    type: vless
+    user_id: "a3482e88-686a-4a58-8126-99c9034e4b09"
   rules:
     - masks: ["0.0.0.0/0"]
       action: allow
@@ -1434,23 +1191,73 @@ fn test_h2mux_client_config_parsing() {
     assert!(h2mux.padding);
 }
 
+// Additional coverage tests for all client/server combinations
+
+/// Sends a request without relying on the peer to propagate a TCP half-close.
+async fn send_tcp_stream_via_socks5(
+    socks_ip: &str,
+    socks_port: u16,
+    target_host: &str,
+    target_port: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut tcp = connect_tcp_via_socks5(socks_ip, socks_port, target_host, target_port).await?;
+    tcp.write_all(payload).await?;
+
+    let mut response = vec![0; payload.len()];
+    timeout(Duration::from_secs(10), tcp.read_exact(&mut response)).await??;
+    tcp.shutdown().await?;
+    Ok(response)
+}
+
+/// Start a stock sing-box SOCKS entry that forwards through a shoes VLESS front.
+///
+/// The retired shoes SOCKS proxy front is replaced by this stock-client entry;
+/// the shoes H2MUX client behavior under test still runs inside the front server.
+fn start_singbox_vless_socks_entry(
+    entry_ip: &str,
+    entry_port: u16,
+    front_ip: &str,
+    front_port: u16,
+) -> std::io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
+    let config = format!(
+        r#"{{
+  "log": {{ "level": "debug" }},
+  "inbounds": [{{ "type": "socks", "tag": "socks-in", "listen": "{}", "listen_port": {} }}],
+  "outbounds": [{{
+    "type": "vless",
+    "tag": "vless-out",
+    "server": "{}",
+    "server_port": {},
+    "uuid": "{}"
+  }}],
+  "route": {{ "final": "vless-out" }}
+}}"#,
+        entry_ip, entry_port, front_ip, front_port, TEST_UUID
+    );
+    start_singbox_server(&config)
+}
+
 /// Test shoes as h2mux client connecting to shoes h2mux server
 #[tokio::test]
 async fn test_h2mux_shoes_client_to_shoes_server() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = PortHelper::new();
     // Server A: VLESS + h2mux server (the upstream)
     let (server_a_ip, server_a_port) = port_helper.get_localhost_listener_port();
-    // Server B: SOCKS5 proxy that uses h2mux client to connect to Server A
+    // Server B: VLESS front that uses the h2mux client to connect to Server A
     let (server_b_ip, server_b_port) = port_helper.get_localhost_listener_port();
+    // Stock sing-box SOCKS entry that forwards through Server B
+    let (entry_ip, entry_port) = port_helper.get_localhost_listener_port();
     // Echo server (the final destination)
     let (tcp_echo_ip, tcp_echo_port) = port_helper.get_localhost_listener_port();
 
     eprintln!("[TEST] H2MUX shoes client to shoes server");
     eprintln!("  Server A (upstream): {}:{}", server_a_ip, server_a_port);
     eprintln!(
-        "  Server B (h2mux client proxy): {}:{}",
+        "  Server B (h2mux client front): {}:{}",
         server_b_ip, server_b_port
     );
+    eprintln!("  sing-box SOCKS entry: {}:{}", entry_ip, entry_port);
     eprintln!("  Echo server: {}:{}", tcp_echo_ip, tcp_echo_port);
 
     // Start TCP echo server
@@ -1479,11 +1286,12 @@ async fn test_h2mux_shoes_client_to_shoes_server() -> Result<(), Box<dyn std::er
         TEST_UUID,
     );
 
-    // Server B config: SOCKS5 proxy that uses h2mux client to connect to Server A
+    // Server B config: VLESS front that uses the h2mux client to connect to Server A
     let server_b_config = format!(
         r#"- address: "{}:{}"
   protocol:
-    type: socks
+    type: vless
+    user_id: "{}"
   rules:
     - mask: 0.0.0.0/0
       action: allow
@@ -1500,23 +1308,27 @@ async fn test_h2mux_shoes_client_to_shoes_server() -> Result<(), Box<dyn std::er
                 max_connections: 2
                 min_streams: 2
 "#,
-        server_b_ip, server_b_port, server_a_ip, server_a_port, TEST_UUID,
+        server_b_ip, server_b_port, TEST_UUID, server_a_ip, server_a_port, TEST_UUID,
     );
 
     // Start Server A (upstream)
     let (_server_a_guard, _server_a_config_file) = start_shoes_server(&server_a_config)?;
 
-    // Start Server B (h2mux client proxy)
+    // Start Server B (h2mux client front)
     let (_server_b_guard, _server_b_config_file) = start_shoes_server(&server_b_config)?;
+
+    // Start the stock sing-box entry
+    let (_entry_guard, _entry_config_file) =
+        start_singbox_vless_socks_entry(&entry_ip, entry_port, &server_b_ip, server_b_port)?;
 
     // Wait for servers
     port_helper.wait_for_all_ports().await?;
     sleep(Duration::from_millis(500)).await;
 
-    // Connect through Server B (SOCKS5) which uses h2mux to Server A
+    // Connect through the entry, which reaches Server B and its h2mux client
     let response = send_tcp_via_socks5(
-        &server_b_ip,
-        server_b_port,
+        &entry_ip,
+        entry_port,
         &tcp_echo_ip,
         tcp_echo_port,
         b"H2MUX Client Test Message",
@@ -1538,6 +1350,7 @@ async fn test_h2mux_client_concurrent_streams() -> Result<(), Box<dyn std::error
     let mut port_helper = PortHelper::new();
     let (server_a_ip, server_a_port) = port_helper.get_localhost_listener_port();
     let (server_b_ip, server_b_port) = port_helper.get_localhost_listener_port();
+    let (entry_ip, entry_port) = port_helper.get_localhost_listener_port();
     let (tcp_echo_ip, tcp_echo_port) = port_helper.get_localhost_listener_port();
 
     eprintln!("[TEST] H2MUX client concurrent streams");
@@ -1568,11 +1381,12 @@ async fn test_h2mux_client_concurrent_streams() -> Result<(), Box<dyn std::error
         TEST_UUID,
     );
 
-    // Server B config (h2mux client)
+    // Server B config (h2mux client front)
     let server_b_config = format!(
         r#"- address: "{}:{}"
   protocol:
-    type: socks
+    type: vless
+    user_id: "{}"
   rules:
     - mask: 0.0.0.0/0
       action: allow
@@ -1589,11 +1403,13 @@ async fn test_h2mux_client_concurrent_streams() -> Result<(), Box<dyn std::error
                 max_connections: 1
                 min_streams: 4
 "#,
-        server_b_ip, server_b_port, server_a_ip, server_a_port, TEST_UUID,
+        server_b_ip, server_b_port, TEST_UUID, server_a_ip, server_a_port, TEST_UUID,
     );
 
     let (_server_a_guard, _server_a_config_file) = start_shoes_server(&server_a_config)?;
     let (_server_b_guard, _server_b_config_file) = start_shoes_server(&server_b_config)?;
+    let (_entry_guard, _entry_config_file) =
+        start_singbox_vless_socks_entry(&entry_ip, entry_port, &server_b_ip, server_b_port)?;
 
     port_helper.wait_for_all_ports().await?;
     sleep(Duration::from_millis(500)).await;
@@ -1601,13 +1417,13 @@ async fn test_h2mux_client_concurrent_streams() -> Result<(), Box<dyn std::error
     // Send multiple concurrent requests
     let mut handles = Vec::new();
     for i in 0..5 {
-        let server_b_ip = server_b_ip.clone();
+        let entry_ip = entry_ip.clone();
         let tcp_echo_ip = tcp_echo_ip.clone();
         let handle = tokio::spawn(async move {
             let msg = format!("Concurrent Message #{}", i);
             let response = send_tcp_via_socks5(
-                &server_b_ip,
-                server_b_port,
+                &entry_ip,
+                entry_port,
                 &tcp_echo_ip,
                 tcp_echo_port,
                 msg.as_bytes(),
@@ -1635,8 +1451,6 @@ async fn test_h2mux_client_concurrent_streams() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-// Additional coverage tests for all client/server combinations
-
 /// Test shoes h2mux client connecting to shoes h2mux server WITH padding enabled
 #[tokio::test]
 async fn test_h2mux_shoes_client_to_shoes_server_with_padding()
@@ -1644,6 +1458,7 @@ async fn test_h2mux_shoes_client_to_shoes_server_with_padding()
     let mut port_helper = PortHelper::new();
     let (server_a_ip, server_a_port) = port_helper.get_localhost_listener_port();
     let (server_b_ip, server_b_port) = port_helper.get_localhost_listener_port();
+    let (entry_ip, entry_port) = port_helper.get_localhost_listener_port();
     let (tcp_echo_ip, tcp_echo_port) = port_helper.get_localhost_listener_port();
 
     eprintln!("[TEST] H2MUX shoes client to shoes server WITH padding");
@@ -1671,11 +1486,12 @@ async fn test_h2mux_shoes_client_to_shoes_server_with_padding()
         TEST_UUID,
     );
 
-    // Server B: SOCKS5 proxy using h2mux client WITH padding
+    // Server B: VLESS front using the h2mux client WITH padding
     let server_b_config = format!(
         r#"- address: "{}:{}"
   protocol:
-    type: socks
+    type: vless
+    user_id: "{}"
   rules:
     - mask: 0.0.0.0/0
       action: allow
@@ -1691,11 +1507,13 @@ async fn test_h2mux_shoes_client_to_shoes_server_with_padding()
               h2mux:
                 padding: true
 "#,
-        server_b_ip, server_b_port, server_a_ip, server_a_port, TEST_UUID,
+        server_b_ip, server_b_port, TEST_UUID, server_a_ip, server_a_port, TEST_UUID,
     );
 
     let (_server_a_guard, _server_a_config_file) = start_shoes_server(&server_a_config)?;
     let (_server_b_guard, _server_b_config_file) = start_shoes_server(&server_b_config)?;
+    let (_entry_guard, _entry_config_file) =
+        start_singbox_vless_socks_entry(&entry_ip, entry_port, &server_b_ip, server_b_port)?;
 
     port_helper.wait_for_all_ports().await?;
     sleep(Duration::from_millis(500)).await;
@@ -1704,8 +1522,8 @@ async fn test_h2mux_shoes_client_to_shoes_server_with_padding()
     for i in 0..20 {
         let msg = format!("Shoes-to-Shoes Padding Test #{}", i);
         let response = send_tcp_via_socks5(
-            &server_b_ip,
-            server_b_port,
+            &entry_ip,
+            entry_port,
             &tcp_echo_ip,
             tcp_echo_port,
             msg.as_bytes(),
@@ -1731,6 +1549,7 @@ async fn test_h2mux_shoes_client_to_singbox_server() -> Result<(), Box<dyn std::
     let mut port_helper = PortHelper::new();
     let (singbox_server_ip, singbox_server_port) = port_helper.get_localhost_listener_port();
     let (shoes_proxy_ip, shoes_proxy_port) = port_helper.get_localhost_listener_port();
+    let (entry_ip, entry_port) = port_helper.get_localhost_listener_port();
     let (tcp_echo_ip, tcp_echo_port) = port_helper.get_localhost_listener_port();
 
     eprintln!("[TEST] H2MUX shoes client to sing-box server");
@@ -1739,9 +1558,10 @@ async fn test_h2mux_shoes_client_to_singbox_server() -> Result<(), Box<dyn std::
         singbox_server_ip, singbox_server_port
     );
     eprintln!(
-        "  shoes proxy (h2mux client): {}:{}",
+        "  shoes front (h2mux client): {}:{}",
         shoes_proxy_ip, shoes_proxy_port
     );
+    eprintln!("  sing-box SOCKS entry: {}:{}", entry_ip, entry_port);
     eprintln!("  Echo server: {}:{}", tcp_echo_ip, tcp_echo_port);
 
     let _tcp_echo_server = start_tcp_stream_echo_server(&tcp_echo_ip, tcp_echo_port).await?;
@@ -1778,11 +1598,12 @@ async fn test_h2mux_shoes_client_to_singbox_server() -> Result<(), Box<dyn std::
         AsRef::<Path>::as_ref(&key_path).to_str().unwrap(),
     );
 
-    // shoes as SOCKS5 proxy using h2mux client to connect to sing-box
+    // shoes as a VLESS front using the h2mux client to connect to sing-box
     let shoes_config = format!(
         r#"- address: "{}:{}"
   protocol:
-    type: socks
+    type: vless
+    user_id: "{}"
   rules:
     - mask: 0.0.0.0/0
       action: allow
@@ -1797,24 +1618,25 @@ async fn test_h2mux_shoes_client_to_singbox_server() -> Result<(), Box<dyn std::
               user_id: "{}"
               h2mux: {{}}
 "#,
-        shoes_proxy_ip, shoes_proxy_port, singbox_server_ip, singbox_server_port, TEST_UUID,
+        shoes_proxy_ip,
+        shoes_proxy_port,
+        TEST_UUID,
+        singbox_server_ip,
+        singbox_server_port,
+        TEST_UUID,
     );
 
     let (_singbox_guard, _singbox_config_file) = start_singbox_server(&singbox_config)?;
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_entry_guard, _entry_config_file) =
+        start_singbox_vless_socks_entry(&entry_ip, entry_port, &shoes_proxy_ip, shoes_proxy_port)?;
 
     port_helper.wait_for_all_ports().await?;
     sleep(Duration::from_millis(500)).await;
 
     let msg = b"Hello from shoes client to sing-box server!";
-    let response = send_tcp_stream_via_socks5(
-        &shoes_proxy_ip,
-        shoes_proxy_port,
-        &tcp_echo_ip,
-        tcp_echo_port,
-        msg,
-    )
-    .await?;
+    let response =
+        send_tcp_stream_via_socks5(&entry_ip, entry_port, &tcp_echo_ip, tcp_echo_port, msg).await?;
 
     assert_eq!(response, msg);
 
@@ -1829,6 +1651,7 @@ async fn test_h2mux_shoes_client_to_singbox_server_with_padding()
     let mut port_helper = PortHelper::new();
     let (singbox_server_ip, singbox_server_port) = port_helper.get_localhost_listener_port();
     let (shoes_proxy_ip, shoes_proxy_port) = port_helper.get_localhost_listener_port();
+    let (entry_ip, entry_port) = port_helper.get_localhost_listener_port();
     let (tcp_echo_ip, tcp_echo_port) = port_helper.get_localhost_listener_port();
 
     eprintln!("[TEST] H2MUX shoes client to sing-box server WITH padding");
@@ -1867,11 +1690,12 @@ async fn test_h2mux_shoes_client_to_singbox_server_with_padding()
         AsRef::<Path>::as_ref(&key_path).to_str().unwrap(),
     );
 
-    // shoes as SOCKS5 proxy using h2mux client with padding
+    // shoes as a VLESS front using the h2mux client with padding
     let shoes_config = format!(
         r#"- address: "{}:{}"
   protocol:
-    type: socks
+    type: vless
+    user_id: "{}"
   rules:
     - mask: 0.0.0.0/0
       action: allow
@@ -1887,11 +1711,18 @@ async fn test_h2mux_shoes_client_to_singbox_server_with_padding()
               h2mux:
                 padding: true
 "#,
-        shoes_proxy_ip, shoes_proxy_port, singbox_server_ip, singbox_server_port, TEST_UUID,
+        shoes_proxy_ip,
+        shoes_proxy_port,
+        TEST_UUID,
+        singbox_server_ip,
+        singbox_server_port,
+        TEST_UUID,
     );
 
     let (_singbox_guard, _singbox_config_file) = start_singbox_server(&singbox_config)?;
     let (_shoes_guard, _shoes_config_file) = start_shoes_server(&shoes_config)?;
+    let (_entry_guard, _entry_config_file) =
+        start_singbox_vless_socks_entry(&entry_ip, entry_port, &shoes_proxy_ip, shoes_proxy_port)?;
 
     port_helper.wait_for_all_ports().await?;
     sleep(Duration::from_millis(500)).await;
@@ -1900,8 +1731,8 @@ async fn test_h2mux_shoes_client_to_singbox_server_with_padding()
     for i in 0..20 {
         let msg = format!("Shoes-to-Singbox Padding Test #{}", i);
         let response = send_tcp_stream_via_socks5(
-            &shoes_proxy_ip,
-            shoes_proxy_port,
+            &entry_ip,
+            entry_port,
             &tcp_echo_ip,
             tcp_echo_port,
             msg.as_bytes(),

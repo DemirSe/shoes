@@ -1,50 +1,31 @@
 # shoes
 
-shoes is a high-performance multi-protocol proxy server written in Rust.
+shoes is a high-performance proxy server written in Rust.
 
 ## Supported Protocols
 
 ### Proxy Protocols
-- **HTTP/HTTPS**
-- **SOCKS5** (with UDP ASSOCIATE)
-- **Mixed** (auto-detect HTTP/SOCKS5)
-- **VMess AEAD**
 - **VLESS** (with fallback support)
-- **Shadowsocks**
-- **Trojan**
-- **Snell v3**
-- **Hysteria2**
-- **TUIC v5**
-- **AnyTLS**
-- **NaiveProxy**
-- **H2MUX** (supported with VMess, VLESS, Trojan, Shadowsocks, Snell)
+- **H2MUX** (HTTP/2 multiplexing for VLESS)
 
 ### Transport Protocols
-All server protocols plus:
-- **SagerNet UDP over TCP** (for Shadowsocks, SOCKS5, AnyTLS, NaiveProxy)
-- **ShadowTLS v3**
 - **TLS**
-- **WebSocket** (Shadowsocks SIP003)
 - **XTLS Reality**
 - **XTLS Vision** (for VLESS)
+- **XUDP** (UDP multiplexing over VLESS)
 
 ### TUN/VPN Mode
 - **TUN device support** - Layer 3 VPN for transparent proxying
 - Supported platforms: Linux, Android, iOS
 
-### Supported Ciphers
-- **VMess**: `aes-128-gcm`, `chacha20-poly1305`, `none`
-- **Shadowsocks**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`, `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-ietf-poly1305`
-- **Snell v3**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
-
 ## Features
 
-- **Multi-transport**: TCP or QUIC for all protocols
+- **TCP transport** with direct IPv4 and IPv6 outbound support
 - **TLS with SNI routing**: Route by Server Name Indication
 - **Upstream proxy chaining**: Multi-hop chains with load balancing
 - **Rule-based routing**: Route by IP/CIDR or hostname masks
 - **Named PEM certificates**: Define once, reference everywhere
-- **TLS fingerprint authentication**: Certificate pinning for TLS/QUIC
+- **TLS fingerprint authentication**: Certificate pinning for TLS
 - **Hot reloading**: Apply config changes without restart
 - **Unix socket support**: Bind to Unix domain sockets
 
@@ -71,8 +52,8 @@ OPTIONS:
     --no-reload          Disable automatic config reloading on file changes
 
 COMMANDS:
-    generate-reality-keypair                  Generate a new Reality X25519 keypair
-    generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password
+    generate-reality-keypair    Generate a new Reality X25519 keypair
+    generate-vless-user-id      Generate a random VLESS user ID (UUID v4)
 ```
 
 ### Examples
@@ -95,8 +76,8 @@ shoes --no-reload config.yaml
 # Generate Reality keypair
 shoes generate-reality-keypair
 
-# Generate Shadowsocks 2022 cipher password
-shoes generate-shadowsocks-2022-password 2022-blake3-aes-256-gcm
+# Generate a VLESS user ID
+shoes generate-vless-user-id
 ```
 
 ## Configuration
@@ -107,13 +88,12 @@ See [CONFIG.md](./CONFIG.md) for the complete YAML configuration reference.
 
 See the [examples](./examples) directory for all examples.
 
-### Basic VMess Server
+### Basic VLESS Server
 ```yaml
-- address: 0.0.0.0:16823
+- address: 0.0.0.0:443
   protocol:
-    type: vmess
-    cipher: chacha20-poly1305
-    user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+    type: vless
+    user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
     udp_enabled: true
 ```
 
@@ -150,11 +130,31 @@ See the [examples](./examples) directory for all examples.
           udp_enabled: true
 ```
 
-### Reality Client
+### Upstream VLESS Chain with H2MUX
 ```yaml
-- address: 127.0.0.1:1080
+- address: 0.0.0.0:443
   protocol:
-    type: socks
+    type: vless
+    user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "server.example.com:443"
+        protocol:
+          type: vless
+          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+          h2mux:
+            max_connections: 4
+            min_streams: 1
+```
+
+### Upstream VLESS Chain
+```yaml
+- address: 0.0.0.0:443
+  protocol:
+    type: vless
+    user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
   rules:
     - masks: "0.0.0.0/0"
       action: allow
@@ -168,77 +168,6 @@ See the [examples](./examples) directory for all examples.
           protocol:
             type: vless
             user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-```
-
-### Hysteria2 Server
-```yaml
-- address: 0.0.0.0:443
-  transport: quic
-  quic_settings:
-    cert: cert.pem
-    key: key.pem
-    alpn_protocols: ["h3"]
-  protocol:
-    type: hysteria2
-    password: supersecret
-    udp_enabled: true
-```
-
-### TUIC v5 Server
-```yaml
-- address: 0.0.0.0:443
-  transport: quic
-  quic_settings:
-    cert: cert.pem
-    key: key.pem
-  protocol:
-    type: tuic
-    uuid: d685aef3-b3c4-4932-9a9d-d0c2f6727dfa
-    password: supersecret
-```
-
-### Mixed HTTP/SOCKS5 Server
-```yaml
-- address: 0.0.0.0:7890
-  protocol:
-    type: mixed
-    username: myuser
-    password: mypassword
-```
-
-### AnyTLS Server
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: tls
-    tls_targets:
-      "anytls.example.com":
-        cert: cert.pem
-        key: key.pem
-        protocol:
-          type: anytls
-          users:
-            - name: user1
-              password: secret123
-          udp_enabled: true
-```
-
-### NaiveProxy Server
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: tls
-    tls_targets:
-      "naive.example.com":
-        cert: cert.pem
-        key: key.pem
-        alpn_protocols: ["h2"]
-        protocol:
-          type: naiveproxy
-          users:
-            - username: user1
-              password: secret123
-          padding: true
 ```
 
 ### TUN VPN
@@ -263,10 +192,6 @@ See the [examples](./examples) directory for all examples.
 
 ## Similar Projects
 
-- [apernet/hysteria](https://github.com/apernet/hysteria)
-- [ihciah/shadow-tls](https://github.com/ihciah/shadow-tls)
 - [SagerNet/sing-box](https://github.com/SagerNet/sing-box)
-- [shadowsocks/shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust)
-- [EAimTY/tuic](https://github.com/EAimTY/tuic)
 - [v2fly/v2ray-core](https://github.com/v2fly/v2ray-core)
 - [XTLS/Xray-core](https://github.com/XTLS/Xray-core)

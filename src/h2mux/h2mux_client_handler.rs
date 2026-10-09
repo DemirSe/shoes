@@ -25,7 +25,7 @@ use super::{H2MuxOptions, MUX_DESTINATION_HOST, MUX_DESTINATION_PORT};
 
 /// H2MUX client handler that multiplexes streams over HTTP/2.
 ///
-/// This handler wraps an inner protocol handler (e.g., Shadowsocks, VLESS)
+/// This handler wraps an inner protocol handler (e.g., VLESS)
 /// and establishes h2mux on the transport supplied by the proxy chain.
 #[derive(Debug)]
 pub struct H2MuxClientHandler {

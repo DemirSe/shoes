@@ -30,7 +30,6 @@ path = "src/main.rs"
 default = []
 ffi = []  # Enable FFI module for non-Android builds
 integration-tests = []
-optional-peer-tests = ["integration-tests"]
 external-network-tests = ["integration-tests"]
 privileged-tests = ["integration-tests"]
 stress-tests = ["integration-tests"]
@@ -46,11 +45,6 @@ path = "tests/external_network.rs"
 required-features = ["external-network-tests"]
 
 [[test]]
-name = "optional_peer"
-path = "tests/optional_peer.rs"
-required-features = ["optional-peer-tests"]
-
-[[test]]
 name = "privileged"
 path = "tests/privileged.rs"
 required-features = ["privileged-tests"]
@@ -64,10 +58,8 @@ required-features = ["stress-tests"]
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
-blake3 = "*"
 bytes = "*"
 chrono = "*"
-dashmap = "*"
 digest = "*"
 etherparse = "*"
 futures = "*"
@@ -76,29 +68,20 @@ h3 = "*"
 h3-quinn = "*"
 hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
 http = "*"
-http-body-util = "*"
-hyper = { version = "*", features = ["server", "http1", "http2"] }
-hyper-util = { version = "*", features = ["tokio", "server"] }
 indexmap = "*"
 libc = "*"
 log = { version = "*", features = ["std", "release_max_level_info"] }
 lru = "*"
-md-5 = "*"
 memchr = "*"
-mime_guess = "*"
 notify = "*"
 parking_lot = "*"
-percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "*"
-rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-rust-argon2 = "*"
 rustc-hash = "*"
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_yaml = "*"
-shake = "*"
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
 socket2 = "*"
 subtle = "*"

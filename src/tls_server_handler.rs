@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,14 +6,11 @@ use rustc_hash::FxHashMap;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
-use crate::naiveproxy::UserLookup;
 use crate::reality::{RealityServerTarget, setup_reality_server_stream};
 use crate::resolver::Resolver;
 use crate::rustls_connection_util::feed_rustls_server_connection;
-use crate::shadow_tls::{
-    ParsedClientHello, ShadowTlsServerTarget, read_client_hello, setup_shadowtls_server_stream,
-};
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::tls_hello::{ParsedClientHello, read_client_hello};
 
 use crate::address::NetLocation;
 
@@ -26,30 +22,17 @@ pub struct VisionVlessConfig {
     pub fallback: Option<NetLocation>,
 }
 
-/// Configuration for NaiveProxy inner protocol
-#[derive(Debug, Clone)]
-pub struct NaiveConfig {
-    pub users: Arc<UserLookup>,
-    pub fallback_path: Option<PathBuf>,
-    pub udp_enabled: bool,
-    pub padding_enabled: bool,
-}
-
 /// What to do after TLS/Reality termination.
 ///
 /// This enum unifies the previous `handler` + `vision_config` pattern into
 /// a single field that represents the inner protocol handling.
 #[derive(Debug)]
 pub enum InnerProtocol {
-    /// Normal handler (standard behavior for most protocols like
-    /// VMess, VLESS without Vision, Shadowsocks, Trojan, etc.)
+    /// Normal handler (standard VLESS behavior without Vision)
     Normal(Box<dyn TcpServerHandler>),
 
     /// Vision VLESS - specialized VLESS handling with Vision flow control
     VisionVless(VisionVlessConfig),
-
-    /// NaiveProxy - hyper-based HTTP/2 proxy with built-in static file fallback
-    Naive(NaiveConfig),
 }
 
 #[derive(Debug)]
@@ -61,10 +44,9 @@ pub enum TlsServerTarget {
         /// This selector is passed to inner handlers at construction and should be used
         /// for routing decisions. For Vision mode, this is passed to the VLESS setup function.
         effective_selector: Arc<ClientProxySelector>,
-        /// What to do after TLS termination - normal handler, Vision VLESS, or Naive
+        /// What to do after TLS termination - normal handler or Vision VLESS
         inner_protocol: InnerProtocol,
     },
-    ShadowTls(ShadowTlsServerTarget),
     Reality(RealityServerTarget),
 }
 
@@ -184,15 +166,6 @@ impl TcpServerHandler for TlsServerHandler {
                         )
                         .await
                     }
-                    InnerProtocol::Naive(naive_cfg) => {
-                        crate::naiveproxy::setup_naive_server_stream(
-                            tls_stream,
-                            naive_cfg,
-                            effective_selector.clone(),
-                            self.fallback_resolver.clone(),
-                        )
-                        .await
-                    }
                 };
 
                 if let Ok(ref mut setup_result) = target_setup_result {
@@ -203,15 +176,6 @@ impl TcpServerHandler for TlsServerHandler {
                 }
 
                 target_setup_result
-            }
-            TlsServerTarget::ShadowTls(target) => {
-                setup_shadowtls_server_stream(
-                    server_stream,
-                    target,
-                    parsed_client_hello,
-                    &self.fallback_resolver,
-                )
-                .await
             }
             TlsServerTarget::Reality(target) => {
                 setup_reality_server_stream(

@@ -58,12 +58,8 @@ pub fn build_client_proxy_chain(
     let initial_hop: Vec<InitialHopEntry> = hops[0]
         .iter()
         .map(|config| {
-            // Find the first proxy address for QUIC socket configuration
-            let target_address = find_first_proxy_address(&hops, config);
-
-            let socket = SocketConnectorImpl::from_config(config, target_address)
-                .map(|s| Box::new(s) as Box<dyn SocketConnector>)
-                .expect("Failed to create SocketConnector");
+            let socket =
+                Box::new(SocketConnectorImpl::from_config(config)) as Box<dyn SocketConnector>;
 
             if config.protocol.is_direct() {
                 // Direct: socket only, no proxy
@@ -108,28 +104,6 @@ pub fn build_client_proxy_chain(
     ClientProxyChain::new(initial_hop, subsequent_hops)
 }
 
-/// Find the first proxy address in the chain (for socket connector target).
-fn find_first_proxy_address<'a>(
-    hops: &'a [Vec<ClientConfig>],
-    current_config: &'a ClientConfig,
-) -> Option<&'a crate::address::NetLocation> {
-    // If current config is a proxy, use its address
-    if !current_config.protocol.is_direct() {
-        return Some(&current_config.address);
-    }
-
-    // Otherwise, look at subsequent hops
-    for hop in hops.iter().skip(1) {
-        for config in hop {
-            if !config.protocol.is_direct() {
-                return Some(&config.address);
-            }
-        }
-    }
-
-    None
-}
-
 /// Build a "direct" ClientChainGroup (no proxy, just socket connection).
 /// Uses the same pattern as build_client_chain_group with no chains configured.
 pub fn build_direct_chain_group(resolver: Arc<dyn Resolver>) -> ClientChainGroup {
@@ -172,12 +146,13 @@ mod tests {
         Arc::new(NativeResolver::new())
     }
 
-    fn socks_config(port: u16) -> ClientConfig {
+    fn vless_config(port: u16) -> ClientConfig {
         ClientConfig {
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
-            protocol: ClientProxyConfig::Socks {
-                username: None,
-                password: None,
+            protocol: ClientProxyConfig::Vless {
+                user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                udp_enabled: true,
+                h2mux: None,
             },
             ..Default::default()
         }
@@ -205,7 +180,7 @@ mod tests {
     fn test_build_single_proxy_hop() {
         let chain = build_client_proxy_chain(
             OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                socks_config(1080),
+                vless_config(1080),
             ))),
             mock_resolver(),
         );
@@ -219,12 +194,12 @@ mod tests {
         let chain = build_client_proxy_chain(
             OneOrSome::Some(vec![
                 ClientChainHop::Single(ConfigSelection::Config(direct_config())),
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
+                ClientChainHop::Single(ConfigSelection::Config(vless_config(1080))),
             ]),
             mock_resolver(),
         );
 
-        // direct (hop 0) -> socks (hop 1)
+        // direct (hop 0) -> vless (hop 1)
         // InitialHopEntry::Direct + 1 subsequent hop = 2 hops total
         assert_eq!(chain.num_hops(), 2);
     }
@@ -233,13 +208,13 @@ mod tests {
     fn test_build_two_proxy_hops() {
         let chain = build_client_proxy_chain(
             OneOrSome::Some(vec![
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1081))),
+                ClientChainHop::Single(ConfigSelection::Config(vless_config(1080))),
+                ClientChainHop::Single(ConfigSelection::Config(vless_config(1081))),
             ]),
             mock_resolver(),
         );
 
-        // socks1 (hop 0) -> socks2 (hop 1)
+        // vless1 (hop 0) -> vless2 (hop 1)
         assert_eq!(chain.num_hops(), 2);
     }
 
@@ -247,8 +222,8 @@ mod tests {
     fn test_build_pool_at_hop0() {
         let chain = build_client_proxy_chain(
             OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
-                ConfigSelection::Config(socks_config(1080)),
-                ConfigSelection::Config(socks_config(1081)),
+                ConfigSelection::Config(vless_config(1080)),
+                ConfigSelection::Config(vless_config(1081)),
             ]))),
             mock_resolver(),
         );
@@ -269,7 +244,7 @@ mod tests {
         let chains = NoneOrSome::Some(vec![
             ClientChain {
                 hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                    socks_config(1080),
+                    vless_config(1080),
                 ))),
             },
             ClientChain {
@@ -288,7 +263,7 @@ mod tests {
     fn test_direct_at_hop1_panics() {
         build_client_proxy_chain(
             OneOrSome::Some(vec![
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
+                ClientChainHop::Single(ConfigSelection::Config(vless_config(1080))),
                 ClientChainHop::Single(ConfigSelection::Config(direct_config())),
             ]),
             mock_resolver(),
@@ -300,9 +275,9 @@ mod tests {
     fn test_direct_in_pool_at_hop1_panics() {
         build_client_proxy_chain(
             OneOrSome::Some(vec![
-                ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
+                ClientChainHop::Single(ConfigSelection::Config(vless_config(1080))),
                 ClientChainHop::Pool(OneOrSome::Some(vec![
-                    ConfigSelection::Config(socks_config(1081)),
+                    ConfigSelection::Config(vless_config(1081)),
                     ConfigSelection::Config(direct_config()),
                 ])),
             ]),
@@ -319,31 +294,5 @@ mod tests {
             ))),
             mock_resolver(),
         );
-    }
-
-    #[test]
-    fn test_find_first_proxy_address_direct_only() {
-        let direct = direct_config();
-        let hops = vec![vec![direct.clone()]];
-        assert!(find_first_proxy_address(&hops, &direct).is_none());
-    }
-
-    #[test]
-    fn test_find_first_proxy_address_proxy_at_hop0() {
-        let proxy = socks_config(1080);
-        let hops = vec![vec![proxy.clone()]];
-        let addr = find_first_proxy_address(&hops, &proxy);
-        assert!(addr.is_some());
-        assert_eq!(addr.unwrap().port(), 1080);
-    }
-
-    #[test]
-    fn test_find_first_proxy_address_proxy_at_hop1() {
-        let direct = direct_config();
-        let proxy = socks_config(1080);
-        let hops = vec![vec![direct.clone()], vec![proxy.clone()]];
-        let addr = find_first_proxy_address(&hops, &direct);
-        assert!(addr.is_some());
-        assert_eq!(addr.unwrap().port(), 1080);
     }
 }

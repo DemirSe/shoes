@@ -11,7 +11,7 @@
 //!
 //! # Features
 //!
-//! - **Multi-protocol support**: VLESS, VMess, Trojan, Shadowsocks, and more
+//! - **VLESS support**: VLESS over TLS, REALITY, and Vision, with H2MUX and XUDP
 //! - **TUN device support**: Virtual network interface for VPN mode
 //! - **Proxy chaining**: Connect through multiple proxies
 //! - **Flexible routing**: Rule-based traffic routing
@@ -56,7 +56,6 @@
 // Modules are declared here (mirroring main.rs) so the library crate can
 // expose them for FFI/mobile integration.
 mod address;
-mod anytls;
 mod async_stream;
 mod buf_reader;
 mod client_proxy_chain;
@@ -66,17 +65,10 @@ mod copy_bidirectional_message;
 mod crypto;
 pub mod dns;
 mod h2mux;
-mod http_handler;
-mod hysteria2_server;
 mod listener_tasks;
-mod mixed_handler;
-mod naiveproxy;
 mod option_util;
-mod port_forward_handler;
 mod prepend_stream;
 mod quic_endpoint;
-mod quic_server;
-mod quic_stream;
 mod reality;
 mod reality_client_handler;
 pub mod resolver;
@@ -84,28 +76,19 @@ pub mod resources;
 mod routing;
 mod rustls_config_util;
 mod rustls_connection_util;
-mod shadow_tls;
-mod shadowsocks;
 mod slide_buffer;
-mod snell;
 mod socket_util;
-mod socks5_udp_relay;
-mod socks_handler;
 mod stream_reader;
 mod sync_adapter;
 mod tcp;
 mod thread_util;
 mod tls_client_handler;
+mod tls_hello;
 mod tls_server_handler;
-mod trojan_handler;
-mod tuic_server;
-mod udp_fragments;
 mod uot;
 mod util;
 mod uuid_util;
 mod vless;
-mod vmess;
-mod websocket;
 mod xudp;
 
 /// Configuration types.

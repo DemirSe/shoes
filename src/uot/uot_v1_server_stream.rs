@@ -1,4 +1,4 @@
-//! Packet-address stream implementation shared by UoT V1/V2 non-connect and h2mux.
+//! Packet-address stream implementation for h2mux `packet_addr` mode.
 //!
 //! Frame format:
 //! ```text
@@ -6,9 +6,7 @@
 //! | u8   | variable | u16be | u16be  | variable |
 //! ```
 //!
-//! The address serializer depends on the transport:
-//! - UoT V1 and V2 non-connect use sing `AddrParser`
-//! - h2mux `packet_addr` uses SOCKS-style `SocksaddrSerializer`
+//! Uses the SOCKS-style `SocksaddrSerializer` address encoding.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -18,7 +16,6 @@ use futures::ready;
 use tokio::io::ReadBuf;
 
 use super::socks_addr::{parse_socks_packet_address, write_socks_packet_address};
-use super::uot_common::{parse_uot_address, write_uot_address};
 use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadTargetedMessage, AsyncShutdownMessage, AsyncStream,
@@ -36,11 +33,6 @@ struct AddressCodec {
     parse: ParseFn,
     write: fn(&mut [u8], &SocketAddr) -> usize,
 }
-
-const UOT_ADDR_CODEC: AddressCodec = AddressCodec {
-    parse: parse_uot_address,
-    write: write_uot_address,
-};
 
 const SOCKS_ADDR_CODEC: AddressCodec = AddressCodec {
     parse: parse_socks_packet_address,
@@ -76,23 +68,9 @@ impl<S: AsyncStream> PacketAddrStream<S> {
         }
     }
 
-    /// Create a stream that uses sing UoT `AddrParser` packet addresses.
-    pub fn new_uot(stream: S) -> Self {
-        Self::new_with_codec(stream, &UOT_ADDR_CODEC)
-    }
-
     /// Create a stream that uses sing-mux SOCKS packet addresses.
     pub fn new_socks(stream: S) -> Self {
         Self::new_with_codec(stream, &SOCKS_ADDR_CODEC)
-    }
-
-    /// Feed initial data that was read before the stream was created.
-    /// This is needed when a higher-level handshake leaves packet bytes buffered.
-    pub fn feed_initial_data(&mut self, data: &[u8]) {
-        if !data.is_empty() {
-            let len = data.len().min(self.read_buf.remaining_capacity());
-            self.read_buf.extend_from_slice(&data[..len]);
-        }
     }
 
     /// Try to parse a complete packet-address frame from the read buffer.
@@ -314,7 +292,6 @@ impl<S: AsyncStream> AsyncPing for PacketAddrStream<S> {
 
 impl<S: AsyncStream> AsyncTargetedMessageStream for PacketAddrStream<S> {}
 
-pub type UotV1ServerStream<S> = PacketAddrStream<S>;
 pub type SocksPacketAddrStream<S> = PacketAddrStream<S>;
 
 #[cfg(test)]
@@ -372,26 +349,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_uot_reads_uot_packets() {
-        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), 4444));
-        let payload = b"uot payload";
-        let frame = encode_packet(write_uot_address, &source, payload);
-
-        let (client, mut server) = tcp_pair().await.unwrap();
-        let mut stream = PacketAddrStream::new_uot(client);
-
-        let writer = tokio::spawn(async move {
-            server.write_all(&frame).await.unwrap();
-        });
-
-        let (location, read_payload) = read_packet(&mut stream).await.unwrap();
-        writer.await.unwrap();
-
-        assert_eq!(location.to_socket_addr_nonblocking(), Some(source));
-        assert_eq!(read_payload, payload);
-    }
-
-    #[tokio::test]
     async fn test_new_socks_reads_socks_packets() {
         let source = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 20), 5353));
         let payload = b"socks payload";
@@ -412,32 +369,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_uot_rejects_socks_packets() {
-        let payload = b"wrong codec";
-        let hostname = b"example.com";
-        let mut frame = vec![0x03, hostname.len() as u8];
-        frame.extend_from_slice(hostname);
-        frame.extend_from_slice(&7000u16.to_be_bytes());
-        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        frame.extend_from_slice(payload);
-
-        let (client, mut server) = tcp_pair().await.unwrap();
-        let mut stream = PacketAddrStream::new_uot(client);
-
-        let writer = tokio::spawn(async move {
-            server.write_all(&frame).await.unwrap();
-        });
-
-        let err = read_packet(&mut stream).await.unwrap_err();
-        writer.await.unwrap();
-
-        assert!(err.to_string().contains("unknown UoT ATYP: 3"));
-    }
-
-    #[tokio::test]
-    async fn test_new_socks_rejects_uot_packets() {
-        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 11), 7001));
-        let frame = encode_packet(write_uot_address, &source, b"wrong codec");
+    async fn test_new_socks_rejects_unknown_address_type() {
+        let mut frame = vec![0x00];
+        frame.extend_from_slice(&[0, 0, 0, 0]);
+        frame.extend_from_slice(&7001u16.to_be_bytes());
+        frame.extend_from_slice(&11u16.to_be_bytes());
+        frame.extend_from_slice(b"wrong codec");
 
         let (client, mut server) = tcp_pair().await.unwrap();
         let mut stream = PacketAddrStream::new_socks(client);
@@ -460,22 +397,6 @@ mod tests {
 
         let (client, mut server) = tcp_pair().await.unwrap();
         let mut stream = PacketAddrStream::new_socks(client);
-
-        write_packet(&mut stream, payload, &source).await.unwrap();
-
-        let mut actual = vec![0u8; expected.len()];
-        server.read_exact(&mut actual).await.unwrap();
-        assert_eq!(actual, expected);
-    }
-
-    #[tokio::test]
-    async fn test_new_uot_writes_uot_packets() {
-        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 12), 9001));
-        let payload = b"write uot";
-        let expected = encode_packet(write_uot_address, &source, payload);
-
-        let (client, mut server) = tcp_pair().await.unwrap();
-        let mut stream = PacketAddrStream::new_uot(client);
 
         write_packet(&mut stream, payload, &source).await.unwrap();
 

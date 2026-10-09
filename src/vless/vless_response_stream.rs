@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::async_stream::{AsyncPing, AsyncStream};
 
 /// A wrapper stream that reads VLESS response header on first read, similar
-/// to vmess and shadowsocks.
+/// to VLESS clients.
 pub struct VlessResponseStream<IO> {
     inner: IO,
     response_pending: bool,

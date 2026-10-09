@@ -6,6 +6,7 @@ pub fn set_num_threads(num_threads: usize) {
     let _ = NUM_THREADS.set(num_threads.max(1));
 }
 
+#[cfg(test)]
 pub fn get_num_threads() -> usize {
     NUM_THREADS.get().copied().unwrap_or(1)
 }

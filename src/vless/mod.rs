@@ -15,5 +15,5 @@ mod vless_message_stream;
 mod vless_response_stream;
 mod vless_util;
 
-// Re-export VlessMessageStream for use by other protocols (e.g., Shadowsocks UoT V2)
+// Re-export VlessMessageStream for use by other modules (e.g., h2mux UDP framing)
 pub use vless_message_stream::VlessMessageStream;

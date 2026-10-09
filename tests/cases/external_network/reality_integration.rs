@@ -62,19 +62,6 @@ async fn test_shoes_reality_server_vless() -> Result<(), Box<dyn std::error::Err
         .await
 }
 
-/// Test shoes REALITY server with Trojan inner protocol
-/// Chain: curl -> sing-box HTTP proxy -> shoes REALITY+Trojan server -> internet
-#[tokio::test]
-async fn test_shoes_reality_server_trojan() -> Result<(), Box<dyn std::error::Error>> {
-    ProxyTestFixture::new()
-        .with_singbox_reality_trojan_client("password123")
-        .with_shoes_reality_trojan_server("password123")
-        .build()
-        .await?
-        .test_http("https://www.google.com")
-        .await
-}
-
 /// Test shoes REALITY server with SEPARATE mode dest server (www.debian.org)
 ///
 /// This test verifies the 512-byte heuristic for mode detection works correctly.
@@ -176,40 +163,6 @@ async fn test_shoes_reality_server_vless_local_https_tls13_large()
         .await?;
 
     let body = fixture.test_local_server("/bytes/204800", true).await?;
-    assert_eq!(body.len(), 204800, "Expected exactly 200KB");
-    Ok(())
-}
-
-/// Test shoes REALITY+Trojan server with small data (1 byte) over local HTTP server
-/// Tests Trojan inner protocol with minimal data transfer
-#[tokio::test]
-async fn test_shoes_reality_server_trojan_local_http_small()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = ProxyTestFixture::new()
-        .with_singbox_reality_trojan_client("password123")
-        .with_shoes_reality_trojan_server("password123")
-        .with_local_http_server()
-        .build()
-        .await?;
-
-    let body = fixture.test_local_server("/bytes/1", false).await?;
-    assert_eq!(body.len(), 1, "Expected exactly 1 byte");
-    Ok(())
-}
-
-/// Test shoes REALITY+Trojan server with large data (200KB) over local HTTP server
-/// Tests Trojan inner protocol with substantial data transfer
-#[tokio::test]
-async fn test_shoes_reality_server_trojan_local_http_large()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = ProxyTestFixture::new()
-        .with_singbox_reality_trojan_client("password123")
-        .with_shoes_reality_trojan_server("password123")
-        .with_local_http_server()
-        .build()
-        .await?;
-
-    let body = fixture.test_local_server("/bytes/204800", false).await?;
     assert_eq!(body.len(), 204800, "Expected exactly 200KB");
     Ok(())
 }

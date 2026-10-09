@@ -13,15 +13,19 @@ use crate::crypto::tls_deframer::TlsDeframer;
 use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
 use crate::prepend_stream::PrependStream;
 use crate::resolver::Resolver;
-use crate::shadow_tls::{ParsedClientHello, parse_server_hello};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerSetupResult};
+use crate::tls_hello::{ParsedClientHello, parse_server_hello};
 use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
 
+use super::fallback_rate_limit::{FallbackLimits, limit_writer};
 use super::{RealityServerConfig, RealityServerConnection};
+use crate::config::server::FallbackRateLimit;
 
 #[derive(Debug)]
 pub struct RealityServerTarget {
+    pub limit_fallback_upload: Option<FallbackRateLimit>,
+    pub limit_fallback_download: Option<FallbackRateLimit>,
     pub private_key: [u8; 32],
     pub short_ids: Vec<[u8; 8]>,
     pub dest: NetLocation,
@@ -37,6 +41,16 @@ pub struct RealityServerTarget {
     pub inner_protocol: InnerProtocol,
     /// Client chain for connecting to dest server (for fallback connections).
     pub dest_client_chain: ClientProxyChain,
+}
+
+impl RealityServerTarget {
+    fn fallback_limits(&self, initial_upload: usize) -> FallbackLimits {
+        FallbackLimits {
+            upload: self.limit_fallback_upload,
+            download: self.limit_fallback_download,
+            initial_upload: initial_upload as u64,
+        }
+    }
 }
 
 /// Set up REALITY server stream with real-time mirroring for anti-probing.
@@ -103,6 +117,7 @@ pub async fn setup_reality_server_stream(
             vec![],
             Bytes::new(),
             client_pending,
+            target.fallback_limits(client_hello_frame.len()),
         ));
     }
 
@@ -172,6 +187,7 @@ pub async fn setup_reality_server_stream(
                             new_records,
                             deframer.into_remaining_data(),
                             client_pending,
+                            target.fallback_limits(client_hello_frame.len()),
                         ));
                     }
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
@@ -184,6 +200,7 @@ pub async fn setup_reality_server_stream(
                         new_records,
                         deframer.into_remaining_data(),
                         client_pending,
+                        target.fallback_limits(client_hello_frame.len()),
                     ));
                 }
             }
@@ -230,6 +247,7 @@ pub async fn setup_reality_server_stream(
             dest_records,
             remaining_data,
             client_pending,
+            target.fallback_limits(client_hello_frame.len()),
         ));
     }
 
@@ -253,6 +271,7 @@ pub async fn setup_reality_server_stream(
                 dest_records,
                 remaining_data,
                 client_pending,
+                target.fallback_limits(client_hello_frame.len()),
             ));
         }
 
@@ -291,74 +310,41 @@ pub async fn setup_reality_server_stream(
             )
             .await
         }
-        InnerProtocol::Naive(naive_cfg) => {
-            crate::naiveproxy::setup_naive_server_stream(
-                tls_stream,
-                naive_cfg,
-                target.effective_selector.clone(),
-                resolver.clone(),
-            )
-            .await
-        }
     }
 }
 
 /// Return an owned fallback transfer after forwarding the ClientHello.
 fn start_forward_to_dest(
     client_stream: Box<dyn AsyncStream>,
-    mut dest_stream: Box<dyn AsyncStream>,
+    dest_stream: Box<dyn AsyncStream>,
     dest_records: Vec<Bytes>,
     remaining_data: Bytes,
     client_pending: Bytes,
+    limits: FallbackLimits,
 ) -> TcpServerSetupResult {
     TcpServerSetupResult::Session(Box::pin(async move {
-        // Replay preread bytes through the bidirectional pump so a blocked client
-        // write cannot prevent the destination's response from reaching the client.
+        // Both preread directions enter the same pump as live bytes. A token wait
+        // in either writer must not block reads or writes in the reverse direction.
+        // A progress-aware shutdown also keeps a stalled half-close from cancelling
+        // reply data that the limiter still has in flight.
         let mut client_stream = PrependStream::new(
-            client_stream,
+            limit_writer(client_stream, limits.download, 0),
             (!client_pending.is_empty()).then(|| client_pending.to_vec().into_boxed_slice()),
         );
-
-        for record in &dest_records {
-            if let Err(e) = write_all(&mut client_stream, record).await {
-                log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);
-                futures::join!(
-                    crate::util::shutdown_stream(&mut client_stream),
-                    crate::util::shutdown_stream(&mut dest_stream),
-                );
-                return;
-            }
-            if let Err(e) = client_stream.flush().await {
-                log::debug!("REALITY FALLBACK: Error flushing record: {}", e);
-                futures::join!(
-                    crate::util::shutdown_stream(&mut client_stream),
-                    crate::util::shutdown_stream(&mut dest_stream),
-                );
-                return;
-            }
+        let mut preread = Vec::new();
+        for record in dest_records {
+            preread.extend_from_slice(&record);
         }
-
-        if !remaining_data.is_empty()
-            && let Err(e) = write_all(&mut client_stream, &remaining_data).await
-        {
-            log::debug!("REALITY FALLBACK: Error forwarding remaining data: {}", e);
-            futures::join!(
-                crate::util::shutdown_stream(&mut client_stream),
-                crate::util::shutdown_stream(&mut dest_stream),
-            );
-            return;
-        }
-
-        log::debug!(
-            "REALITY FALLBACK: Forwarded {} records + {} remaining bytes, starting bidirectional copy",
-            dest_records.len(),
-            remaining_data.len()
+        preread.extend_from_slice(&remaining_data);
+        let mut dest_stream = PrependStream::new(
+            limit_writer(dest_stream, limits.upload, limits.initial_upload),
+            (!preread.is_empty()).then(|| preread.into_boxed_slice()),
         );
 
-        let result = crate::copy_bidirectional::copy_bidirectional(
+        let result = crate::copy_bidirectional::copy_bidirectional_with_progress_aware_shutdown(
             &mut client_stream,
             &mut dest_stream,
-            !remaining_data.is_empty(), // flush the client if we wrote remaining data
+            false,
             false,
         )
         .await;
@@ -379,15 +365,16 @@ mod cleanup_tests {
     use super::*;
     use std::io;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
     #[tokio::test]
     async fn authenticated_non_vision_oversized_preread_returns_error_without_panicking() {
         use crate::client_proxy_chain::InitialHopEntry;
-        use crate::port_forward_handler::PortForwardServerHandler;
         use crate::reality::{RealityClientConfig, RealityClientConnection};
         use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+        use crate::vless::vless_server_handler::VlessTcpServerHandler;
         use aws_lc_rs::agreement;
 
         let private_key = [1; 32];
@@ -434,7 +421,16 @@ mod cleanup_tests {
         let mut response = Vec::new();
         decoy.write_tls(&mut response).unwrap();
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let target = RealityServerTarget {
+            limit_fallback_upload: Some(FallbackRateLimit {
+                bytes_per_sec: 1,
+                ..Default::default()
+            }),
+            limit_fallback_download: Some(FallbackRateLimit {
+                bytes_per_sec: 1,
+                ..Default::default()
+            }),
             private_key,
             short_ids: vec![[0; 8]],
             dest: dest.clone(),
@@ -443,25 +439,26 @@ mod cleanup_tests {
             max_client_version: None,
             cipher_suites: Vec::new(),
             effective_selector: selector.clone(),
-            inner_protocol: InnerProtocol::Normal(Box::new(PortForwardServerHandler::new(
-                vec![dest],
+            inner_protocol: InnerProtocol::Normal(Box::new(VlessTcpServerHandler::new(
+                "550e8400-e29b-41d4-a716-446655440000",
+                true,
                 selector,
+                resolver.clone(),
+                None,
             ))),
             dest_client_chain: ClientProxyChain::new(
                 vec![InitialHopEntry::Direct(Box::new(
-                    SocketConnectorImpl::from_config(&crate::config::ClientConfig::default(), None)
-                        .unwrap(),
+                    SocketConnectorImpl::from_config(&crate::config::ClientConfig::default()),
                 ))],
                 Vec::new(),
             ),
         };
-        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let (io, mut peer) = tokio::io::duplex(65540);
         let mut flight = hello.clone();
         flight.extend_from_slice(&[0x17, 0x03, 0x03, 0, 1, 0].repeat(6000));
         peer.write_all(&flight).await.unwrap();
         let mut io: Box<dyn AsyncStream> = Box::new(io);
-        let parsed = crate::shadow_tls::read_client_hello(&mut io).await.unwrap();
+        let parsed = crate::tls_hello::read_client_hello(&mut io).await.unwrap();
         assert!(parsed.client_reader.unparsed_data().len() > 33290);
 
         let decoy_io = async {
@@ -494,6 +491,7 @@ mod cleanup_tests {
             vec![Bytes::from_static(b"server")],
             Bytes::new(),
             Bytes::copy_from_slice(&pending),
+            FallbackLimits::default(),
         ) else {
             panic!("expected fallback session");
         };
@@ -523,6 +521,7 @@ mod cleanup_tests {
             vec![Bytes::from_static(b"server")],
             Bytes::from_static(b"-tail"),
             Bytes::from_static(b"client"),
+            FallbackLimits::default(),
         ) else {
             panic!("expected fallback session");
         };
@@ -542,6 +541,87 @@ mod cleanup_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_limits_include_preread_and_allow_reverse_progress() {
+        let (client, mut client_peer) = tokio::io::duplex(64);
+        let (dest, mut dest_peer) = tokio::io::duplex(64);
+        let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+            Box::new(client),
+            Box::new(dest),
+            vec![Bytes::from_static(b"server")],
+            Bytes::from_static(b"-tail"),
+            Bytes::from_static(b"abc"),
+            FallbackLimits {
+                upload: Some(FallbackRateLimit {
+                    after_bytes: 6,
+                    bytes_per_sec: 1,
+                    burst_bytes_per_sec: 1,
+                }),
+                download: Some(FallbackRateLimit {
+                    after_bytes: 2,
+                    bytes_per_sec: 2,
+                    burst_bytes_per_sec: 1,
+                }),
+                initial_upload: 4,
+            },
+        ) else {
+            panic!()
+        };
+        let task = tokio::spawn(session);
+        let mut upload = [0; 3];
+        dest_peer.read_exact(&mut upload).await.unwrap();
+        assert_eq!(&upload, b"abc");
+        let mut download = [0; 3];
+        client_peer.read_exact(&mut download).await.unwrap();
+        assert_eq!(&download, b"ser");
+        client_peer.write_all(b"d").await.unwrap();
+        let mut byte = [0];
+        let mut read_upload = Box::pin(dest_peer.read_exact(&mut byte));
+        assert!(futures::poll!(read_upload.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(500)).await;
+        client_peer.read_exact(&mut download[..1]).await.unwrap();
+        assert_eq!(download[0], b'v');
+        assert!(futures::poll!(read_upload.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(500)).await;
+        read_upload.await.unwrap();
+        assert_eq!(byte[0], b'd');
+        // Cancellation drops both streams and the outstanding token timer.
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_cancellation_releases_throttled_streams() {
+        let marker = Arc::new(());
+        let stream = || {
+            Box::new(StalledShutdown {
+                fail_write: false,
+                fail_flush: false,
+                _marker: marker.clone(),
+            }) as Box<dyn AsyncStream>
+        };
+        let TcpServerSetupResult::Session(mut session) = start_forward_to_dest(
+            stream(),
+            stream(),
+            vec![Bytes::from_static(b"response")],
+            Bytes::new(),
+            Bytes::new(),
+            FallbackLimits {
+                download: Some(FallbackRateLimit {
+                    bytes_per_sec: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ) else {
+            panic!()
+        };
+        assert!(futures::poll!(session.as_mut()).is_pending());
+        assert_eq!(Arc::strong_count(&marker), 3);
+        drop(session);
+        assert_eq!(Arc::strong_count(&marker), 1);
     }
 
     struct StalledShutdown {
@@ -595,6 +675,214 @@ mod cleanup_tests {
 
     impl AsyncStream for StalledShutdown {}
 
+    /// The queued thirteen-byte reply needs twelve seconds at one byte per second.
+    /// Cleanup must wait for that drain, then stay bounded, and release both streams.
+    #[tokio::test(start_paused = true)]
+    async fn fallback_throttled_half_close_cleanup_is_bounded() {
+        let marker = Arc::new(());
+        let stream = || {
+            Box::new(StalledShutdown {
+                fail_write: false,
+                fail_flush: false,
+                _marker: marker.clone(),
+            }) as Box<dyn AsyncStream>
+        };
+        let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+            stream(),
+            stream(),
+            vec![Bytes::from_static(b"long response")],
+            Bytes::new(),
+            Bytes::new(),
+            FallbackLimits {
+                download: Some(FallbackRateLimit {
+                    bytes_per_sec: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ) else {
+            panic!()
+        };
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), session)
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(22));
+        assert_eq!(Arc::strong_count(&marker), 1);
+    }
+
+    /// Client side of a fallback session that counts bytes it accepts.
+    struct CapturingStalled {
+        captured: Arc<AtomicUsize>,
+        accept_limit: usize,
+        shutdown_ready: bool,
+    }
+
+    impl AsyncRead for CapturingStalled {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for CapturingStalled {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let accepted = bytes.len().min(self.accept_limit);
+            self.captured.fetch_add(accepted, Ordering::Relaxed);
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.shutdown_ready {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for CapturingStalled {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for CapturingStalled {}
+
+    fn capturing_stalled(captured: &Arc<AtomicUsize>, accept_limit: usize) -> Box<dyn AsyncStream> {
+        Box::new(CapturingStalled {
+            captured: captured.clone(),
+            accept_limit,
+            shutdown_ready: false,
+        })
+    }
+
+    /// A queued, rate-limited reply must survive a stalled half-close.
+    /// Before the progress-aware policy this test lost queued bytes at ten seconds.
+    #[tokio::test(start_paused = true)]
+    async fn fallback_limited_reply_drains_before_shutdown_cleanup() {
+        const REPLY_BYTES: usize = 13;
+        for (limited, expected_seconds) in [(false, 10), (true, 22)] {
+            let delivered = Arc::new(AtomicUsize::new(0));
+            let limits = FallbackLimits {
+                download: limited.then_some(FallbackRateLimit {
+                    bytes_per_sec: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+                capturing_stalled(&delivered, usize::MAX),
+                capturing_stalled(&Arc::new(AtomicUsize::new(0)), usize::MAX),
+                vec![Bytes::from(vec![0u8; REPLY_BYTES])],
+                Bytes::new(),
+                Bytes::new(),
+                limits,
+            ) else {
+                panic!("expected fallback session")
+            };
+            let started = Instant::now();
+            tokio::time::timeout(Duration::from_secs(60), session)
+                .await
+                .expect("fallback cleanup must stay bounded");
+            assert_eq!(
+                delivered.load(Ordering::Relaxed),
+                REPLY_BYTES,
+                "limited={limited} lost queued reply bytes"
+            );
+            assert_eq!(
+                started.elapsed(),
+                Duration::from_secs(expected_seconds),
+                "limited={limited}"
+            );
+        }
+    }
+
+    /// Partial writer acceptance must not truncate a rate-limited reply.
+    #[tokio::test(start_paused = true)]
+    async fn fallback_partial_writes_do_not_truncate_limited_reply() {
+        const REPLY_BYTES: usize = 11;
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+            capturing_stalled(&delivered, 2),
+            capturing_stalled(&Arc::new(AtomicUsize::new(0)), usize::MAX),
+            vec![Bytes::from(vec![0u8; REPLY_BYTES])],
+            Bytes::new(),
+            Bytes::new(),
+            FallbackLimits {
+                download: Some(FallbackRateLimit {
+                    bytes_per_sec: 1,
+                    burst_bytes_per_sec: 3,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ) else {
+            panic!("expected fallback session")
+        };
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), session)
+            .await
+            .expect("fallback cleanup must stay bounded");
+        assert_eq!(delivered.load(Ordering::Relaxed), REPLY_BYTES);
+        assert_eq!(started.elapsed(), Duration::from_secs(18));
+    }
+
+    /// Control: a normal slow half-close delivers the whole reply and ends cleanly.
+    #[tokio::test(start_paused = true)]
+    async fn fallback_slow_half_close_delivers_whole_reply() {
+        let (client, mut client_peer) = tokio::io::duplex(64);
+        let (dest, mut dest_peer) = tokio::io::duplex(64);
+        let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+            Box::new(client),
+            Box::new(dest),
+            vec![Bytes::from_static(b"hello")],
+            Bytes::new(),
+            Bytes::new(),
+            FallbackLimits {
+                download: Some(FallbackRateLimit {
+                    bytes_per_sec: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ) else {
+            panic!("expected fallback session")
+        };
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(session, async {
+                client_peer.write_all(b"request").await.unwrap();
+                client_peer.shutdown().await.unwrap();
+                let mut request = Vec::new();
+                dest_peer.read_to_end(&mut request).await.unwrap();
+                assert_eq!(request, b"request");
+                dest_peer.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                client_peer.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, b"hello");
+            });
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() <= Duration::from_secs(10));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn fallback_cleanup_is_bounded_after_copy_and_early_errors() {
         let bytes = Bytes::from_static(b"handshake");
@@ -622,6 +910,7 @@ mod cleanup_tests {
                 records,
                 remaining,
                 Bytes::new(),
+                FallbackLimits::default(),
             ) else {
                 panic!("fallback must remain owned by its caller")
             };
