@@ -66,6 +66,9 @@ impl RealityServerTarget {
 /// - Branch based on auth:
 ///   - Auth failed: forward dest's response, continue bidirectional copy
 ///   - Auth succeeded: build REALITY response matching dest's structure
+///
+/// A cover that refuses, closes, stalls, or answers with unusable records stops
+/// the connection. Only a usable cover response reaches the forwarding branch.
 #[inline]
 pub async fn setup_reality_server_stream(
     server_stream: Box<dyn AsyncStream>,
@@ -109,114 +112,126 @@ pub async fn setup_reality_server_stream(
     write_all(&mut dest_stream, client_hello_frame).await?;
     dest_stream.flush().await?;
 
-    if !parsed_client_hello.supports_tls13 {
-        log::warn!("REALITY: Client does not support TLS 1.3, falling back to dest");
-        return Ok(start_forward_to_dest(
-            server_stream,
-            dest_stream,
-            vec![],
-            Bytes::new(),
-            client_pending,
-            target.fallback_limits(client_hello_frame.len()),
-        ));
-    }
-
-    let reality_config = RealityServerConfig {
-        private_key: target.private_key,
-        short_ids: target.short_ids.clone(),
-        dest: target.dest.clone(),
-        max_time_diff: target.max_time_diff,
-        min_client_version: target.min_client_version,
-        max_client_version: target.max_client_version,
-        cipher_suites: target.cipher_suites.clone(),
+    // Validate auth while dest processes the ClientHello. We don't short circuit on
+    // permission denied before the read loop below so that the timing is always the
+    // same. A client without TLS 1.3 cannot be authenticated at all; it stays
+    // unauthenticated traffic that may relay through a usable cover.
+    let authenticated_connection = if parsed_client_hello.supports_tls13 {
+        let mut reality_conn = RealityServerConnection::new(RealityServerConfig {
+            private_key: target.private_key,
+            short_ids: target.short_ids.clone(),
+            dest: target.dest.clone(),
+            max_time_diff: target.max_time_diff,
+            min_client_version: target.min_client_version,
+            max_client_version: target.max_client_version,
+            cipher_suites: target.cipher_suites.clone(),
+        })?;
+        match reality_conn.validate_client_hello(client_hello_frame) {
+            Ok(()) => Some(reality_conn),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                log::warn!(
+                    "REALITY: Auth failed ({}), treating as unauthenticated traffic",
+                    e
+                );
+                None
+            }
+            Err(e) => {
+                log::error!("REALITY: Unexpected error during auth: {}", e);
+                return Err(e);
+            }
+        }
+    } else {
+        log::warn!("REALITY: Client does not support TLS 1.3, treating as unauthenticated traffic");
+        None
     };
 
-    let mut reality_conn = RealityServerConnection::new(reality_config)?;
-
-    let auth_result = reality_conn.validate_client_hello(client_hello_frame);
-
-    // Read dest response until we have enough records. Use 512-byte heuristic like XTLS/REALITY:
-    // first encrypted record > 512 bytes = combined mode, <= 512 bytes = separate mode
+    // Read the cover response until it is usable. Use the 512-byte heuristic like
+    // XTLS/REALITY: first encrypted record > 512 bytes = combined mode, <= 512 bytes
+    // = separate mode. Every cover failure below stops the connection instead of
+    // starting transparent forwarding.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut deframer = TlsDeframer::new();
     let mut dest_records: Vec<Bytes> = Vec::new();
     let mut buf = allocate_vec(8192).into_boxed_slice();
-    let mut dest_handshake_success = false;
 
     loop {
         let new_records = match timeout_at(deadline, dest_stream.read(&mut buf)).await {
             Ok(Ok(0)) => {
-                return Err(std::io::Error::other(
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
                     "REALITY: Dest connection closed during TLS handshake",
                 ));
             }
             Ok(Ok(n)) => {
                 deframer.feed(&buf[..n]);
-                match deframer.next_records() {
-                    Ok(records) => records,
-                    Err(e) => {
-                        log::error!("REALITY: Error parsing dest records: {}", e);
-                        break;
-                    }
-                }
+                deframer.next_records().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("REALITY: Malformed dest record: {}", e),
+                    )
+                })?
             }
             Ok(Err(e)) => {
-                return Err(std::io::Error::other(format!(
-                    "REALITY: Error reading from dest: {}",
-                    e
-                )));
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("REALITY: Error reading from dest: {}", e),
+                ));
             }
             Err(_) => {
-                log::debug!("REALITY: Timeout reading from dest");
-                break;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "REALITY: Timed out waiting for the dest TLS response",
+                ));
             }
         };
 
-        // When we get the first record (ServerHello), check if dest supports TLS 1.3
+        // When we get the first record (ServerHello), check the cover's TLS version
         if dest_records.is_empty() && !new_records.is_empty() {
-            match parse_server_hello(&new_records[0]) {
-                Ok(parsed) => {
-                    if !parsed.is_tls13 {
-                        log::error!(
-                            "REALITY: Dest {} is TLS 1.2, falling back to transparent forward",
+            let parsed = parse_server_hello(&new_records[0]).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("REALITY: Failed to parse dest ServerHello: {}", e),
+                )
+            })?;
+            if !parsed.is_tls13 {
+                // A TLS 1.2 cover serves unauthenticated traffic only. An authenticated
+                // REALITY request needs a TLS 1.3 cover to match its structure.
+                if authenticated_connection.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "REALITY: Dest {} answered TLS 1.2 for an authenticated request",
                             target.dest
-                        );
-                        return Ok(start_forward_to_dest(
-                            server_stream,
-                            dest_stream,
-                            new_records,
-                            deframer.into_remaining_data(),
-                            client_pending,
-                            target.fallback_limits(client_hello_frame.len()),
-                        ));
-                    }
-                    log::debug!("REALITY: Dest confirmed TLS 1.3");
-                }
-                Err(e) => {
-                    log::error!("REALITY: Failed to parse dest ServerHello: {}", e);
-                    return Ok(start_forward_to_dest(
-                        server_stream,
-                        dest_stream,
-                        new_records,
-                        deframer.into_remaining_data(),
-                        client_pending,
-                        target.fallback_limits(client_hello_frame.len()),
+                        ),
                     ));
                 }
+                log::debug!(
+                    "REALITY: Dest {} is TLS 1.2, forwarding unauthenticated traffic",
+                    target.dest
+                );
+                dest_records.extend(new_records);
+                return Ok(start_forward_to_dest(
+                    server_stream,
+                    dest_stream,
+                    dest_records,
+                    deframer.into_remaining_data(),
+                    client_pending,
+                    target.fallback_limits(client_hello_frame.len()),
+                ));
             }
+            log::debug!("REALITY: Dest confirmed TLS 1.3");
         }
 
         dest_records.extend(new_records);
 
         // Separate mode: first encrypted record is small, need more records
-        // Keep reading until we have 6 records (SH + CCS + 4 encrypted) or timeout
+        // Keep reading until we have 6 records (SH + CCS + 4 encrypted)
         // Note: Some servers send NewSessionTicket as a 7th record, but we don't need it
         if dest_records.len() >= 6 {
             log::debug!(
                 "REALITY: Separate mode detected, got {} records",
                 dest_records.len()
             );
-            dest_handshake_success = true;
             break;
         } else if dest_records.len() >= 3 {
             // Check if we have enough records using the 512-byte heuristic
@@ -228,7 +243,6 @@ pub async fn setup_reality_server_stream(
                     "REALITY: Combined mode detected (first encrypted record {} bytes > 512)",
                     first_encrypted.len()
                 );
-                dest_handshake_success = true;
                 break;
             }
         }
@@ -236,11 +250,14 @@ pub async fn setup_reality_server_stream(
 
     let remaining_data = deframer.into_remaining_data();
 
-    if !dest_handshake_success {
-        log::warn!(
-            "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
-            dest_records.len()
-        );
+    log::debug!(
+        "REALITY: Read {} records from dest ({} bytes remaining)",
+        dest_records.len(),
+        remaining_data.len()
+    );
+
+    let Some(mut reality_conn) = authenticated_connection else {
+        log::debug!("REALITY: Unauthenticated traffic, forwarding through the cover");
         return Ok(start_forward_to_dest(
             server_stream,
             dest_stream,
@@ -249,39 +266,7 @@ pub async fn setup_reality_server_stream(
             client_pending,
             target.fallback_limits(client_hello_frame.len()),
         ));
-    }
-
-    log::debug!(
-        "REALITY: Read {} records from dest ({} bytes remaining)",
-        dest_records.len(),
-        remaining_data.len()
-    );
-
-    // Branch based on auth result. We don't short circuit on permission denied before the
-    // read loop above so that the timing is always the same.
-    match auth_result {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            log::warn!(
-                "REALITY: Auth failed ({}), forwarding to dest transparently",
-                e
-            );
-            return Ok(start_forward_to_dest(
-                server_stream,
-                dest_stream,
-                dest_records,
-                remaining_data,
-                client_pending,
-                target.fallback_limits(client_hello_frame.len()),
-            ));
-        }
-
-        Err(e) => {
-            log::error!("REALITY: Unexpected error during auth: {}", e);
-            return Err(e);
-        }
-
-        Ok(()) => {}
-    }
+    };
 
     log::debug!("REALITY: Auth succeeded, building response matching dest structure");
 
@@ -921,5 +906,699 @@ mod cleanup_tests {
             assert_eq!(started.elapsed(), std::time::Duration::from_secs(seconds));
             assert_eq!(Arc::strong_count(&marker), 1);
         }
+    }
+
+    // ---- Synthetic covers for the REALITY cover-failure decision ------------------
+
+    const SYNTHETIC_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    /// The owner-mandated REALITY destination and SNI. Fixtures use this exact name
+    /// as the ClientHello SNI and as the target destination hostname.
+    const SYNTHETIC_COVER_HOSTNAME: &str = "whatsapp.net";
+
+    /// Maps exactly the synthetic cover name to one loopback endpoint. Every other
+    /// name fails, so no fixture can reach real DNS or a real cover.
+    #[derive(Debug)]
+    struct SyntheticCoverResolver {
+        address: std::net::IpAddr,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Resolver for SyntheticCoverResolver {
+        fn resolve_location(
+            &self,
+            location: &NetLocation,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>> + Send,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let resolved = match location.address() {
+                crate::address::Address::Hostname(name) if name == SYNTHETIC_COVER_HOSTNAME => Ok(
+                    vec![std::net::SocketAddr::new(self.address, location.port())],
+                ),
+                other => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("synthetic resolver has no mapping for {other:?}"),
+                )),
+            };
+            Box::pin(async move { resolved })
+        }
+    }
+
+    fn synthetic_cover_resolver() -> (Arc<dyn Resolver>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(SyntheticCoverResolver {
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                calls: calls.clone(),
+            }),
+            calls,
+        )
+    }
+
+    fn synthetic_public_key(private_key: [u8; 32]) -> [u8; 32] {
+        aws_lc_rs::agreement::PrivateKey::from_private_key(
+            &aws_lc_rs::agreement::X25519,
+            &private_key,
+        )
+        .unwrap()
+        .compute_public_key()
+        .unwrap()
+        .as_ref()
+        .try_into()
+        .unwrap()
+    }
+
+    fn synthetic_reality_client_hello(short_id: [u8; 8], public_key: [u8; 32]) -> Vec<u8> {
+        use crate::reality::{RealityClientConfig, RealityClientConnection};
+
+        let mut client = RealityClientConnection::new(RealityClientConfig {
+            public_key,
+            short_id,
+            server_name: SYNTHETIC_COVER_HOSTNAME.into(),
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        hello
+    }
+
+    fn tls_record(content_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut record = vec![content_type, 0x03, 0x03];
+        record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        record.extend_from_slice(payload);
+        record
+    }
+
+    /// One structurally valid ServerHello. TLS 1.3 is signalled only by the
+    /// supported_versions extension, exactly as `parse_server_hello` expects.
+    fn synthetic_server_hello(tls13: bool) -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0x5a; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.push(0);
+        if tls13 {
+            body.extend_from_slice(&[0x00, 0x06, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        } else {
+            body.extend_from_slice(&[0x00, 0x00]);
+        }
+        let mut payload = vec![0x02];
+        let length = body.len();
+        payload.extend_from_slice(&[(length >> 16) as u8, (length >> 8) as u8, length as u8]);
+        payload.extend_from_slice(&body);
+        tls_record(0x16, &payload)
+    }
+
+    /// ServerHello, ChangeCipherSpec, and one encrypted record over 512 bytes.
+    /// That is the combined-mode shape the cover mirroring heuristic expects.
+    fn synthetic_tls13_flight() -> Vec<u8> {
+        let mut flight = synthetic_server_hello(true);
+        flight.extend_from_slice(&tls_record(0x14, &[0x01]));
+        flight.extend_from_slice(&tls_record(0x17, &[0x5c; 600]));
+        flight
+    }
+
+    /// A genuine TLS 1.2 ClientHello and the flight a TLS 1.2 cover answers it with.
+    /// Both sides are driven by the production crypto backend, so the records are
+    /// real TLS 1.2 records rather than hand-flipped version flags.
+    fn synthetic_tls12_handshake() -> (Vec<u8>, Vec<u8>) {
+        let cert =
+            rcgen::generate_simple_self_signed(vec![SYNTHETIC_COVER_HOSTNAME.into()]).unwrap();
+        let server_config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                        .into(),
+                )
+                .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client_config =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let mut client = CryptoConnection::new_rustls_client(
+            rustls::ClientConnection::new(
+                Arc::new(client_config),
+                SYNTHETIC_COVER_HOSTNAME.try_into().unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut server = CryptoConnection::new_rustls_server(
+            rustls::ServerConnection::new(Arc::new(server_config)).unwrap(),
+        );
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        crate::crypto::feed_crypto_connection(&mut server, &hello).unwrap();
+        server.process_new_packets().unwrap();
+        let mut flight = Vec::new();
+        server.write_tls(&mut flight).unwrap();
+        (hello, flight)
+    }
+
+    enum SyntheticCover {
+        /// Accepts the connection and sends nothing.
+        Silent,
+        /// Sends these bytes once the forwarded ClientHello arrives.
+        Respond(Vec<u8>),
+        /// Closes the connection once the forwarded ClientHello arrives.
+        Close,
+        /// Resets the connection without reading the forwarded ClientHello.
+        Reset,
+    }
+
+    /// A loopback cover. The task holds the accepted socket until the test aborts it.
+    async fn synthetic_cover(behavior: SyntheticCover) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            match behavior {
+                SyntheticCover::Reset => {
+                    socket2::SockRef::from(&socket)
+                        .set_linger(Some(Duration::ZERO))
+                        .unwrap();
+                }
+                SyntheticCover::Close => {
+                    drain_forwarded_hello(&mut socket).await;
+                }
+                SyntheticCover::Silent => {
+                    drain_forwarded_hello(&mut socket).await;
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                }
+                SyntheticCover::Respond(response) => {
+                    drain_forwarded_hello(&mut socket).await;
+                    let _ = socket.write_all(&response).await;
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                }
+            }
+        });
+        (port, task)
+    }
+
+    /// Reads the forwarded ClientHello without waiting for further cover input.
+    async fn drain_forwarded_hello(socket: &mut tokio::net::TcpStream) {
+        let mut scratch = [0u8; 4096];
+        while let Ok(Ok(read)) =
+            tokio::time::timeout(Duration::from_millis(200), socket.read(&mut scratch)).await
+        {
+            if read == 0 {
+                return;
+            }
+        }
+    }
+
+    /// A cover that hands its accepted socket to the test.
+    struct InteractiveCover {
+        port: u16,
+        socket: tokio::sync::oneshot::Receiver<tokio::net::TcpStream>,
+    }
+
+    async fn interactive_cover() -> InteractiveCover {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, socket) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                let _ = sender.send(socket);
+            }
+        });
+        InteractiveCover { port, socket }
+    }
+
+    fn synthetic_reality_target(
+        private_key: [u8; 32],
+        cover_port: u16,
+        resolver: Arc<dyn Resolver>,
+    ) -> RealityServerTarget {
+        use crate::client_proxy_chain::InitialHopEntry;
+        use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+        use crate::vless::vless_server_handler::VlessTcpServerHandler;
+
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        RealityServerTarget {
+            limit_fallback_upload: None,
+            limit_fallback_download: None,
+            private_key,
+            short_ids: vec![[0; 8]],
+            dest: NetLocation::new(
+                crate::address::Address::Hostname(SYNTHETIC_COVER_HOSTNAME.into()),
+                cover_port,
+            ),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+            effective_selector: selector.clone(),
+            inner_protocol: InnerProtocol::Normal(Box::new(VlessTcpServerHandler::new(
+                SYNTHETIC_UUID,
+                true,
+                selector,
+                resolver.clone(),
+                None,
+            ))),
+            dest_client_chain: ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Box::new(
+                    SocketConnectorImpl::from_config(&crate::config::ClientConfig::default()),
+                ))],
+                Vec::new(),
+            ),
+        }
+    }
+
+    /// Runs the production setup against one synthetic cover.
+    async fn setup_against_cover(
+        hello: Vec<u8>,
+        target: &RealityServerTarget,
+        resolver: &Arc<dyn Resolver>,
+    ) -> (
+        std::io::Result<TcpServerSetupResult>,
+        tokio::io::DuplexStream,
+    ) {
+        let (io, mut peer) = tokio::io::duplex(65540);
+        peer.write_all(&hello).await.unwrap();
+        let mut io: Box<dyn AsyncStream> = Box::new(io);
+        let parsed = crate::tls_hello::read_client_hello(&mut io).await.unwrap();
+        let result = setup_reality_server_stream(io, target, parsed, resolver).await;
+        (result, peer)
+    }
+
+    fn synthetic_vless_tcp_request() -> Vec<u8> {
+        let mut request = vec![0u8];
+        request.extend_from_slice(&crate::uuid_util::parse_uuid(SYNTHETIC_UUID).unwrap());
+        request.push(0);
+        request.push(1); // COMMAND_TCP
+        request.extend_from_slice(&443u16.to_be_bytes());
+        request.push(1);
+        request.extend_from_slice(&[127, 0, 0, 1]);
+        request
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticated_client_stops_on_silent_cover() {
+        let private_key = [1u8; 32];
+        let (resolver, cover_calls) = synthetic_cover_resolver();
+        let (cover_port, cover) = synthetic_cover(SyntheticCover::Silent).await;
+        let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+        let hello = synthetic_reality_client_hello([0; 8], synthetic_public_key(private_key));
+
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+        cover.abort();
+        assert_eq!(
+            cover_calls.load(Ordering::SeqCst),
+            1,
+            "the cover name must resolve only through the injected synthetic resolver"
+        );
+
+        let error = result
+            .err()
+            .expect("an authenticated client behind a silent cover must be stopped");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unauthenticated_client_stops_on_silent_cover() {
+        let private_key = [1u8; 32];
+        let (resolver, cover_calls) = synthetic_cover_resolver();
+        let (cover_port, cover) = synthetic_cover(SyntheticCover::Silent).await;
+        let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+        // A wrong short id fails authentication but the cover decision must not change.
+        let hello = synthetic_reality_client_hello([9; 8], synthetic_public_key(private_key));
+
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+        cover.abort();
+        assert_eq!(cover_calls.load(Ordering::SeqCst), 1);
+
+        let error = result
+            .err()
+            .expect("unauthenticated traffic behind a silent cover must be stopped");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tls12_client_stops_on_silent_cover() {
+        let private_key = [1u8; 32];
+        let (resolver, _cover_calls) = synthetic_cover_resolver();
+        let (cover_port, cover) = synthetic_cover(SyntheticCover::Silent).await;
+        let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+        let (hello, _cover_flight) = synthetic_tls12_handshake();
+
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+        cover.abort();
+
+        let error = result
+            .err()
+            .expect("a non-TLS1.3 client is no excuse for a silent cover");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+    }
+
+    #[tokio::test]
+    async fn client_stops_on_malformed_cover_records() {
+        let private_key = [1u8; 32];
+        let (resolver, _cover_calls) = synthetic_cover_resolver();
+        let (cover_port, cover) = synthetic_cover(SyntheticCover::Respond(
+            b"this is not a tls record".to_vec(),
+        ))
+        .await;
+        let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+        let hello = synthetic_reality_client_hello([0; 8], synthetic_public_key(private_key));
+
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+        cover.abort();
+
+        let error = result
+            .err()
+            .expect("malformed cover records must stop the connection");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    #[tokio::test]
+    async fn client_stops_on_invalid_cover_server_hello() {
+        let private_key = [1u8; 32];
+        let (resolver, _cover_calls) = synthetic_cover_resolver();
+        // A handshake record that is not a ServerHello.
+        let mut payload = vec![0x0b];
+        payload.extend_from_slice(&[0x00, 0x00, 45]);
+        payload.extend_from_slice(&[0x11; 45]);
+        let (cover_port, cover) =
+            synthetic_cover(SyntheticCover::Respond(tls_record(0x16, &payload))).await;
+        let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+        let hello = synthetic_reality_client_hello([0; 8], synthetic_public_key(private_key));
+
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+        cover.abort();
+
+        let error = result
+            .err()
+            .expect("an invalid cover ServerHello must stop the connection");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    #[tokio::test]
+    async fn client_stops_on_cover_eof() {
+        let private_key = [1u8; 32];
+        let (resolver, cover_calls) = synthetic_cover_resolver();
+        let (cover_port, cover) = synthetic_cover(SyntheticCover::Close).await;
+        let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+        let hello = synthetic_reality_client_hello([0; 8], synthetic_public_key(private_key));
+
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+        cover.abort();
+        assert_eq!(cover_calls.load(Ordering::SeqCst), 1);
+
+        let error = result
+            .err()
+            .expect("a closed cover must stop the connection");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
+    }
+
+    #[tokio::test]
+    async fn client_stops_on_cover_read_error() {
+        let private_key = [1u8; 32];
+        let (resolver, _cover_calls) = synthetic_cover_resolver();
+        let (cover_port, cover) = synthetic_cover(SyntheticCover::Reset).await;
+        let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+        let hello = synthetic_reality_client_hello([0; 8], synthetic_public_key(private_key));
+
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+        cover.abort();
+
+        let error = result
+            .err()
+            .expect("a reset cover must stop the connection");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset, "{error}");
+    }
+
+    #[tokio::test]
+    async fn client_stops_on_refused_cover() {
+        let private_key = [1u8; 32];
+        let (resolver, _cover_calls) = synthetic_cover_resolver();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let target = synthetic_reality_target(private_key, refused_port, resolver.clone());
+        let hello = synthetic_reality_client_hello([0; 8], synthetic_public_key(private_key));
+
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+
+        let error = result
+            .err()
+            .expect("a refused cover must stop the connection");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused, "{error}");
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_stops_on_incomplete_cover_flight() {
+        let private_key = [1u8; 32];
+        let (resolver, _cover_calls) = synthetic_cover_resolver();
+        let mut incomplete = synthetic_server_hello(true);
+        incomplete.extend_from_slice(&tls_record(0x14, &[0x01]));
+        let (cover_port, cover) = synthetic_cover(SyntheticCover::Respond(incomplete)).await;
+        let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+        let hello = synthetic_reality_client_hello([0; 8], synthetic_public_key(private_key));
+
+        let started = Instant::now();
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+        let elapsed = started.elapsed();
+        cover.abort();
+
+        let error = result
+            .err()
+            .expect("a cover flight that stops before the handshake must stop the connection");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "the cover deadline must expire before the connection stops, elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_stops_on_tls12_cover() {
+        let private_key = [1u8; 32];
+        let (resolver, _cover_calls) = synthetic_cover_resolver();
+        let (cover_port, cover) =
+            synthetic_cover(SyntheticCover::Respond(synthetic_server_hello(false))).await;
+        let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+        let hello = synthetic_reality_client_hello([0; 8], synthetic_public_key(private_key));
+
+        let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+        cover.abort();
+
+        let error = result
+            .err()
+            .expect("an authenticated request needs a usable TLS 1.3 cover");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    /// Control: a valid authenticated REALITY handshake still reaches the inner VLESS
+    /// handler through a healthy synthetic cover.
+    #[tokio::test]
+    async fn healthy_authenticated_reality_handshake_still_succeeds() {
+        use crate::reality::{RealityClientConfig, RealityClientConnection};
+
+        let private_key = [3u8; 32];
+        let public_key = synthetic_public_key(private_key);
+        let (resolver, cover_calls) = synthetic_cover_resolver();
+        let cover = interactive_cover().await;
+        let target = synthetic_reality_target(private_key, cover.port, resolver.clone());
+
+        let mut client = RealityClientConnection::new(RealityClientConfig {
+            public_key,
+            short_id: [0; 8],
+            server_name: SYNTHETIC_COVER_HOSTNAME.into(),
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+
+        let (server_io, mut client_io) = tokio::io::duplex(65540);
+        // `write_tls` already drained the ClientHello and the handshake helper writes
+        // only what is still queued, so the test sends the drained flight itself.
+        client_io.write_all(&hello).await.unwrap();
+        let client_task = tokio::spawn(async move {
+            let connection = CryptoConnection::new_reality_client(client);
+            let mut stream =
+                CryptoTlsStream::handshake(client_io, connection, TlsReadMode::Stream, &[])
+                    .await
+                    .expect("client REALITY handshake");
+            stream
+                .write_all(&synthetic_vless_tcp_request())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            stream
+        });
+
+        let mut server_io: Box<dyn AsyncStream> = Box::new(server_io);
+        let scenario = tokio::time::timeout(Duration::from_secs(15), async {
+            let parsed = crate::tls_hello::read_client_hello(&mut server_io)
+                .await
+                .unwrap();
+            assert!(parsed.supports_tls13);
+            let setup = tokio::spawn(async move {
+                setup_reality_server_stream(server_io, &target, parsed, &resolver).await
+            });
+
+            let mut cover_socket = cover.socket.await.unwrap();
+            let mut forwarded = vec![0u8; hello.len()];
+            cover_socket.read_exact(&mut forwarded).await.unwrap();
+            assert_eq!(
+                forwarded, hello,
+                "the cover must receive the exact ClientHello"
+            );
+            cover_socket
+                .write_all(&synthetic_tls13_flight())
+                .await
+                .unwrap();
+
+            let result = setup.await.unwrap();
+            let client_stream = client_task.await.unwrap();
+            (result, client_stream)
+        })
+        .await
+        .expect("the healthy authenticated scenario must finish inside 15 s");
+        assert_eq!(
+            cover_calls.load(Ordering::SeqCst),
+            1,
+            "the cover name must resolve only through the injected synthetic resolver"
+        );
+        match scenario.0 {
+            Ok(TcpServerSetupResult::TcpForward {
+                remote_location, ..
+            }) => {
+                assert_eq!(
+                    remote_location,
+                    NetLocation::new(
+                        crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                        443
+                    )
+                );
+            }
+            Ok(_) => panic!("authenticated REALITY setup returned an unexpected variant"),
+            Err(error) => panic!("authenticated REALITY setup failed: {error}"),
+        }
+        drop(scenario.1);
+    }
+
+    /// Control: unauthenticated traffic still returns a forwarding session that relays
+    /// both directions through that same synthetic cover.
+    #[tokio::test]
+    async fn healthy_unauthenticated_forwarding_still_relays_through_cover() {
+        let private_key = [2u8; 32];
+        let (resolver, cover_calls) = synthetic_cover_resolver();
+        let cover = interactive_cover().await;
+        let target = synthetic_reality_target(private_key, cover.port, resolver.clone());
+        let hello = synthetic_reality_client_hello([9; 8], synthetic_public_key(private_key));
+        let flight = synthetic_tls13_flight();
+
+        let (io, mut peer) = tokio::io::duplex(65540);
+        peer.write_all(&hello).await.unwrap();
+        let mut io: Box<dyn AsyncStream> = Box::new(io);
+        let parsed = crate::tls_hello::read_client_hello(&mut io).await.unwrap();
+        assert!(parsed.supports_tls13);
+        let setup = tokio::spawn(async move {
+            setup_reality_server_stream(io, &target, parsed, &resolver).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut cover_socket = cover.socket.await.unwrap();
+            let mut forwarded = vec![0u8; hello.len()];
+            cover_socket.read_exact(&mut forwarded).await.unwrap();
+            assert_eq!(forwarded, hello);
+            cover_socket.write_all(&flight).await.unwrap();
+
+            let result = setup.await.unwrap();
+            let TcpServerSetupResult::Session(session) =
+                result.expect("a healthy cover must still forward unauthenticated traffic")
+            else {
+                panic!("unauthenticated traffic must return a forwarding session");
+            };
+
+            let relay = tokio::spawn(session);
+            let mut preread = vec![0u8; flight.len()];
+            peer.read_exact(&mut preread).await.unwrap();
+            assert_eq!(
+                preread, flight,
+                "the cover flight must reach the client first"
+            );
+            peer.write_all(b"client-live").await.unwrap();
+            let mut uploaded = [0u8; 11];
+            cover_socket.read_exact(&mut uploaded).await.unwrap();
+            assert_eq!(&uploaded, b"client-live");
+            cover_socket.write_all(b"cover-live").await.unwrap();
+            let mut downloaded = [0u8; 10];
+            peer.read_exact(&mut downloaded).await.unwrap();
+            assert_eq!(&downloaded, b"cover-live");
+            relay.abort();
+        })
+        .await
+        .expect("the healthy forwarding scenario must finish inside 15 s");
+        assert_eq!(
+            cover_calls.load(Ordering::SeqCst),
+            1,
+            "the cover name must resolve only through the injected synthetic resolver"
+        );
+    }
+
+    /// Control: a TLS 1.2 client with a TLS 1.2 cover keeps ordinary forwarding.
+    #[tokio::test]
+    async fn healthy_tls12_cover_still_forwards_tls12_client() {
+        let private_key = [4u8; 32];
+        let (resolver, cover_calls) = synthetic_cover_resolver();
+        let cover = interactive_cover().await;
+        let target = synthetic_reality_target(private_key, cover.port, resolver.clone());
+        let (hello, cover_flight) = synthetic_tls12_handshake();
+
+        let (io, mut peer) = tokio::io::duplex(65540);
+        peer.write_all(&hello).await.unwrap();
+        let mut io: Box<dyn AsyncStream> = Box::new(io);
+        let parsed = crate::tls_hello::read_client_hello(&mut io).await.unwrap();
+        assert!(!parsed.supports_tls13);
+        let setup = tokio::spawn(async move {
+            setup_reality_server_stream(io, &target, parsed, &resolver).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut cover_socket = cover.socket.await.unwrap();
+            let mut forwarded = vec![0u8; hello.len()];
+            cover_socket.read_exact(&mut forwarded).await.unwrap();
+            assert_eq!(forwarded, hello);
+            cover_socket.write_all(&cover_flight).await.unwrap();
+
+            let result = setup.await.unwrap();
+            let TcpServerSetupResult::Session(session) =
+                result.expect("a TLS 1.2 cover must still forward unauthenticated traffic")
+            else {
+                panic!("a TLS 1.2 client must return a forwarding session");
+            };
+
+            let relay = tokio::spawn(session);
+            let mut preread = vec![0u8; cover_flight.len()];
+            peer.read_exact(&mut preread).await.unwrap();
+            assert_eq!(
+                preread, cover_flight,
+                "the TLS 1.2 cover flight must reach the client first"
+            );
+            peer.write_all(b"tls12-live").await.unwrap();
+            let mut uploaded = [0u8; 10];
+            cover_socket.read_exact(&mut uploaded).await.unwrap();
+            assert_eq!(&uploaded, b"tls12-live");
+            relay.abort();
+        })
+        .await
+        .expect("the healthy TLS 1.2 scenario must finish inside 15 s");
+        assert_eq!(
+            cover_calls.load(Ordering::SeqCst),
+            1,
+            "the cover name must resolve only through the injected synthetic resolver"
+        );
     }
 }

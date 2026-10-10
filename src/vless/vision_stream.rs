@@ -13,6 +13,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
 use crate::async_stream::AsyncStream;
 
@@ -787,7 +788,30 @@ impl<IO: AsyncStream> crate::async_stream::AsyncPing for VisionStream<IO> {
     }
 }
 
-impl<IO: AsyncStream> AsyncStream for VisionStream<IO> {}
+impl<IO: AsyncStream> AsyncStream for VisionStream<IO> {
+    /// Reads reach the transport socket only in Direct mode, after every
+    /// unpadded byte, the VLESS response, and the raw crypto tail are delivered.
+    /// Padding mode and ordinary TLS never qualify.
+    fn raw_read_socket(&self) -> Option<&TcpStream> {
+        if self.read_mode != VisionMode::Direct
+            || self.vless_response_pending
+            || !self.pending_read.is_empty()
+        {
+            return None;
+        }
+        self.tls.raw_read_socket()
+    }
+
+    /// Writes reach the transport socket only in Direct mode, after the queued
+    /// padded writes and the final encrypted flight are drained. This gate is
+    /// independent of the read gate, because the modes switch separately.
+    fn raw_write_socket(&self) -> Option<&TcpStream> {
+        if self.write_mode != VisionMode::Direct || !self.pending_plain_writes.is_empty() {
+            return None;
+        }
+        self.tls.raw_write_socket()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1895,5 +1919,224 @@ mod tests {
     #[test]
     fn initial_direct_accepts_empty_session() {
         assert_initial_mode_transition(UnpadCommand::Direct, b"");
+    }
+
+    /// Pass-through IO over a real loopback socket pair, so the raw accessors of
+    /// the wrappers are observable.
+    struct SocketIo {
+        socket: tokio::net::TcpStream,
+    }
+
+    impl SocketIo {
+        /// Returns the socket IO and the peer end of its connection. The caller
+        /// keeps the peer, so the connection stays open.
+        async fn new() -> io::Result<(Self, tokio::net::TcpStream)> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let (connector, accepted) =
+                tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+            let (accepted, _) = accepted?;
+            Ok((Self { socket: connector? }, accepted))
+        }
+    }
+
+    impl AsyncRead for SocketIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.socket).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for SocketIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.socket).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.socket).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.socket).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for SocketIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for SocketIo {
+        fn raw_read_socket(&self) -> Option<&tokio::net::TcpStream> {
+            Some(&self.socket)
+        }
+
+        fn raw_write_socket(&self) -> Option<&tokio::net::TcpStream> {
+            Some(&self.socket)
+        }
+    }
+
+    /// A record-preserving TLS stream over a real socket, ready for a Vision
+    /// transition, with the peer end of its connection.
+    async fn socket_backed_vision() -> io::Result<(VisionStream<SocketIo>, tokio::net::TcpStream)> {
+        let (_, server) = connection_pair(Backend::Reality);
+        let (io, peer) = SocketIo::new().await?;
+        let tls = CryptoTlsStream::new(io, server, Some(TlsDeframer::new()));
+        Ok((VisionStream::new_server(tls, [7; 16], b"")?, peer))
+    }
+
+    #[tokio::test]
+    async fn padding_mode_exposes_no_socket_on_either_side() -> io::Result<()> {
+        let (vision, _peer) = socket_backed_vision().await?;
+        assert!(
+            vision.raw_read_socket().is_none(),
+            "padded reads must keep the buffered path"
+        );
+        assert!(
+            vision.raw_write_socket().is_none(),
+            "padded writes must keep the buffered path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_read_and_write_gates_switch_independently() -> io::Result<()> {
+        let (mut vision, _peer) = socket_backed_vision().await?;
+        vision.tls.start_raw_read()?;
+        vision.switch_read_to_direct_mode()?;
+        assert!(
+            vision.raw_read_socket().is_some(),
+            "a direct read side must expose its socket"
+        );
+        assert!(
+            vision.raw_write_socket().is_none(),
+            "the write side must stay gated while it still pads"
+        );
+
+        vision.switch_write_to_direct_mode()?;
+        assert!(
+            vision.raw_write_socket().is_none(),
+            "the final encrypted flight must drain before the write socket is usable"
+        );
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(Pin::new(&mut vision).poll_flush(&mut cx).is_ready());
+        assert!(
+            vision.raw_write_socket().is_some(),
+            "a drained direct write side must expose its socket"
+        );
+        assert!(
+            vision.raw_read_socket().is_some(),
+            "the read side must stay open while the write side switches"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_tls_mode_never_exposes_a_socket() -> io::Result<()> {
+        let (mut vision, _peer) = socket_backed_vision().await?;
+        vision.tls.allow_streaming_reads();
+        vision.switch_read_to_tls_mode()?;
+        vision.switch_write_to_tls_mode()?;
+        assert!(vision.raw_read_socket().is_none());
+        assert!(vision.raw_write_socket().is_none());
+        Ok(())
+    }
+
+    /// A direct Vision stream is the production fast path, so the copy seam must
+    /// move its payload with splice and keep the bytes exact.
+    #[cfg(target_os = "linux")]
+    #[ignore = "process-wide counters; runs in an isolated process"]
+    #[tokio::test]
+    async fn a_direct_vision_stream_moves_payload_through_splice() -> io::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::linux_splice::test_hooks::reset();
+        let (mut vision, mut peer) = socket_backed_vision().await?;
+        vision.tls.start_raw_read()?;
+        vision.switch_read_to_direct_mode()?;
+        vision.switch_write_to_direct_mode()?;
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(Pin::new(&mut vision).poll_flush(&mut cx).is_ready());
+        assert!(vision.raw_read_socket().is_some() && vision.raw_write_socket().is_some());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (connector, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        let (mut sink, _) = accepted?;
+        let mut sink_peer = connector?;
+
+        let copy = tokio::spawn(async move {
+            crate::copy_bidirectional::copy_bidirectional(&mut vision, &mut sink, false, false)
+                .await
+        });
+        let payload: Vec<u8> = (0..64 * 1024).map(|index| (index % 251) as u8).collect();
+        peer.write_all(&payload).await?;
+        let mut received = vec![0; payload.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sink_peer.read_exact(&mut received),
+        )
+        .await??;
+        assert_eq!(received, payload);
+        assert!(
+            crate::linux_splice::test_hooks::splice_bytes() >= 2 * payload.len() as u64,
+            "a direct Vision payload must move through splice: {} bytes",
+            crate::linux_splice::test_hooks::splice_bytes()
+        );
+
+        peer.shutdown().await?;
+        sink_peer.shutdown().await?;
+        let copy_result = tokio::time::timeout(std::time::Duration::from_secs(10), copy).await??;
+        copy_result.map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_buffered_crypto_tail_gates_the_direct_read_socket() -> io::Result<()> {
+        let tail = [0x17u8, 0x03, 0x03, 0x10, 0x00, 0x00, 0x00];
+        let (_, server) = connection_pair(Backend::Reality);
+        let mut deframer = TlsDeframer::new();
+        deframer.feed(&tail);
+        let (io, _peer) = SocketIo::new().await?;
+        let tls = CryptoTlsStream::new(io, server, Some(deframer));
+        let mut vision = VisionStream::new_server(tls, [7; 16], b"")?;
+        vision.tls.start_raw_read()?;
+        vision.switch_read_to_direct_mode()?;
+        assert!(
+            vision.raw_read_socket().is_none(),
+            "the raw crypto tail must reach the caller first"
+        );
+
+        let mut drained = Vec::new();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        while drained.len() < tail.len() {
+            let mut bytes = [0; 16];
+            let mut buf = ReadBuf::new(&mut bytes);
+            match Pin::new(&mut vision).poll_read(&mut cx, &mut buf) {
+                Poll::Ready(Ok(())) => {}
+                result => panic!("expected buffered tail bytes: {result:?}"),
+            }
+            assert!(!buf.filled().is_empty());
+            drained.extend_from_slice(buf.filled());
+        }
+        assert_eq!(drained, tail);
+        assert!(
+            vision.raw_read_socket().is_some(),
+            "the read socket must open once the tail drains"
+        );
+        Ok(())
     }
 }

@@ -173,6 +173,27 @@ pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync 
     fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
         None
     }
+
+    /// The transport socket this stream reads from, when reading that socket is
+    /// exactly what this stream's own read path does.
+    ///
+    /// The Linux splice fast path moves payload with this socket instead of
+    /// calling `poll_read`. A stream may return `Some` only while no buffered
+    /// bytes, protocol header, crypto tail, or rate limit is pending, because
+    /// the fast path keeps no state of its own. `None` is the default and keeps
+    /// ordinary copying.
+    fn raw_read_socket(&self) -> Option<&TcpStream> {
+        None
+    }
+
+    /// The transport socket this stream writes to, when writing that socket is
+    /// exactly what this stream's own write path does.
+    ///
+    /// See [`AsyncStream::raw_read_socket`]. A stream may return `Some` only
+    /// while no framing, flush, or crypto tail is pending on the write side.
+    fn raw_write_socket(&self) -> Option<&TcpStream> {
+        None
+    }
 }
 
 pub trait AsyncMessageStream:
@@ -222,7 +243,15 @@ impl AsyncPing for TcpStream {
     }
 }
 
-impl AsyncStream for TcpStream {}
+impl AsyncStream for TcpStream {
+    fn raw_read_socket(&self) -> Option<&TcpStream> {
+        Some(self)
+    }
+
+    fn raw_write_socket(&self) -> Option<&TcpStream> {
+        Some(self)
+    }
+}
 
 #[cfg(test)]
 impl AsyncPing for tokio::io::DuplexStream {
@@ -425,10 +454,26 @@ impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
     fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
         (**self).preferred_write_size()
     }
+
+    fn raw_read_socket(&self) -> Option<&TcpStream> {
+        (**self).raw_read_socket()
+    }
+
+    fn raw_write_socket(&self) -> Option<&TcpStream> {
+        (**self).raw_write_socket()
+    }
 }
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
     fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
         (**self).preferred_write_size()
+    }
+
+    fn raw_read_socket(&self) -> Option<&TcpStream> {
+        (**self).raw_read_socket()
+    }
+
+    fn raw_write_socket(&self) -> Option<&TcpStream> {
+        (**self).raw_write_socket()
     }
 }
 

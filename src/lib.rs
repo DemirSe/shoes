@@ -65,6 +65,8 @@ mod copy_bidirectional_message;
 mod crypto;
 pub mod dns;
 mod h2mux;
+#[cfg(target_os = "linux")]
+mod linux_splice;
 mod listener_tasks;
 mod option_util;
 mod prepend_stream;

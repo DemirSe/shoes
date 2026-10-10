@@ -613,6 +613,25 @@ openssl x509 -in cert.pem -noout -fingerprint -sha256
 - Use `tcp_settings.no_delay: true` for low latency
 - Keep the TLS buffer size at or above the 16 KiB minimum
 
+### Linux Splice Relay
+
+On Linux, the TCP relay copies payload through the kernel for eligible
+directions. The option is automatic and has no configuration key.
+
+- A direction qualifies only when both ends are raw TCP sockets.
+- Vision qualifies only after its read or write side switches to direct mode.
+  The two sides switch independently.
+- Padded Vision, ordinary TLS, H2MUX, XUDP, and rate-limited fallback traffic
+  keep the ordinary copy path.
+- Buffered bytes, crypto tails, and flush barriers drain before the switch.
+- If the kernel or the sandbox denies `splice`, the relay keeps ordinary
+  copying, and no payload is lost or reordered.
+- The relay reads the local socket buffers once per direction. If either side
+  reports less than 32 KiB for send or receive, that direction keeps ordinary
+  copying and allocates no pipe. The check uses the kernel-reported sizes only:
+  it cannot see a later socket change or a remote receive window.
+- Other platforms always use ordinary copying.
+
 ### Common Issues
 
 - **"Address already in use"**: Change port or stop conflicting service

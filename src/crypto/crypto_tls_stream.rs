@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
 use super::tls_deframer::TlsDeframer;
 use super::{CryptoConnection, feed_crypto_connection};
@@ -495,7 +496,33 @@ impl<IO: AsyncStream> AsyncPing for CryptoTlsStream<IO> {
     }
 }
 
-impl<IO: AsyncStream> AsyncStream for CryptoTlsStream<IO> {}
+impl<IO: AsyncStream> AsyncStream for CryptoTlsStream<IO> {
+    /// Reads reach the transport socket only in raw mode, after every queued
+    /// plaintext and deframed byte is delivered, and while the read side is open.
+    fn raw_read_socket(&self) -> Option<&TcpStream> {
+        match &self.input {
+            TlsInput::Raw(pending) if pending.is_empty() && self.state.readable() => {
+                self.io.raw_read_socket()
+            }
+            _ => None,
+        }
+    }
+
+    /// Writes reach the transport socket only in raw mode, after the final
+    /// encrypted flight is drained, with no pending flush, and while the write
+    /// side is open.
+    fn raw_write_socket(&self) -> Option<&TcpStream> {
+        if self.write_raw
+            && self.raw_write_prefix.is_none()
+            && !self.need_flush
+            && self.state.writeable()
+        {
+            self.io.raw_write_socket()
+        } else {
+            None
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -791,6 +818,138 @@ mod tests {
             accepted <= 64 * 1024,
             "blocked REALITY stream accepted {accepted} plaintext bytes"
         );
+    }
+
+    /// Pass-through IO over a real loopback socket pair, so the raw accessors of
+    /// the stream are observable.
+    struct SocketIo {
+        socket: tokio::net::TcpStream,
+        _peer: tokio::net::TcpStream,
+    }
+
+    impl SocketIo {
+        async fn new() -> io::Result<Self> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let (connector, accepted) =
+                tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+            let (accepted, _) = accepted?;
+            Ok(Self {
+                socket: connector?,
+                _peer: accepted,
+            })
+        }
+    }
+
+    impl AsyncRead for SocketIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.socket).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for SocketIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.socket).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.socket).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.socket).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for SocketIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for SocketIo {
+        fn raw_read_socket(&self) -> Option<&tokio::net::TcpStream> {
+            Some(&self.socket)
+        }
+
+        fn raw_write_socket(&self) -> Option<&tokio::net::TcpStream> {
+            Some(&self.socket)
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_sockets_appear_only_after_the_crypto_tail_drains() -> io::Result<()> {
+        let tail = [0x17u8, 0x03, 0x03, 0x10, 0x00, 0x00, 0x00];
+        let mut deframer = TlsDeframer::new();
+        deframer.feed(&tail);
+        let mut stream = CryptoTlsStream::new(
+            SocketIo::new().await?,
+            CryptoConnection::new_reality_server(completed_reality_connection()),
+            Some(deframer),
+        );
+        assert!(
+            stream.raw_read_socket().is_none(),
+            "framed TLS input must keep the buffered path"
+        );
+        assert!(stream.raw_write_socket().is_none());
+
+        stream.start_raw_read()?;
+        assert!(
+            stream.raw_read_socket().is_none(),
+            "the deframed crypto tail must reach the caller first"
+        );
+        let mut drained = Vec::new();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        while drained.len() < tail.len() {
+            let mut bytes = [0; 16];
+            let mut buf = ReadBuf::new(&mut bytes);
+            match Pin::new(&mut stream).poll_read(&mut cx, &mut buf) {
+                Poll::Ready(Ok(())) => {}
+                result => panic!("expected buffered tail bytes: {result:?}"),
+            }
+            assert!(!buf.filled().is_empty());
+            drained.extend_from_slice(buf.filled());
+        }
+        assert_eq!(drained, tail);
+        assert!(
+            stream.raw_read_socket().is_some(),
+            "the read socket must open once the tail drains"
+        );
+
+        stream.start_raw_write(b"")?;
+        assert!(
+            stream.raw_write_socket().is_none(),
+            "the final encrypted flight must drain first"
+        );
+        assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_ready());
+        assert!(
+            stream.raw_write_socket().is_some(),
+            "the write socket must open once the flight drains"
+        );
+
+        stream.state.shutdown_read();
+        assert!(
+            stream.raw_read_socket().is_none(),
+            "a shut-down read side must not expose the socket"
+        );
+        stream.state.shutdown_write();
+        assert!(
+            stream.raw_write_socket().is_none(),
+            "a shut-down write side must not expose the socket"
+        );
+        Ok(())
     }
 
     #[test]

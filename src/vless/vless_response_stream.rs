@@ -4,6 +4,7 @@ use std::task::{Context, Poll};
 use futures::ready;
 use log::debug;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
 use crate::async_stream::{AsyncPing, AsyncStream};
 
@@ -145,4 +146,96 @@ where
     }
 }
 
-impl<IO> AsyncStream for VlessResponseStream<IO> where IO: AsyncStream {}
+impl<IO> AsyncStream for VlessResponseStream<IO>
+where
+    IO: AsyncStream,
+{
+    /// Reads reach the inner socket only after the response header is consumed.
+    fn raw_read_socket(&self) -> Option<&TcpStream> {
+        if self.response_pending {
+            return None;
+        }
+        self.inner.raw_read_socket()
+    }
+
+    /// Writes always reach the inner stream, so the inner gate decides.
+    fn raw_write_socket(&self) -> Option<&TcpStream> {
+        self.inner.raw_write_socket()
+    }
+}
+
+/// The response header gate, checked at the copy seam.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::linux_splice::test_hooks;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{Duration, timeout};
+
+    async fn tcp_pair() -> std::io::Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (connector, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let (accepted, _) = accepted?;
+        Ok((connector?, accepted))
+    }
+
+    #[ignore = "process-wide counters; runs in an isolated process"]
+    #[tokio::test]
+    async fn the_response_header_gates_the_fast_path_without_reaching_the_payload()
+    -> std::io::Result<()> {
+        test_hooks::reset();
+        let (mut peer, reader) = tcp_pair().await?;
+        let (relay_b, mut destination) = tcp_pair().await?;
+        let mut reader = VlessResponseStream::new(reader);
+        assert!(
+            reader.raw_read_socket().is_none(),
+            "the response header must be consumed before the socket is usable"
+        );
+
+        let mut relay_b = relay_b;
+        let copy = tokio::spawn(async move {
+            crate::copy_bidirectional::copy_bidirectional(&mut reader, &mut relay_b, false, false)
+                .await
+        });
+
+        // The header is consumed silently; only the payload may reach the peer.
+        peer.write_all(&[0, 0]).await?;
+        let first = vec![0x11u8; 4096];
+        peer.write_all(&first).await?;
+        let mut received = vec![0; first.len()];
+        timeout(
+            Duration::from_secs(5),
+            destination.read_exact(&mut received),
+        )
+        .await??;
+        assert_eq!(
+            received, first,
+            "the response header must not reach the payload"
+        );
+
+        // Once the header is gone, later payload must take the fast path.
+        let later = vec![0x22u8; 32 * 1024];
+        peer.write_all(&later).await?;
+        let mut received_later = vec![0; later.len()];
+        timeout(
+            Duration::from_secs(5),
+            destination.read_exact(&mut received_later),
+        )
+        .await??;
+        assert_eq!(received_later, later);
+        assert!(
+            test_hooks::splice_bytes() >= 2 * later.len() as u64,
+            "a consumed response header must let the payload use splice: {} bytes",
+            test_hooks::splice_bytes()
+        );
+
+        peer.shutdown().await?;
+        timeout(Duration::from_secs(5), destination.shutdown()).await??;
+        timeout(Duration::from_secs(10), copy)
+            .await??
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+}

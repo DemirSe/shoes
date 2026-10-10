@@ -65,6 +65,10 @@ struct RoutedSession {
 }
 
 impl XudpMessageStream {
+    #[allow(
+        dead_code,
+        reason = "native-resolver default remains available to library and test callers; server XUDP paths use the configured resolver"
+    )]
     pub fn new(inner_stream: Box<dyn AsyncStream>) -> Self {
         Self::new_with_resolver(inner_stream, Arc::new(NativeResolver::new()))
     }

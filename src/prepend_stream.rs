@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
 use crate::async_stream::{AsyncPing, AsyncStream};
 
@@ -23,6 +24,13 @@ impl<S> PrependStream<S> {
             initial_data,
             offset: 0,
         }
+    }
+
+    /// True while prepended bytes still precede the inner stream's own bytes.
+    fn pending_read_bytes(&self) -> bool {
+        self.initial_data
+            .as_ref()
+            .is_some_and(|data| self.offset < data.len())
     }
 }
 
@@ -98,5 +106,53 @@ impl<S: AsyncPing + Unpin> AsyncPing for PrependStream<S> {
 impl<S: AsyncStream> AsyncStream for PrependStream<S> {
     fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
         self.inner.preferred_write_size()
+    }
+
+    /// Reads reach the inner socket only after the prepended bytes are drained.
+    fn raw_read_socket(&self) -> Option<&TcpStream> {
+        if self.pending_read_bytes() {
+            return None;
+        }
+        self.inner.raw_read_socket()
+    }
+
+    /// Writes always reach the inner stream, so the inner gate decides.
+    fn raw_write_socket(&self) -> Option<&TcpStream> {
+        self.inner.raw_write_socket()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::AsyncStream;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn prefix_bytes_gate_the_inner_read_socket() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (connector, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let (accepted, _) = accepted?;
+        let mut stream = PrependStream::new(accepted, Some(b"prefix".to_vec().into_boxed_slice()));
+        assert!(
+            stream.raw_read_socket().is_none(),
+            "prepended bytes must keep the buffered path"
+        );
+        assert!(
+            stream.raw_write_socket().is_some(),
+            "writes always reach the inner stream"
+        );
+
+        let mut drained = [0; 6];
+        stream.read_exact(&mut drained).await?;
+        assert_eq!(&drained, b"prefix");
+        assert!(
+            stream.raw_read_socket().is_some(),
+            "the read socket must open once the prefix drains"
+        );
+        drop(connector);
+        Ok(())
     }
 }

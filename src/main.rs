@@ -9,6 +9,8 @@ mod copy_bidirectional_message;
 mod crypto;
 mod dns;
 mod h2mux;
+#[cfg(target_os = "linux")]
+mod linux_splice;
 mod listener_tasks;
 mod logging;
 mod option_util;

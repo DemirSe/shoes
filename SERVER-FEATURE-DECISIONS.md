@@ -3,10 +3,14 @@
 ## Kapsam
 
 Bu dosya sahibin seçimlerini ve istediği kısa değerlendirmeleri kaydeder.
-Yalnız 16 numaralı özellik koda eklendi.
-Varsayılan olarak kapalıdır.
+16 ve 17 numaralı özellikler koda eklendi.
+16 varsayılan olarak kapalıdır.
+17 otomatiktir ve yalnız Linux'ta çalışır.
 Canlı sunucu servisi ve istemci ayarları değişmedi.
-Çoklu UUID ve splice uygulaması henüz başlamadı.
+16 numaralı özellik canlı sunucuda çalışıyor.
+17 numaralı özellik henüz dağıtılmadı.
+Bu kayıt dağıtım, staging, commit veya push izni vermez.
+Çoklu UUID uygulaması henüz başlamadı.
 Çalışma sınırlarının kaynağı [proje talimatlarıdır](AGENTS.md).
 Mevcut sunucu yönetimi yeterli kalır.
 Bu kayıt dağıtım, staging, commit veya push izni vermez.
@@ -166,6 +170,23 @@ Uygun olmayan bağlantılarda mevcut kopyalama yolu kalmalı.
 Sahip splice desteğini eklemeyi seçti.
 Performans kazancı yine ölçüm gerektirir.
 
+Kod eklendi. Karar her yön için ayrı verilir.
+Bir yön yalnız iki ucu da ham TCP soketi sunduğunda uygundur.
+Vision okuma ve yazma geçidi bağımsızdır.
+Dolgu modu ve sıradan TLS hiçbir zaman uygun değildir.
+Kuyruktaki ön veri, şifreli kuyruk ve boşaltma bariyeri önce boşalır.
+Vision yanıt başlığı ayrıştırma sırası korunur.
+İlerleme farkında REALITY fallback yolu arabellekli kopyalamayı korur.
+Sınırlayıcı, ping, çerçeve ve TLS katmanları atlanmaz.
+Splice reddedilirse veya boru ayrılamazsa arabellekli yol sürer.
+Yerel soket tamponu 32 KiB'in altındaysa yol kullanılmaz.
+Bu karar yön başına bir kez ve yalnız okuma sorgusuyla alınır.
+Sorgu başarısız olursa sıradan kopyalama sürer ve boru ayrılmaz.
+Bu ölçüm yerel soketleri kapsar; uzak pencereyi ve sonraki değişiklikleri kapsamaz.
+Boruda bayt varsa bu baytlar yeni soket okumalarından önce yazıcıya gider.
+Her boru tamamlanmada, hatada, iptalde ve geri dönüşte kapanır.
+Ölçüm yereldir; sunucu, mobil veya tüm tünel hız iddiası yoktur.
+
 ### 18–21. Diğer proxy protokolleri
 
 Bunlar mevcut VLESS profilinin yerine geçen ayrı seçeneklerdir.
@@ -187,11 +208,18 @@ Sunucuya kullanılmayan protokol eklemek mevcut bağlantıyı hızlandırmaz.
 - Anlamlı performans kaybı kabulü engeller.
 - 16 için doğrulanmış kullanıcıların aktarımı etkilenmemeli.
 - 17 için ara bellek, kısmi ilerleme, geri basınç, iptal, hata ve yarı kapatma davranışları korunmalı.
+- 17 için ham TCP yönlerinde gerçek splice kullanımı ve tam bayt eşitliği kanıtlanmalı.
+- 17 için IPv4, IPv6, önek sırası ve iki yarı kapatma sırası sınanmalı.
+- 17 için eş hatası, desteklenmeyen çağrı ve boru ayırma hatası sınanmalı.
+- 17 için tanıtıcı sayısı oturum sonrası ve iptal sonrası başlangıca dönmeli.
+- 17 için küçük yerel tampon ve sorgu hatası sıradan kopyalamaya düşmeli.
+- 17 için küçük tamponda boru ayrılmamalı ve splice sayacı sıfır kalmalı.
 
 ## Kanıt ve sınırlar
 
-Yerel inceleme ve kamuya açık kaynak araştırması tamamlandı.
-Yeni performans testi veya platform testi yapılmadı.
+Yerel inceleme, kamuya açık kaynak araştırması ve yerel döngüsel ölçüm tamamlandı.
+VPS, mobil veya tüm tünel ölçümü yapılmadı.
+Diğer işletim sistemleri için yalnız derleme koruması incelendi.
 Android/Windows/Linux Hiddify sürümleri için ek özellik matrisi yok.
 Mevcut işlev testleri, önerilen ek özelliklerin uyumluluğunu kanıtlamaz.
 
