@@ -3,6 +3,8 @@ mod h2mux;
 #[cfg(target_os = "linux")]
 #[path = "cases/integration/linux_splice_integration.rs"]
 mod linux_splice;
+#[path = "cases/integration/parser_boundary_integration.rs"]
+mod parser_boundary_integration;
 #[path = "cases/integration/reality_client_config_test.rs"]
 mod reality_client_config;
 #[path = "cases/integration/resource_lifecycle_test.rs"]
