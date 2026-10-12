@@ -20,8 +20,11 @@ async fn xudp_preserves_a_domain_destination_across_the_proxy_chain() -> TestRes
     let (shoes_ip, shoes_port) = ports.get_listener_port();
     let (singbox_ip, singbox_port) = ports.get_listener_port();
 
-    let ipv6_echo = start_udp_echo_server_with_suffix("::1", 0, b" [ECHO]").await?;
-    let echo_port = ipv6_echo.local_addr().port();
+    // One port that is free on both loopback families. The shared test allocator
+    // reserves both pairs, so a parallel test cannot claim the port between this
+    // allocation and the echo binds below.
+    let echo_port = common::port_helper::get_dual_stack_listener_port();
+    let _ipv6_echo = start_udp_echo_server_with_suffix("::1", echo_port, b" [ECHO]").await?;
     let _ipv4_echo = start_udp_echo_server_with_suffix("127.0.0.1", echo_port, b" [ECHO]").await?;
 
     let (cert_path, key_path) = generate_test_cert_files()?;

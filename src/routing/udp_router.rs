@@ -299,7 +299,9 @@ impl ServerStream {
     fn eof_on_empty(&self) -> bool {
         match self {
             Self::Targeted(stream) => stream.targeted_eof_on_empty(),
-            Self::Session(_) => true,
+            // A session stream reports its end as an error, and a data frame may
+            // carry a zero-length datagram, so an empty read is still a message.
+            Self::Session(_) => false,
         }
     }
     fn poll_read_message(
@@ -1731,6 +1733,113 @@ mod tests {
                 Err(io::Error::other("injected DNS failure"))
             })
         }
+    }
+
+    /// A session stream that serves scripted packets and then stays idle.
+    struct ScriptedSessionStream {
+        packets: std::collections::VecDeque<(MessageSessionId, SocketAddr, Vec<u8>)>,
+    }
+
+    impl crate::async_stream::AsyncReadSessionMessage for ScriptedSessionStream {
+        fn poll_read_session_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<(MessageSessionId, SocketAddr)>> {
+            let this = self.get_mut();
+            match this.packets.pop_front() {
+                Some((session_id, address, data)) => {
+                    buf.put_slice(&data);
+                    Poll::Ready(Ok((session_id, address)))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl crate::async_stream::AsyncWriteSessionMessage for ScriptedSessionStream {
+        fn poll_write_session_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _session_id: MessageSessionId,
+            _buf: &[u8],
+            _target: &SocketAddr,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl crate::async_stream::AsyncFlushMessage for ScriptedSessionStream {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl crate::async_stream::AsyncShutdownMessage for ScriptedSessionStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for ScriptedSessionStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl crate::async_stream::AsyncSessionMessageStream for ScriptedSessionStream {}
+
+    #[tokio::test]
+    async fn an_empty_session_datagram_is_forwarded_and_does_not_end_the_read() {
+        let destination = NetLocation::from_str("127.0.0.1:12345", None).unwrap();
+        let state = Arc::new(RemoteState::default());
+        let mut server = ServerStream::Session(Box::new(ScriptedSessionStream {
+            packets: std::collections::VecDeque::from([
+                (0, "127.0.0.1:53".parse().unwrap(), Vec::new()),
+                (0, "127.0.0.1:53".parse().unwrap(), b"payload".to_vec()),
+            ]),
+        }));
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let mut router = UdpRouter::new(&mut server, selector, resolver, false);
+
+        let SessionLookup::BySessionId(lookup) = &mut router.session_lookup else {
+            unreachable!()
+        };
+        lookup.insert(0, KeyState::Pending);
+        let remote = RecordingRemote {
+            state: Arc::clone(&state),
+        };
+        router.pending_creates.push(PendingSessionCreate {
+            lookup_key: LookupKey::SessionId(0),
+            destination,
+            session_id: 0,
+            packets: Vec::new(),
+            future: Box::pin(async move {
+                Ok(SessionCreateResult {
+                    permit: crate::resources::try_stream().unwrap(),
+                    remote: Box::new(remote),
+                    resolved_addr: "127.0.0.1:12345".parse().unwrap(),
+                })
+            }),
+        });
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+
+        assert_eq!(
+            *state.writes.lock().unwrap(),
+            vec![Vec::new(), b"payload".to_vec()],
+            "an empty datagram is a message and must not end the session read"
+        );
     }
 
     #[derive(Default)]

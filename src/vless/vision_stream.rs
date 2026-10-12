@@ -106,6 +106,12 @@ pub struct VisionStream<IO> {
     /// When the rustls Writer buffer fills (write length 0), we store the remainder here
     /// Used in PaddingTls mode - drained immediately before switching modes
     pending_plain_writes: BytesMut,
+
+    /// Leading bytes of `inner_write_deframer` that are already queued for
+    /// delivery. A flush queues the retained suffix while the deframer still
+    /// needs those bytes to classify what follows, so the output the deframer
+    /// emits later is trimmed by this count. The bytes are queued exactly once.
+    write_delivered_prefix: usize,
 }
 
 impl<IO> VisionStream<IO>
@@ -163,6 +169,7 @@ where
             vless_response_to_send,
             pending_tls_mode_switch: false,
             pending_plain_writes: BytesMut::new(),
+            write_delivered_prefix: 0,
         }
     }
 
@@ -276,11 +283,62 @@ where
         // TODO: consider using an Option for all PaddingTls fields instead
         self.inner_read_deframer.deallocate();
         self.inner_write_deframer.deallocate();
+        self.write_delivered_prefix = 0;
         self.pending_plain_writes = BytesMut::new();
     }
 
     fn queue_padded_write(&mut self, data: &[u8]) {
         self.pending_plain_writes.extend_from_slice(data);
+    }
+
+    /// Queue one padded packet. The first packet of the stream carries the UUID.
+    ///
+    /// Content above the packet header's length field is refused instead of
+    /// being framed with a truncated length.
+    fn queue_padded_packet(&mut self, content: &[u8], command: u8, is_tls: bool) -> io::Result<()> {
+        let padded_packet = if self.write_first_packet {
+            self.write_first_packet = false;
+            super::vision_pad::pad_with_uuid_and_command(content, &self.user_uuid, command, is_tls)?
+        } else {
+            super::vision_pad::pad_with_command(content, command, is_tls)?
+        };
+        self.queue_padded_write(&padded_packet);
+        Ok(())
+    }
+
+    /// Queue deframer output, skipping the leading bytes a flush already queued.
+    /// The deframer still classified the complete record or prefix.
+    fn queue_deframed_output(
+        &mut self,
+        content: &[u8],
+        command: u8,
+        is_tls: bool,
+    ) -> io::Result<()> {
+        let skip = self.write_delivered_prefix.min(content.len());
+        self.write_delivered_prefix -= skip;
+        self.queue_padded_packet(&content[skip..], command, is_tls)
+    }
+
+    /// Queue the part of the retained write suffix that was not queued yet.
+    /// Returns true when bytes were queued.
+    fn queue_retained_write_suffix(&mut self) -> io::Result<bool> {
+        let pending = self.inner_write_deframer.pending_bytes();
+        if pending <= self.write_delivered_prefix {
+            return Ok(false);
+        }
+        let suffix = bytes::Bytes::copy_from_slice(
+            &self.inner_write_deframer.remaining_data()[self.write_delivered_prefix..],
+        );
+        self.write_delivered_prefix = pending;
+        let is_tls = self.filter.is_tls();
+        self.queue_padded_packet(&suffix, COMMAND_CONTINUE, is_tls)?;
+        Ok(true)
+    }
+
+    /// Drop the write deframer's buffer together with its delivery accounting.
+    fn clear_write_deframer(&mut self) {
+        self.inner_write_deframer.clear();
+        self.write_delivered_prefix = 0;
     }
 
     fn drain_all_writes_padding(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -293,6 +351,34 @@ where
             self.pending_plain_writes.advance(written);
         }
         self.tls.poll_drain_tls(cx)
+    }
+
+    /// Send the bytes the write deframer still holds, because the caller closed
+    /// the write side and no later byte can complete a TLS record.
+    ///
+    /// A flush must not do this. A genuine TLS record can be split across writes
+    /// and flush calls, and the deframer cannot tell that case from a short
+    /// non-TLS tail. Only shutdown proves that no more bytes will follow.
+    fn release_retained_write_suffix(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.inner_write_deframer.pending_bytes() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        // Bytes a flush already queued still need the end command, so the packet
+        // is sent even when nothing is left to deliver.
+        let suffix = bytes::Bytes::copy_from_slice(
+            &self.inner_write_deframer.remaining_data()[self.write_delivered_prefix..],
+        );
+        self.clear_write_deframer();
+
+        // The peer must stop expecting padded packets after this one, so the tail
+        // travels with the end command. Switching here also keeps the raw-socket
+        // gate closed for any later write.
+        self.pending_tls_mode_switch = false;
+        self.switch_write_to_tls_mode()?;
+
+        self.queue_padded_packet(&suffix, COMMAND_END, self.filter.is_tls())?;
+        self.drain_all_writes_padding(cx)
     }
 
     /// Read the VLESS response header and addons, returning any following plaintext.
@@ -498,21 +584,7 @@ where
                             COMMAND_END
                         };
 
-                        let final_padded_packet = if self.write_first_packet {
-                            self.write_first_packet = false;
-                            super::vision_pad::pad_with_uuid_and_command(
-                                &record,
-                                &self.user_uuid,
-                                command,
-                                true, // is_tls
-                            )
-                        } else {
-                            super::vision_pad::pad_with_command(
-                                &record, command, true, // is_tls
-                            )
-                        };
-
-                        self.queue_padded_write(&final_padded_packet);
+                        self.queue_deframed_output(&record, command, true)?;
                         if command == COMMAND_DIRECT {
                             self.switch_write_to_direct_mode()?;
                         }
@@ -532,7 +604,7 @@ where
                         }
 
                         // Clear deframer since caller will re-feed remaining data
-                        self.inner_write_deframer.clear();
+                        self.clear_write_deframer();
 
                         // tell caller to resend the next packets after the mode switch
                         return Poll::Ready(Ok(processed_len - existing_inner_len));
@@ -545,23 +617,8 @@ where
                     // .. so we need to continue padding
                     // ref: https://github.com/XTLS/Xray-core/blob/9f5dcb15910aadc7ef450514747576827a389853/proxy/proxy.go#L371
 
-                    let padded_packet = if self.write_first_packet {
-                        self.write_first_packet = false;
-                        super::vision_pad::pad_with_uuid_and_command(
-                            &record,
-                            &self.user_uuid,
-                            COMMAND_CONTINUE,
-                            self.filter.is_tls(),
-                        )
-                    } else {
-                        super::vision_pad::pad_with_command(
-                            &record,
-                            COMMAND_CONTINUE,
-                            self.filter.is_tls(),
-                        )
-                    };
-
-                    self.queue_padded_write(&padded_packet);
+                    let is_tls = self.filter.is_tls();
+                    self.queue_deframed_output(&record, COMMAND_CONTINUE, is_tls)?;
                     match self.drain_all_writes_padding(cx) {
                         Poll::Pending => {
                             let unprocessed_buf_len =
@@ -571,7 +628,7 @@ where
                                 self.inner_write_deframer.pending_bytes() == unprocessed_buf_len
                             );
                             // clear since the user will re-feed
-                            self.inner_write_deframer.clear();
+                            self.clear_write_deframer();
                             return Poll::Ready(Ok(processed_len - existing_inner_len));
                         }
                         Poll::Ready(Ok(())) => {
@@ -581,14 +638,10 @@ where
                     }
                 }
                 Ok(DeframeResult::NeedData) => {
-                    // TODO: There's a theoretical edge case where non-TLS data ends with bytes
-                    // that look like a valid TLS record prefix (e.g., [0x16, 0x03, 0x03]).
-                    // The deframer would hold onto these bytes waiting for more data to
-                    // complete the "TLS record", but since it's not actually TLS, no more
-                    // data will come. This would cause a hang.
-                    //
-                    // This is extremely unlikely in practice, so we choose not to handle this edge
-                    // case to keep the code simple.
+                    // The deframer keeps a suffix that could still complete into a
+                    // TLS record. The caller has already accepted those bytes, so a
+                    // later flush queues them without losing the classification
+                    // state (see queue_retained_write_suffix).
                     break;
                 }
                 Ok(DeframeResult::UnknownPrefix(prefix)) => {
@@ -602,23 +655,8 @@ where
                     if self.filter.is_filtering() {
                         // We don't assume the deframer won't return any more packets,
                         // so we continue here, and stop if we're no longer filtering.
-                        let padded_packet = if self.write_first_packet {
-                            self.write_first_packet = false;
-                            super::vision_pad::pad_with_uuid_and_command(
-                                &prefix,
-                                &self.user_uuid,
-                                COMMAND_CONTINUE,
-                                self.filter.is_tls(),
-                            )
-                        } else {
-                            super::vision_pad::pad_with_command(
-                                &prefix,
-                                COMMAND_CONTINUE,
-                                self.filter.is_tls(),
-                            )
-                        };
-
-                        self.queue_padded_write(&padded_packet);
+                        let is_tls = self.filter.is_tls();
+                        self.queue_deframed_output(&prefix, COMMAND_CONTINUE, is_tls)?;
                         match self.drain_all_writes_padding(cx) {
                             Poll::Pending => {}
                             Poll::Ready(Ok(())) => {}
@@ -630,27 +668,13 @@ where
                         // Sending end command to switch to TLS, there are no more padded packets.
                         self.pending_tls_mode_switch = true;
 
-                        let padded_packet = if self.write_first_packet {
-                            self.write_first_packet = false;
-                            super::vision_pad::pad_with_uuid_and_command(
-                                &prefix,
-                                &self.user_uuid,
-                                COMMAND_END,
-                                self.filter.is_tls(),
-                            )
-                        } else {
-                            super::vision_pad::pad_with_command(
-                                &prefix,
-                                COMMAND_END,
-                                self.filter.is_tls(),
-                            )
-                        };
+                        let is_tls = self.filter.is_tls();
+                        self.queue_deframed_output(&prefix, COMMAND_END, is_tls)?;
 
                         // Clear deframe, not really necessary since deallocate will occur and this
                         // will never be used again.
-                        self.inner_write_deframer.clear();
+                        self.clear_write_deframer();
 
-                        self.queue_padded_write(&padded_packet);
                         // Drain and handle result
                         match self.drain_all_writes_padding(cx) {
                             Poll::Ready(Ok(())) => {
@@ -683,25 +707,10 @@ where
                     self.filter
                         .stop_filtering("write invalid TLS data".to_string());
 
-                    let remaining_data = self.inner_write_deframer.remaining_data();
-
-                    let padded_packet = if self.write_first_packet {
-                        self.write_first_packet = false;
-                        super::vision_pad::pad_with_uuid_and_command(
-                            remaining_data,
-                            &self.user_uuid,
-                            COMMAND_END,
-                            self.filter.is_tls(),
-                        )
-                    } else {
-                        super::vision_pad::pad_with_command(
-                            remaining_data,
-                            COMMAND_END,
-                            self.filter.is_tls(),
-                        )
-                    };
-
-                    self.queue_padded_write(&padded_packet);
+                    let remaining_data =
+                        bytes::Bytes::copy_from_slice(self.inner_write_deframer.remaining_data());
+                    let is_tls = self.filter.is_tls();
+                    self.queue_deframed_output(&remaining_data, COMMAND_END, is_tls)?;
 
                     match self.drain_all_writes_padding(cx) {
                         Poll::Pending => {}
@@ -709,7 +718,7 @@ where
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     }
 
-                    self.inner_write_deframer.clear();
+                    self.clear_write_deframer();
 
                     return Poll::Ready(Ok(buf.len()));
                 }
@@ -768,12 +777,22 @@ impl<IO: AsyncStream> AsyncWrite for VisionStream<IO> {
         let this = self.get_mut();
         if this.write_mode == VisionMode::PaddingTls {
             ready!(this.drain_all_writes_padding(cx))?;
+            // A successful flush has to deliver every accepted application byte,
+            // including a tail that could still start a TLS record. The deframer
+            // keeps those bytes so a genuinely fragmented record is still
+            // classified, and the record it emits later is trimmed instead.
+            if this.queue_retained_write_suffix()? {
+                ready!(this.drain_all_writes_padding(cx))?;
+            }
         }
         Pin::new(&mut this.tls).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.as_mut().poll_flush(cx))?;
+        if self.write_mode == VisionMode::PaddingTls {
+            ready!(self.as_mut().release_retained_write_suffix(cx))?;
+        }
         Pin::new(&mut self.tls).poll_shutdown(cx)
     }
 }
@@ -1919,6 +1938,485 @@ mod tests {
     #[test]
     fn initial_direct_accepts_empty_session() {
         assert_initial_mode_transition(UnpadCommand::Direct, b"");
+    }
+
+    #[test]
+    fn padding_shutdown_delivers_a_retained_tls_prefix() {
+        use std::io::Read;
+
+        let uuid = [7; 16];
+        // A partial TLS record header: the write deframer keeps it because more
+        // bytes could still complete the record.
+        let tail = [0x16, 0x03];
+        let (mut peer, session) = connection_pair(Backend::Tls13);
+        let gate = Arc::new(std::sync::Mutex::new(WriteGate::default()));
+        let io = GatedIo {
+            input: ScriptedIo {
+                reads: VecDeque::new(),
+            },
+            gate: gate.clone(),
+        };
+        let mut vision = VisionStream::new_server(
+            CryptoTlsStream::new(io, session, Some(TlsDeframer::new())),
+            uuid,
+            b"",
+        )
+        .unwrap();
+        vision.vless_response_to_send = false;
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            Pin::new(&mut vision).poll_write(&mut cx, &tail),
+            Poll::Ready(Ok(2))
+        ));
+        assert_eq!(vision.inner_write_deframer.pending_bytes(), tail.len());
+
+        assert!(matches!(
+            Pin::new(&mut vision).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let ciphertext = gate.lock().unwrap().output.clone();
+        assert!(
+            !ciphertext.is_empty(),
+            "shutdown must send the bytes the write path accepted"
+        );
+        feed_and_process_crypto_connection(&mut peer, &ciphertext).unwrap();
+        let mut plaintext = Vec::new();
+        if let Err(error) = peer.reader().read_to_end(&mut plaintext) {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+        let result = VisionUnpadder::new(uuid).unpad(&plaintext).unwrap();
+        assert_eq!(result.command, Some(UnpadCommand::End));
+        assert_eq!(
+            result.content, tail,
+            "the accepted tail must reach the peer byte for byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn padding_flush_keeps_a_fragmented_record_and_its_classification() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let uuid = [7; 16];
+        // One handshake record, delivered in two writes with a flush in between.
+        let record: Vec<u8> = [&[0x16, 0x03, 0x01, 0x00, 0x0a, 0x01][..], &[0x00; 9][..]].concat();
+        let (client_session, server_session) = connection_pair(Backend::Tls13);
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let mut server = VisionStream::new_server(
+            CryptoTlsStream::new(server_io, server_session, Some(TlsDeframer::new())),
+            uuid,
+            b"",
+        )
+        .unwrap();
+        let mut client = VisionStream::new_client(
+            CryptoTlsStream::new(client_io, client_session, Some(TlsDeframer::new())),
+            uuid,
+        )
+        .unwrap();
+
+        let wanted = record.clone();
+        let server_task = async move {
+            server.write_all(&record[..6]).await.unwrap();
+            server.flush().await.unwrap();
+            assert_eq!(
+                server.inner_write_deframer.pending_bytes(),
+                6,
+                "a flush must not decide that a fragmented TLS record is a short tail"
+            );
+            assert_eq!(server.write_delivered_prefix, 6);
+
+            server.write_all(&record[6..]).await.unwrap();
+            server.flush().await.unwrap();
+            assert_eq!(
+                server.write_delivered_prefix, 0,
+                "the emitted record must be trimmed by the delivered prefix"
+            );
+            assert!(
+                server.filter.is_tls(),
+                "the complete record must still be classified as TLS"
+            );
+            assert_eq!(server.write_mode, VisionMode::PaddingTls);
+        };
+        let client_task = async move {
+            let mut received = vec![0u8; wanted.len()];
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(
+                received, wanted,
+                "the fragmented record must arrive once, in order"
+            );
+            assert_eq!(
+                client.read_mode,
+                VisionMode::PaddingTls,
+                "a flush must not switch the peer to plain TLS"
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server_task, client_task)
+        })
+        .await
+        .expect("the fragmented record must arrive");
+    }
+
+    /// How long the peer waits for data that must not arrive.
+    const QUIET_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// Prove that the peer receives `expected` and nothing else.
+    ///
+    /// With `expect_eof` the writer closed its side, so a clean end must follow.
+    /// Otherwise a bounded probe must stay quiet; an I/O error is not a quiet
+    /// result.
+    async fn assert_exactly_delivered<S>(client: &mut S, expected: &[u8], expect_eof: bool)
+    where
+        S: AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut received = vec![0u8; expected.len()];
+        client
+            .read_exact(&mut received)
+            .await
+            .expect("the peer must receive every accepted byte");
+        assert_eq!(received, expected, "the payload must arrive byte for byte");
+
+        let mut extra = [0u8; 64];
+        let probe = tokio::time::timeout(QUIET_PROBE, client.read(&mut extra)).await;
+        match probe {
+            Err(_) if !expect_eof => {}
+            Err(_) => panic!("the peer did not close its side after the payload"),
+            Ok(Ok(0)) => {}
+            Ok(Ok(length)) => panic!("{length} extra bytes followed the expected payload"),
+            Ok(Err(error)) => panic!("unexpected read error after the payload: {error}"),
+        }
+    }
+
+    /// Run a flush-only exchange: the server writes `request`, flushes `flushes`
+    /// times, optionally shuts down, and the peer must receive exactly `request`.
+    async fn assert_flush_delivers(request: Vec<u8>, flushes: usize, shutdown: bool) {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let uuid = [7; 16];
+        let (client_session, server_session) = connection_pair(Backend::Tls13);
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let mut server = VisionStream::new_server(
+            CryptoTlsStream::new(server_io, server_session, Some(TlsDeframer::new())),
+            uuid,
+            b"",
+        )
+        .unwrap();
+        let mut client = VisionStream::new_client(
+            CryptoTlsStream::new(client_io, client_session, Some(TlsDeframer::new())),
+            uuid,
+        )
+        .unwrap();
+
+        let expected = request.clone();
+        let server_task = async move {
+            server.write_all(&request).await.unwrap();
+            for _ in 0..flushes {
+                server.flush().await.unwrap();
+            }
+            if shutdown {
+                server.shutdown().await.unwrap();
+            } else {
+                // Keep the connection open while the peer proves that nothing
+                // else follows the payload.
+                tokio::time::sleep(QUIET_PROBE + Duration::from_millis(200)).await;
+            }
+        };
+        let client_task = async move {
+            assert_exactly_delivered(&mut client, &expected, shutdown).await;
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server_task, client_task)
+        })
+        .await
+        .expect("a successful flush must deliver the accepted request");
+    }
+
+    /// Parse the padded packets of one captured plaintext stream.
+    ///
+    /// Returns the command and content of every packet, so a test can detect
+    /// duplicated or appended bytes beyond the expected payload.
+    fn parse_padded_packets(
+        uuid: [u8; 16],
+        plaintext: &[u8],
+    ) -> Vec<(Option<UnpadCommand>, Vec<u8>)> {
+        let mut packets = Vec::new();
+        let mut offset = 0;
+        let mut first = true;
+        while offset < plaintext.len() {
+            if first {
+                assert_eq!(
+                    &plaintext[offset..offset + 16],
+                    &uuid,
+                    "the first packet must carry the uuid"
+                );
+                offset += 16;
+                first = false;
+            }
+            assert!(
+                offset + 5 <= plaintext.len(),
+                "truncated padded packet header"
+            );
+            let command = UnpadCommand::try_from(plaintext[offset]).ok();
+            let content_len =
+                u16::from_be_bytes([plaintext[offset + 1], plaintext[offset + 2]]) as usize;
+            let padding_len =
+                u16::from_be_bytes([plaintext[offset + 3], plaintext[offset + 4]]) as usize;
+            let start = offset + 5;
+            assert!(
+                start + content_len <= plaintext.len(),
+                "truncated padded packet content"
+            );
+            packets.push((command, plaintext[start..start + content_len].to_vec()));
+            offset = start + content_len + padding_len;
+        }
+        packets
+    }
+
+    /// A short non-TLS request whose last 1-5 bytes could still start a TLS
+    /// record. The caller waits for a response after the flush, so the flush has
+    /// to deliver those bytes.
+    #[tokio::test]
+    async fn padding_flush_delivers_a_short_non_tls_request() {
+        let ambiguous_tail = [0x16, 0x03, 0x03, 0x00, 0x40];
+        for length in 1..=ambiguous_tail.len() {
+            let mut request = b"ping".to_vec();
+            request.extend_from_slice(&ambiguous_tail[..length]);
+            assert_flush_delivers(request, 1, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn padding_repeated_flush_does_not_repeat_bytes() {
+        let mut request = b"ping".to_vec();
+        request.extend_from_slice(&[0x16, 0x03]);
+        assert_flush_delivers(request, 3, false).await;
+    }
+
+    #[tokio::test]
+    async fn padding_shutdown_after_a_flush_does_not_repeat_bytes() {
+        let mut request = b"ping".to_vec();
+        request.extend_from_slice(&[0x16, 0x03]);
+        assert_flush_delivers(request, 1, true).await;
+    }
+
+    #[tokio::test]
+    async fn padding_flush_prefix_then_non_tls_continuation_stays_byte_exact() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let uuid = [7; 16];
+        let (client_session, server_session) = connection_pair(Backend::Tls13);
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let mut server = VisionStream::new_server(
+            CryptoTlsStream::new(server_io, server_session, Some(TlsDeframer::new())),
+            uuid,
+            b"",
+        )
+        .unwrap();
+        let mut client = VisionStream::new_client(
+            CryptoTlsStream::new(client_io, client_session, Some(TlsDeframer::new())),
+            uuid,
+        )
+        .unwrap();
+
+        let mut expected = vec![0x16, 0x03];
+        expected.extend_from_slice(b"\x00\x00\x00tail");
+        let wanted = expected.clone();
+        let server_task = async move {
+            server.write_all(&expected[..2]).await.unwrap();
+            server.flush().await.unwrap();
+            server.write_all(&expected[2..]).await.unwrap();
+            server.flush().await.unwrap();
+        };
+        let client_task = async move {
+            let mut received = vec![0u8; wanted.len()];
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(
+                received, wanted,
+                "prefix and continuation must stay in order"
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server_task, client_task)
+        })
+        .await
+        .expect("the prefix and its continuation must arrive");
+    }
+
+    /// A flush that is cancelled while the transport is blocked must not deliver
+    /// the retained suffix twice.
+    #[test]
+    fn padding_cancelled_flush_delivers_the_retained_suffix_once() {
+        use std::io::Read;
+
+        let uuid = [7; 16];
+        let mut request = b"ping".to_vec();
+        request.extend_from_slice(&[0x16, 0x03]);
+        let (mut peer, session) = connection_pair(Backend::Tls13);
+        let gate = Arc::new(std::sync::Mutex::new(WriteGate::default()));
+        let io = GatedIo {
+            input: ScriptedIo {
+                reads: VecDeque::new(),
+            },
+            gate: gate.clone(),
+        };
+        let mut vision = VisionStream::new_server(
+            CryptoTlsStream::new(io, session, Some(TlsDeframer::new())),
+            uuid,
+            b"",
+        )
+        .unwrap();
+        vision.vless_response_to_send = false;
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            Pin::new(&mut vision).poll_write(&mut cx, &request),
+            Poll::Ready(Ok(n)) if n == request.len()
+        ));
+
+        // The first flush queues the retained suffix and then blocks, so the
+        // future is dropped with the suffix already queued.
+        gate.lock().unwrap().blocked = true;
+        assert!(Pin::new(&mut vision).poll_flush(&mut cx).is_pending());
+        drop(Pin::new(&mut vision).poll_flush(&mut cx));
+
+        gate.lock().unwrap().blocked = false;
+        assert!(matches!(
+            Pin::new(&mut vision).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        // A later flush must queue nothing extra.
+        assert!(matches!(
+            Pin::new(&mut vision).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let ciphertext = gate.lock().unwrap().output.clone();
+        feed_and_process_crypto_connection(&mut peer, &ciphertext).unwrap();
+        let mut plaintext = Vec::new();
+        if let Err(error) = peer.reader().read_to_end(&mut plaintext) {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+        let packets = parse_padded_packets(uuid, &plaintext);
+        let delivered: Vec<u8> = packets
+            .iter()
+            .flat_map(|(_, content)| content.clone())
+            .collect();
+        assert_eq!(
+            delivered, request,
+            "the cancelled flush must deliver the retained suffix exactly once"
+        );
+        assert!(
+            packets
+                .iter()
+                .all(|(command, _)| *command == Some(UnpadCommand::Continue)),
+            "every packet before the mode switch continues padding: {packets:?}"
+        );
+    }
+
+    #[test]
+    fn padding_flush_retries_after_backpressure() {
+        use std::io::Read;
+
+        let uuid = [7; 16];
+        let mut request = b"ping".to_vec();
+        request.extend_from_slice(&[0x16, 0x03]);
+        let (mut peer, session) = connection_pair(Backend::Tls13);
+        let gate = Arc::new(std::sync::Mutex::new(WriteGate::default()));
+        let io = GatedIo {
+            input: ScriptedIo {
+                reads: VecDeque::new(),
+            },
+            gate: gate.clone(),
+        };
+        let mut vision = VisionStream::new_server(
+            CryptoTlsStream::new(io, session, Some(TlsDeframer::new())),
+            uuid,
+            b"",
+        )
+        .unwrap();
+        vision.vless_response_to_send = false;
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            Pin::new(&mut vision).poll_write(&mut cx, &request),
+            Poll::Ready(Ok(n)) if n == request.len()
+        ));
+
+        // The transport blocks, so the flush has to be retried after re-polling.
+        gate.lock().unwrap().blocked = true;
+        assert!(Pin::new(&mut vision).poll_flush(&mut cx).is_pending());
+        gate.lock().unwrap().blocked = false;
+        assert!(matches!(
+            Pin::new(&mut vision).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        // A second flush after the retry must not queue the bytes again.
+        assert!(matches!(
+            Pin::new(&mut vision).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let ciphertext = gate.lock().unwrap().output.clone();
+        feed_and_process_crypto_connection(&mut peer, &ciphertext).unwrap();
+        let mut plaintext = Vec::new();
+        if let Err(error) = peer.reader().read_to_end(&mut plaintext) {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+        let result = VisionUnpadder::new(uuid).unpad(&plaintext).unwrap();
+        assert_eq!(result.content, request);
+    }
+
+    #[test]
+    fn padding_shutdown_sends_nothing_when_no_bytes_are_retained() {
+        use std::io::Read;
+
+        let uuid = [7; 16];
+        let record: Vec<u8> = [&[0x16, 0x03, 0x01, 0x00, 0x0a, 0x01][..], &[0x00; 9][..]].concat();
+        let (mut peer, session) = connection_pair(Backend::Tls13);
+        let gate = Arc::new(std::sync::Mutex::new(WriteGate::default()));
+        let io = GatedIo {
+            input: ScriptedIo {
+                reads: VecDeque::new(),
+            },
+            gate: gate.clone(),
+        };
+        let mut vision = VisionStream::new_server(
+            CryptoTlsStream::new(io, session, Some(TlsDeframer::new())),
+            uuid,
+            b"",
+        )
+        .unwrap();
+        vision.vless_response_to_send = false;
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            Pin::new(&mut vision).poll_write(&mut cx, &record),
+            Poll::Ready(Ok(n)) if n == record.len()
+        ));
+        assert_eq!(vision.inner_write_deframer.pending_bytes(), 0);
+        assert!(matches!(
+            Pin::new(&mut vision).poll_shutdown(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let ciphertext = gate.lock().unwrap().output.clone();
+        feed_and_process_crypto_connection(&mut peer, &ciphertext).unwrap();
+        let mut plaintext = Vec::new();
+        if let Err(error) = peer.reader().read_to_end(&mut plaintext) {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+        let result = VisionUnpadder::new(uuid).unpad(&plaintext).unwrap();
+        assert_eq!(result.command, Some(UnpadCommand::Continue));
+        assert_eq!(
+            result.content, record,
+            "a complete record must not be sent twice at shutdown"
+        );
     }
 
     /// Pass-through IO over a real loopback socket pair, so the raw accessors of

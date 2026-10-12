@@ -9,33 +9,58 @@ use crate::async_stream::{
 };
 use crate::util::allocate_vec;
 
+/// Framing buffer size: one length prefix plus the largest VLESS UDP payload.
+const FRAMING_BUFFER_LEN: usize = u16::MAX as usize + 2;
+
 pub struct VlessMessageStream<S> {
     stream: S,
+    /// Framing buffer for incoming messages. It is allocated on the first read
+    /// and given back while the stream waits with no partial message, so a relay
+    /// that is idle between messages does not hold it.
     read_buf: Box<[u8]>,
     read_end_index: usize,
     pending_write: Vec<u8>,
     write_offset: usize,
     is_eof: bool,
+    /// Set when the stream ended between messages, which is a clean end even
+    /// though it is reported as an error.
+    ended_between_messages: bool,
 }
 
 impl<S: AsyncStream> VlessMessageStream<S> {
     pub fn new(stream: S) -> Self {
         Self {
             stream,
-            read_buf: allocate_vec(65537).into_boxed_slice(),
+            read_buf: Box::new([]),
             read_end_index: 0,
-            pending_write: Vec::with_capacity(65537),
+            pending_write: Vec::new(),
             write_offset: 0,
             is_eof: false,
+            ended_between_messages: false,
+        }
+    }
+
+    /// Allocate the framing buffer when a message is expected.
+    fn reserve_read_buf(&mut self) {
+        if self.read_buf.is_empty() {
+            self.read_buf = allocate_vec(FRAMING_BUFFER_LEN).into_boxed_slice();
+        }
+    }
+
+    /// Give the framing buffer back while no partial message is retained.
+    fn release_read_buf(&mut self) {
+        if self.read_end_index == 0 {
+            self.read_buf = Box::new([]);
         }
     }
 
     pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
-        if data.len() > self.read_buf.len() {
+        if data.len() > FRAMING_BUFFER_LEN {
             return Err(std::io::Error::other(
                 "feed_initial_read_data called with too much data",
             ));
         }
+        self.reserve_read_buf();
         self.read_buf[0..data.len()].copy_from_slice(data);
         self.read_end_index = data.len();
         Ok(())
@@ -43,6 +68,16 @@ impl<S: AsyncStream> VlessMessageStream<S> {
 }
 
 impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
+    /// A length-prefixed frame with a zero length is an empty datagram, so this
+    /// stream reports its end as an error instead of an empty read.
+    fn read_message_eof_on_empty(&self) -> bool {
+        false
+    }
+
+    fn read_error_is_end_of_stream(&self) -> bool {
+        self.ended_between_messages
+    }
+
     fn poll_read_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -51,7 +86,11 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
         let this = self.get_mut();
 
         if this.is_eof {
-            return Poll::Ready(Ok(()));
+            this.release_read_buf();
+            return Poll::Ready(Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "message stream closed",
+            )));
         }
 
         loop {
@@ -71,11 +110,13 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
                     } else {
                         // this.read_end_index == total_len
                         this.read_end_index = 0;
+                        this.release_read_buf();
                     }
                     return Poll::Ready(Ok(()));
                 }
             }
 
+            this.reserve_read_buf();
             let read_buf_slice = &mut this.read_buf[this.read_end_index..];
             // this is impossible because our buffer size is u16::MAX + 2, so there should always
             // be space for a full message.
@@ -87,7 +128,14 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
                     if n == 0 {
                         this.is_eof = true;
                         if this.read_end_index == 0 {
-                            return Poll::Ready(Ok(()));
+                            this.ended_between_messages = true;
+                            // No partial message is retained, so the framing
+                            // buffer can go back with the end of the stream.
+                            this.release_read_buf();
+                            return Poll::Ready(Err(Error::new(
+                                ErrorKind::UnexpectedEof,
+                                "message stream closed",
+                            )));
                         } else {
                             return Poll::Ready(Err(Error::new(
                                 ErrorKind::UnexpectedEof,
@@ -98,7 +146,12 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
                     this.read_end_index += n;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // No message is waiting, so the framing buffer can go back
+                    // until the stream is readable again.
+                    this.release_read_buf();
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -160,7 +213,9 @@ impl<S: AsyncStream> AsyncFlushMessage for VlessMessageStream<S> {
         // Once complete, flush the underlying stream.
         match Pin::new(&mut this.stream).poll_flush(cx) {
             Poll::Ready(Ok(())) => {
-                this.pending_write.clear();
+                // The framed output is fully drained, so its storage can go back
+                // instead of staying with the association.
+                this.pending_write = Vec::new();
                 this.write_offset = 0;
                 Poll::Ready(Ok(()))
             }
@@ -195,3 +250,114 @@ impl<S: AsyncStream> AsyncPing for VlessMessageStream<S> {
 }
 
 impl<S: AsyncStream> AsyncMessageStream for VlessMessageStream<S> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{Buf, BytesMut};
+    use std::task::Waker;
+    use tokio::io::AsyncRead;
+
+    /// Inner stream that serves scripted bytes and then reports its end.
+    struct ScriptedIo {
+        bytes: BytesMut,
+    }
+
+    impl AsyncRead for ScriptedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<()>> {
+            let this = self.get_mut();
+            let len = buf.remaining().min(this.bytes.len());
+            buf.put_slice(&this.bytes[..len]);
+            this.bytes.advance(len);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ScriptedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for ScriptedIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for ScriptedIo {}
+
+    fn read_one(stream: &mut VlessMessageStream<ScriptedIo>) -> Poll<Result<Vec<u8>>> {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut bytes = [0u8; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+        match Pin::new(stream).poll_read_message(&mut cx, &mut buf) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.filled().to_vec())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    #[test]
+    fn an_empty_frame_is_a_message_and_the_end_is_an_error() {
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&[0, 0]); // an empty datagram
+        bytes.extend_from_slice(&[0, 4, b'p', b'i', b'n', b'g']);
+        let mut stream = VlessMessageStream::new(ScriptedIo { bytes });
+
+        assert!(!stream.read_message_eof_on_empty());
+        assert!(matches!(read_one(&mut stream), Poll::Ready(Ok(payload)) if payload.is_empty()));
+        assert!(
+            matches!(read_one(&mut stream), Poll::Ready(Ok(payload)) if payload == b"ping"),
+            "the frame after the empty one must still be delivered"
+        );
+
+        let error = match read_one(&mut stream) {
+            Poll::Ready(Err(error)) => error,
+            other => panic!("expected the end of the stream, got {other:?}"),
+        };
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+        assert!(
+            stream.read_error_is_end_of_stream(),
+            "the end between messages is a clean end"
+        );
+    }
+
+    #[test]
+    fn a_frame_truncated_by_the_end_is_not_a_clean_end() {
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&[0, 4, b'p', b'i']);
+        let mut stream = VlessMessageStream::new(ScriptedIo { bytes });
+
+        let error = match read_one(&mut stream) {
+            Poll::Ready(Err(error)) => error,
+            other => panic!("expected a truncation error, got {other:?}"),
+        };
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+        assert!(
+            !stream.read_error_is_end_of_stream(),
+            "a truncated frame is not a clean end"
+        );
+    }
+}

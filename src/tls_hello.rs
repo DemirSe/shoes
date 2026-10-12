@@ -257,6 +257,13 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
+    // Every ServerHello field lives inside the declared handshake body. Bytes
+    // after it belong to a following handshake message, so they must not be read
+    // as ServerHello fields and the body itself must be fully consumed.
+    const HANDSHAKE_HEADER_LEN: usize = 4;
+    let body_start = TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN;
+    let mut reader = BufReader::new(&server_hello_frame[body_start..body_start + message_len]);
+
     // Legacy version (should be 0x0303 for TLS 1.2/1.3)
     let version_major = reader.read_u8()?;
     let version_minor = reader.read_u8()?;
@@ -320,6 +327,13 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         }
     }
 
+    if !reader.is_consumed() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ServerHello body has bytes that belong to no field",
+        ));
+    }
+
     Ok(ParsedServerHello {
         cipher_suite,
         is_tls13,
@@ -373,6 +387,92 @@ mod parser_boundary_tests {
 
     fn push_u16(buffer: &mut Vec<u8>, value: u16) {
         buffer.extend_from_slice(&value.to_be_bytes());
+    }
+
+    /// Build one ServerHello record frame and report its declared body length.
+    fn server_hello_record(session_id: &[u8], extensions: &[u8]) -> (Vec<u8>, usize) {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy version
+        body.extend_from_slice(&[0x11; 32]); // random
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        body.push(0x00); // compression
+        if !extensions.is_empty() {
+            push_u16(&mut body, extensions.len() as u16);
+            body.extend_from_slice(extensions);
+        }
+
+        let mut frame = vec![0x16, 0x03, 0x03];
+        push_u16(&mut frame, (body.len() + 4) as u16);
+        frame.push(0x02); // ServerHello
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        frame.extend_from_slice(&body);
+        (frame, body.len())
+    }
+
+    /// supported_versions extension selecting TLS 1.3.
+    fn supported_versions_tls13() -> Vec<u8> {
+        vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]
+    }
+
+    #[test]
+    fn a_tls13_server_hello_inside_its_body_is_accepted() {
+        let (frame, _) = server_hello_record(&[0xab; 32], &supported_versions_tls13());
+        let parsed = parse_server_hello(&frame).unwrap();
+        assert!(parsed.is_tls13);
+        assert_eq!(parsed.cipher_suite, 0x1301);
+    }
+
+    #[test]
+    fn a_tls12_server_hello_without_the_extension_is_not_tls13() {
+        let (frame, _) = server_hello_record(&[], &[]);
+        let parsed = parse_server_hello(&frame).unwrap();
+        assert!(!parsed.is_tls13);
+    }
+
+    #[test]
+    fn a_version_extension_outside_the_declared_body_does_not_select_the_version() {
+        let (mut frame, body_len) = server_hello_record(&[0xab; 32], &supported_versions_tls13());
+        // The declared body stops after the compression method, so the extension
+        // bytes in this record belong to no declared ServerHello field.
+        let short_body = body_len - 2 - supported_versions_tls13().len();
+        frame[6..9].copy_from_slice(&(short_body as u32).to_be_bytes()[1..]);
+
+        let parsed = parse_server_hello(&frame).unwrap();
+        assert!(
+            !parsed.is_tls13,
+            "bytes outside the declared handshake body must not select the TLS version"
+        );
+        assert_eq!(parsed.cipher_suite, 0x1301);
+    }
+
+    #[test]
+    fn trailing_bytes_inside_the_declared_body_are_rejected() {
+        let (mut frame, body_len) = server_hello_record(&[], &supported_versions_tls13());
+        // The declared body is longer than the ServerHello fields it contains.
+        let long_body = body_len + 4;
+        frame[3..5].copy_from_slice(&((long_body + 4) as u16).to_be_bytes());
+        frame[6..9].copy_from_slice(&(long_body as u32).to_be_bytes()[1..]);
+        frame.extend_from_slice(&[0, 0, 0, 0]);
+
+        assert!(
+            parse_server_hello(&frame).is_err(),
+            "a declared body with unconsumed bytes is not a ServerHello"
+        );
+    }
+
+    #[test]
+    fn a_valid_following_handshake_message_is_not_part_of_the_body() {
+        let (mut frame, body_len) = server_hello_record(&[], &supported_versions_tls13());
+        // A separate handshake message follows the ServerHello in the same record.
+        let following = [0x0e, 0x00, 0x00, 0x02, 0x00, 0x00];
+        frame.extend_from_slice(&following);
+        frame[3..5].copy_from_slice(&((body_len + 4 + following.len()) as u16).to_be_bytes());
+
+        let parsed = parse_server_hello(&frame).unwrap();
+        assert!(parsed.is_tls13);
+        assert_eq!(parsed.cipher_suite, 0x1301);
     }
 
     fn push_extension(buffer: &mut Vec<u8>, extension_type: u16, body: &[u8]) {

@@ -326,11 +326,13 @@ impl RealityServerConnection {
         let auth_key = derive_auth_key(&shared_secret, salt, b"REALITY")
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        // Validate session ID (contains encrypted metadata)
+        // Validate session ID (contains encrypted metadata). A ClientHello that
+        // cannot carry the envelope is unauthenticated traffic, not a syntax
+        // error: the caller may forward it to the configured cover.
         if session_id.len() != 32 {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid session ID length",
+                io::ErrorKind::PermissionDenied,
+                "ClientHello carries no REALITY auth envelope: invalid session ID length",
             ));
         }
 
@@ -605,13 +607,16 @@ impl RealityServerConnection {
         )?;
         let server_finished = construct_finished(&server_verify_data)?;
 
-        // Analyze dest's record structure to determine how to encrypt
-        // dest_records: [0]=ServerHello, [1]=CCS, [2..]=encrypted handshake, possibly NewSessionTicket
-        let dest_encrypted_records: Vec<&bytes::Bytes> = if dest_records.len() > 2 {
-            dest_records[2..].iter().collect()
-        } else {
-            vec![]
-        };
+        // Analyze dest's record structure to determine how to encrypt.
+        // dest_records: [0]=ServerHello, then the optional ChangeCipherSpec record,
+        // then the encrypted handshake records, possibly NewSessionTicket records.
+        // CCS is optional in TLS 1.3, so encrypted records are selected by their
+        // content type instead of by position.
+        let dest_encrypted_records: Vec<&bytes::Bytes> = dest_records
+            .iter()
+            .skip(1)
+            .filter(|record| record.first() == Some(&CONTENT_TYPE_APPLICATION_DATA))
+            .collect();
 
         // Build handshake messages array
         let messages: [&[u8]; 4] = [
@@ -950,12 +955,20 @@ impl RealityServerConnection {
                         }
                     }
                 }
-                // CONTENT_TYPE_HANDSHAKE is invalid after handshake complete
-                // strip_content_type() validates and returns error for invalid types
-                _ => unreachable!(
-                    "strip_content_type validates content type; unexpected: 0x{:02x}",
-                    content_type
-                ),
+                // A Handshake record after the handshake carries a TLS 1.3
+                // post-handshake message. This connection implements none of
+                // them: KeyUpdate would need new traffic secrets and a matching
+                // response, so unsupported post-handshake input fails the
+                // connection instead of panicking.
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unexpected post-handshake record content type: 0x{:02x}",
+                            content_type
+                        ),
+                    ));
+                }
             }
 
             // Consume the processed record from the buffer (after plaintext borrow ends)
@@ -1111,6 +1124,236 @@ pub fn feed_reality_server_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completed_connection() -> RealityServerConnection {
+        let config = RealityServerConfig {
+            private_key: [0u8; 32],
+            short_ids: vec![[0u8; 8]],
+            dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+        };
+        RealityServerConnection::new(config)
+            .unwrap()
+            .complete_for_test()
+            .unwrap()
+    }
+
+    fn validation_connection() -> RealityServerConnection {
+        let config = RealityServerConfig {
+            private_key: [0u8; 32],
+            short_ids: vec![[0u8; 8]],
+            dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+        };
+        RealityServerConnection::new(config).unwrap()
+    }
+
+    /// A real X25519 public key, as a client would offer it.
+    fn x25519_public_key() -> Vec<u8> {
+        agreement::PrivateKey::from_private_key(&agreement::X25519, &[0x11; 32])
+            .unwrap()
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
+    /// A real P-256 public key, as a client would offer it.
+    fn p256_public_key() -> Vec<u8> {
+        agreement::PrivateKey::from_private_key(&agreement::ECDH_P256, &[0x22; 32])
+            .unwrap()
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
+    /// A syntactically valid TLS 1.3 ClientHello record with a chosen legacy
+    /// session id and a single key share entry.
+    fn client_hello_record(session_id: &[u8], group: u16, public_key: &[u8]) -> Vec<u8> {
+        let mut hello = Vec::new();
+        hello.push(0x01); // ClientHello
+        let length_offset = hello.len();
+        hello.extend_from_slice(&[0u8; 3]);
+        hello.extend_from_slice(&[0x03, 0x03]);
+        hello.extend_from_slice(&[0x22; 32]); // random
+        hello.push(session_id.len() as u8);
+        hello.extend_from_slice(session_id);
+        hello.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
+        hello.extend_from_slice(&[0x01, 0x00]); // compression methods
+        let extensions_offset = hello.len();
+        hello.extend_from_slice(&[0u8; 2]);
+
+        // server_name
+        let hostname = b"localhost";
+        hello.extend_from_slice(&[0x00, 0x00]);
+        hello.extend_from_slice(&((5 + hostname.len()) as u16).to_be_bytes());
+        hello.extend_from_slice(&((hostname.len() + 3) as u16).to_be_bytes());
+        hello.push(0x00);
+        hello.extend_from_slice(&(hostname.len() as u16).to_be_bytes());
+        hello.extend_from_slice(hostname);
+
+        // supported_versions: TLS 1.3
+        hello.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+
+        // supported_groups: the offered group only
+        hello.extend_from_slice(&[0x00, 0x0a, 0x00, 0x04, 0x00, 0x02]);
+        hello.extend_from_slice(&group.to_be_bytes());
+
+        // signature_algorithms
+        hello.extend_from_slice(&[
+            0x00, 0x0d, 0x00, 0x08, 0x00, 0x06, 0x04, 0x03, 0x08, 0x04, 0x08, 0x07,
+        ]);
+
+        // key_share: one entry for the offered group, last so tests can address
+        // its length field from the end of the record.
+        hello.extend_from_slice(&[0x00, 0x33]);
+        hello.extend_from_slice(&((6 + public_key.len()) as u16).to_be_bytes());
+        hello.extend_from_slice(&((4 + public_key.len()) as u16).to_be_bytes());
+        hello.extend_from_slice(&group.to_be_bytes());
+        hello.extend_from_slice(&(public_key.len() as u16).to_be_bytes());
+        hello.extend_from_slice(public_key);
+
+        let extensions_len = hello.len() - extensions_offset - 2;
+        hello[extensions_offset..extensions_offset + 2]
+            .copy_from_slice(&(extensions_len as u16).to_be_bytes());
+        let body_len = hello.len() - 4;
+        hello[length_offset..length_offset + 3]
+            .copy_from_slice(&(body_len as u32).to_be_bytes()[1..]);
+
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hello);
+        record
+    }
+
+    #[test]
+    fn a_client_hello_without_a_reality_envelope_is_unauthenticated() {
+        // A TLS 1.3 client may send an empty legacy session id. It cannot carry
+        // the REALITY envelope, so it is unauthenticated traffic that the caller
+        // may forward to the configured cover.
+        let hello = client_hello_record(&[], 0x001d, &x25519_public_key());
+        let mut connection = validation_connection();
+        let error = connection
+            .validate_client_hello(&hello)
+            .expect_err("a hello without an envelope must not authenticate");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[test]
+    fn a_client_hello_without_an_x25519_key_share_is_unauthenticated() {
+        // The envelope needs an X25519 key share. A client that offers only a
+        // valid P-256 key share is a valid TLS client without a REALITY envelope.
+        let hello = client_hello_record(&[0x44; 32], 0x0017, &p256_public_key());
+        let mut connection = validation_connection();
+        let error = connection
+            .validate_client_hello(&hello)
+            .expect_err("a hello without X25519 must not authenticate");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    #[test]
+    fn an_empty_session_id_does_not_hide_a_malformed_key_share() {
+        // The malformed extension is a syntax error even though the empty
+        // session id alone would only mean "no REALITY envelope".
+        let mut hello = client_hello_record(&[], 0x001d, &x25519_public_key());
+        let key_len_offset = hello.len() - 32 - 2;
+        hello[key_len_offset..key_len_offset + 2].copy_from_slice(&64u16.to_be_bytes());
+        let mut connection = validation_connection();
+        let error = connection
+            .validate_client_hello(&hello)
+            .expect_err("a truncated key share must stay a syntax error");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    #[test]
+    fn a_malformed_key_share_stays_a_syntax_error() {
+        let mut hello = client_hello_record(&[0x44; 32], 0x001d, &x25519_public_key());
+        // Claim a 64-byte key while the extension only holds 32 bytes. The key
+        // share entry is the last field of the record.
+        let key_len_offset = hello.len() - 32 - 2;
+        hello[key_len_offset..key_len_offset + 2].copy_from_slice(&64u16.to_be_bytes());
+        let mut connection = validation_connection();
+        let error = connection
+            .validate_client_hello(&hello)
+            .expect_err("a truncated key share must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    #[test]
+    fn invalid_credentials_stay_unauthenticated() {
+        // A 32-byte session id that does not decrypt is not an authenticated
+        // client, and it must never be treated as one.
+        let hello = client_hello_record(&[0x44; 32], 0x001d, &x25519_public_key());
+        let mut connection = validation_connection();
+        let error = connection
+            .validate_client_hello(&hello)
+            .expect_err("an undecryptable envelope must not authenticate");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    /// Encrypt one post-handshake record with the zero application keys that
+    /// `complete_for_test` installs, starting at read-side sequence number 0.
+    fn post_handshake_record(content_type: u8, message: &[u8]) -> Vec<u8> {
+        let key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, &[0u8; 16]).unwrap();
+        let iv = [0u8; 12];
+        let mut seq = 0u64;
+        let mut encryptor = RecordEncryptor::new(&key, &iv, &mut seq);
+        let mut ciphertext = Vec::new();
+        match content_type {
+            CONTENT_TYPE_APPLICATION_DATA => {
+                let mut plaintext = message.to_vec();
+                encryptor
+                    .encrypt_app_data(&mut plaintext, &mut ciphertext)
+                    .unwrap();
+            }
+            CONTENT_TYPE_HANDSHAKE => {
+                encryptor
+                    .encrypt_handshake(message, &mut ciphertext)
+                    .unwrap();
+            }
+            other => panic!("unsupported test content type 0x{other:02x}"),
+        }
+        ciphertext
+    }
+
+    #[test]
+    fn application_data_after_the_handshake_still_reads() {
+        let mut connection = completed_connection();
+        let record = post_handshake_record(CONTENT_TYPE_APPLICATION_DATA, b"payload");
+        connection.read_tls(&mut record.as_slice()).unwrap();
+        connection.process_new_packets().unwrap();
+        let mut plaintext = [0u8; 7];
+        connection.reader().read_exact(&mut plaintext).unwrap();
+        assert_eq!(&plaintext, b"payload");
+    }
+
+    #[test]
+    fn post_handshake_handshake_record_is_rejected_without_panicking() {
+        let mut connection = completed_connection();
+        // KeyUpdate: the one Handshake message a TLS 1.3 peer may send after
+        // the handshake, which this connection does not implement.
+        let record = post_handshake_record(CONTENT_TYPE_HANDSHAKE, &[0x18, 0x00, 0x00, 0x00]);
+        connection.read_tls(&mut record.as_slice()).unwrap();
+        let error = connection
+            .process_new_packets()
+            .expect_err("an unsupported post-handshake record must fail instead of panicking");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert_eq!(
+            connection
+                .process_new_packets()
+                .map_err(|e| e.kind())
+                .unwrap_err(),
+            io::ErrorKind::InvalidData,
+            "the failed connection must stay failed"
+        );
+    }
 
     #[test]
     fn test_reality_server_connection_creation() {

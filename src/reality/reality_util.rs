@@ -212,12 +212,21 @@ pub fn extract_client_public_key(client_hello: &[u8]) -> Result<[u8; 32], std::i
     }
 
     Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "KeyShare extension not found in ClientHello",
+        std::io::ErrorKind::PermissionDenied,
+        "ClientHello carries no REALITY auth envelope: no KeyShare extension",
     ))
 }
 
-/// Parses the KeyShare extension to extract X25519 public key
+/// X25519 key share group.
+const X25519_GROUP: u16 = 0x001d;
+
+/// Parses the KeyShare extension and extracts the X25519 public key.
+///
+/// The extension syntax is checked before any group is selected: the declared
+/// entry vector has to consume the extension exactly and every entry has to fit
+/// inside it. Only then is the absence of an X25519 share "no REALITY envelope"
+/// instead of malformed TLS. Unknown and GREASE groups stay valid entries; their
+/// key material is ignored.
 fn parse_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
     let mut reader = BufReader::new(data);
 
@@ -228,47 +237,62 @@ fn parse_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
     //   - Key Exchange Length: 2 bytes
     //   - Key Exchange Data: variable
 
-    let _client_shares_len = reader.read_u16_be()?;
+    let client_shares_len = reader.read_u16_be()? as usize;
 
-    // Find X25519 key share (group 0x001d = 29)
-    loop {
-        // Check if we have at least 4 bytes for group and length
-        if reader.position() + 4 > data.len() {
-            break;
+    // Entries live inside the declared vector, and the vector is the whole
+    // extension body: bytes outside it belong to no key share.
+    if reader.remaining() != client_shares_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "KeyShare vector does not match the extension length",
+        ));
+    }
+    let entries = &data[reader.position()..reader.position() + client_shares_len];
+    let mut reader = BufReader::new(entries);
+
+    // Every entry is parsed before the key is selected, so a valid early entry
+    // cannot hide a malformed tail.
+    let mut x25519_key: Option<[u8; 32]> = None;
+    while !reader.is_consumed() {
+        if reader.remaining() < 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "KeyShare entry header is truncated",
+            ));
         }
 
         let group = reader.read_u16_be()?;
         let key_len = reader.read_u16_be()? as usize;
 
-        if reader.position() + key_len > data.len() {
+        if reader.remaining() < key_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "KeyShare entry extends past end",
             ));
         }
+        let key_bytes = reader.read_slice(key_len)?;
 
-        if group == 0x001d {
-            // X25519
+        if group == X25519_GROUP {
             if key_len != 32 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("Invalid X25519 key length: {}", key_len),
                 ));
             }
-
-            let key_bytes = reader.read_slice(32)?;
-            let mut key = [0u8; 32];
-            key.copy_from_slice(key_bytes);
-            return Ok(key);
-        } else {
-            reader.skip(key_len)?;
+            if x25519_key.is_none() {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(key_bytes);
+                x25519_key = Some(key);
+            }
         }
     }
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "X25519 key share not found in KeyShare extension",
-    ))
+    x25519_key.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "ClientHello carries no REALITY auth envelope: no X25519 key share",
+        )
+    })
 }
 
 /// Extract server's X25519 public key from ServerHello message
@@ -483,6 +507,138 @@ pub fn generate_keypair() -> std::io::Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a key_share extension body: declared vector length, then entries.
+    fn keyshare_extension(declared_vector_len: u16, entries: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&declared_vector_len.to_be_bytes());
+        for (group, key) in entries {
+            data.extend_from_slice(&group.to_be_bytes());
+            data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            data.extend_from_slice(key);
+        }
+        data
+    }
+
+    /// Declared vector length that covers exactly the given entries.
+    fn entry_vector_len(entries: &[(u16, &[u8])]) -> u16 {
+        entries
+            .iter()
+            .map(|(_, key)| 4 + key.len() as u16)
+            .sum::<u16>()
+    }
+
+    const X25519: u16 = 0x001d;
+    const P256: u16 = 0x0017;
+    /// A GREASE group from RFC 8701 that a client may offer.
+    const GREASE: u16 = 0x0a0a;
+
+    #[test]
+    fn a_key_share_inside_the_declared_vector_is_used() {
+        let key = [0x42u8; 32];
+        let data = keyshare_extension(entry_vector_len(&[(X25519, &key)]), &[(X25519, &key)]);
+        assert_eq!(parse_keyshare_extension(&data).unwrap(), key);
+    }
+
+    #[test]
+    fn a_grease_entry_before_the_x25519_share_is_retained() {
+        let key = [0x42u8; 32];
+        let entries = [(GREASE, &[0xaa, 0xbb][..]), (X25519, &key[..])];
+        let data = keyshare_extension(entry_vector_len(&entries), &entries);
+        assert_eq!(parse_keyshare_extension(&data).unwrap(), key);
+    }
+
+    #[test]
+    fn a_grease_entry_after_the_x25519_share_is_retained() {
+        let key = [0x42u8; 32];
+        let entries = [(X25519, &key[..]), (GREASE, &[0xaa, 0xbb][..])];
+        let data = keyshare_extension(entry_vector_len(&entries), &entries);
+        assert_eq!(parse_keyshare_extension(&data).unwrap(), key);
+    }
+
+    #[test]
+    fn a_valid_non_x25519_share_is_unauthenticated() {
+        // A complete P-256 entry is valid syntax, but the envelope needs X25519.
+        let point = [0x04u8; 65];
+        let data = keyshare_extension(entry_vector_len(&[(P256, &point)]), &[(P256, &point)]);
+        let error = parse_keyshare_extension(&data).expect_err("no X25519 share was offered");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn a_key_share_outside_the_declared_vector_is_malformed() {
+        let key = [0x42u8; 32];
+        // The declared vector is empty while an entry follows it: the extension
+        // body is not the vector it declares.
+        let data = keyshare_extension(0, &[(X25519, &key)]);
+        let error = parse_keyshare_extension(&data)
+            .expect_err("an entry outside the declared vector is malformed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_key_share_vector_shorter_than_the_extension_is_malformed() {
+        let key = [0x42u8; 32];
+        // The declared vector covers the entry, but the extension has trailing
+        // bytes that belong to no declared entry.
+        let mut data = keyshare_extension(entry_vector_len(&[(X25519, &key)]), &[(X25519, &key)]);
+        data.extend_from_slice(&[0x00, 0x00]);
+        let error =
+            parse_keyshare_extension(&data).expect_err("trailing extension bytes are malformed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_key_share_vector_longer_than_the_extension_is_malformed() {
+        let key = [0x42u8; 32];
+        let data = keyshare_extension(entry_vector_len(&[(X25519, &key)]) + 8, &[(X25519, &key)]);
+        let error = parse_keyshare_extension(&data).expect_err("a truncated vector is malformed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_key_share_entry_longer_than_the_vector_is_malformed() {
+        let key = [0x42u8; 32];
+        // The vector covers the entry header only.
+        let data = keyshare_extension(4, &[(X25519, &key)]);
+        let error = parse_keyshare_extension(&data).expect_err("a truncated entry is malformed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_valid_entry_cannot_hide_a_truncated_tail() {
+        let key = [0x42u8; 32];
+        // A complete X25519 entry followed by a one-byte fragment inside the
+        // declared vector.
+        let mut data =
+            keyshare_extension(entry_vector_len(&[(X25519, &key)]) + 1, &[(X25519, &key)]);
+        data.push(0x01);
+        let error =
+            parse_keyshare_extension(&data).expect_err("a trailing entry fragment is malformed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_valid_entry_cannot_hide_a_malformed_tail_entry() {
+        let key = [0x42u8; 32];
+        // A complete X25519 entry followed by a P-256 entry that claims more key
+        // bytes than the vector holds.
+        let mut data = keyshare_extension(entry_vector_len(&[(X25519, &key)]), &[(X25519, &key)]);
+        data[0..2].copy_from_slice(&(entry_vector_len(&[(X25519, &key)]) + 4).to_be_bytes());
+        data.extend_from_slice(&P256.to_be_bytes());
+        data.extend_from_slice(&64u16.to_be_bytes());
+        let error =
+            parse_keyshare_extension(&data).expect_err("a truncated tail entry is malformed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_wrong_length_x25519_entry_is_malformed() {
+        let short = [0x42u8; 16];
+        let data = keyshare_extension(entry_vector_len(&[(X25519, &short)]), &[(X25519, &short)]);
+        let error = parse_keyshare_extension(&data).expect_err("a short X25519 key is malformed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn test_decode_short_id() {

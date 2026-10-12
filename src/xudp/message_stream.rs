@@ -312,7 +312,9 @@ impl XudpMessageStream {
                 SessionStatus::End | SessionStatus::KeepAlive => unreachable!(),
             };
 
-            if !has_data || data.is_empty() {
+            // A data section of length zero is an empty datagram, not a control
+            // frame: only a frame without the DATA option carries no message.
+            if !has_data {
                 continue;
             }
 
@@ -751,6 +753,144 @@ mod tests {
     }
 
     impl AsyncStream for BudgetedWriter {}
+
+    /// Inner stream that serves scripted XUDP frame bytes to the reader.
+    struct FrameReader {
+        bytes: bytes::Bytes,
+    }
+
+    impl AsyncRead for FrameReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.bytes.is_empty() {
+                // A stream with nothing left to send stays open.
+                return Poll::Pending;
+            }
+            let len = buf.remaining().min(this.bytes.len());
+            buf.put_slice(&this.bytes[..len]);
+            this.bytes.advance(len);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FrameReader {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for FrameReader {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for FrameReader {}
+
+    /// Build one XUDP frame: metadata plus an optional data section.
+    fn xudp_frame(
+        session_id: u16,
+        status: SessionStatus,
+        option: FrameOption,
+        target: Option<NetLocation>,
+        data: Option<&[u8]>,
+    ) -> bytes::BytesMut {
+        let metadata = FrameMetadata {
+            session_id,
+            status,
+            option,
+            target,
+            network: Some(TargetNetwork::Udp),
+        };
+        let mut frame = bytes::BytesMut::new();
+        metadata.encode(&mut frame).unwrap();
+        if option.has_data() {
+            let data = data.unwrap_or(&[]);
+            frame.put_u16(data.len() as u16);
+            frame.extend_from_slice(data);
+        }
+        frame
+    }
+
+    #[test]
+    fn a_zero_length_data_frame_is_delivered_as_an_empty_message() {
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 53);
+        // HAS_DATA with a zero-length data section is an empty datagram, which is
+        // not the same as a control frame without a data section.
+        let frame = xudp_frame(
+            10,
+            SessionStatus::New,
+            FrameOption::new().with_data(),
+            Some(destination.clone()),
+            Some(&[]),
+        );
+        let mut stream = XudpMessageStream::new(Box::new(FrameReader {
+            bytes: frame.freeze(),
+        }));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0u8; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+
+        match Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf) {
+            Poll::Ready(Ok((session_id, address))) => {
+                assert!(
+                    buf.filled().is_empty(),
+                    "the empty datagram carries no bytes"
+                );
+                assert_eq!(address, "127.0.0.1:53".parse().unwrap());
+                assert!(session_id > 0, "the frame must map to a routed session");
+            }
+            other => panic!("an empty data frame must be delivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_control_frame_without_data_is_still_skipped() {
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 53);
+        // KeepAlive has no data section and stays a control frame.
+        let frame = xudp_frame(
+            10,
+            SessionStatus::KeepAlive,
+            FrameOption::new(),
+            Some(destination),
+            None,
+        );
+        let mut stream = XudpMessageStream::new(Box::new(FrameReader {
+            bytes: frame.freeze(),
+        }));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0u8; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+
+        assert!(
+            Pin::new(&mut stream)
+                .poll_read_session_message(&mut cx, &mut buf)
+                .is_pending(),
+            "a control frame must not be delivered as a message"
+        );
+    }
 
     fn budgeted_writer(
         write_budget: usize,

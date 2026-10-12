@@ -3,9 +3,45 @@
 //! Provides centralized port allocation with tracking and synchronization.
 //! All tests should use PortHelper instead of directly allocating ports.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::sync::{Mutex, OnceLock};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, Instant, sleep, timeout};
+
+/// Address and port pairs this process has already handed out.
+///
+/// The availability probe binds a listener and then releases it, so two parallel
+/// tests in the same process could otherwise be handed the same pair and the
+/// second fixture bind would fail with `AddrInUse`. Every allocation reserves
+/// its pair here before it is returned.
+static ALLOCATED_PORTS: OnceLock<Mutex<HashSet<(IpAddr, u16)>>> = OnceLock::new();
+
+fn allocated_ports() -> &'static Mutex<HashSet<(IpAddr, u16)>> {
+    ALLOCATED_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Reserve one pair for this process, or report that it is already handed out.
+fn reserve_port(ip: IpAddr, port: u16) -> bool {
+    allocated_ports()
+        .lock()
+        .expect("port reservation lock is not poisoned")
+        .insert((ip, port))
+}
+
+/// True when this process has not handed the pair out yet.
+fn port_is_available_to_this_process(ip: IpAddr, port: u16) -> bool {
+    !allocated_ports()
+        .lock()
+        .expect("port reservation lock is not poisoned")
+        .contains(&(ip, port))
+}
+
+/// True when the operating system can still bind the pair for TCP and UDP.
+fn os_accepts_both_protocols(ip: IpAddr, port: u16) -> bool {
+    TcpListener::bind(SocketAddr::new(ip, port)).is_ok()
+        && UdpSocket::bind(SocketAddr::new(ip, port)).is_ok()
+}
 
 /// Helper for allocating random ports and waiting for them to be ready.
 /// Tracks all listener ports so we can wait for them to be ready before tests run.
@@ -52,26 +88,38 @@ impl PortHelper {
     ///
     /// Returns ("127.0.0.1", port).
     pub fn get_localhost_listener_port(&mut self) -> (String, u16) {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("failed to allocate a localhost test port");
-        let port = listener
-            .local_addr()
-            .expect("failed to read allocated localhost test port")
-            .port();
-        let addr = ("127.0.0.1".to_string(), port);
-        self.listener_addrs
-            .push(format!("{}:{}", addr.0, addr.1).parse().unwrap());
-        addr
+        for _ in 0..64 {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("failed to allocate a localhost test port");
+            let port = listener
+                .local_addr()
+                .expect("failed to read allocated localhost test port")
+                .port();
+            if !reserve_port(IpAddr::V4(Ipv4Addr::LOCALHOST), port) {
+                continue;
+            }
+            let addr = ("127.0.0.1".to_string(), port);
+            self.listener_addrs
+                .push(format!("{}:{}", addr.0, addr.1).parse().unwrap());
+            return addr;
+        }
+        panic!("no localhost test port is available");
     }
 
     pub fn get_ipv6_listener_port(&mut self) -> (String, u16) {
-        let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
-            .expect("failed to allocate an IPv6 test port");
-        let address = listener
-            .local_addr()
-            .expect("failed to read the allocated IPv6 test port");
-        self.listener_addrs.push(address);
-        (address.ip().to_string(), address.port())
+        for _ in 0..64 {
+            let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
+                .expect("failed to allocate an IPv6 test port");
+            let address = listener
+                .local_addr()
+                .expect("failed to read the allocated IPv6 test port");
+            if !reserve_port(IpAddr::V6(Ipv6Addr::LOCALHOST), address.port()) {
+                continue;
+            }
+            self.listener_addrs.push(address);
+            return (address.ip().to_string(), address.port());
+        }
+        panic!("no IPv6 test port is available");
     }
 
     /// Wait for all tracked listener addresses to be ready for connections.
@@ -116,13 +164,48 @@ fn get_random_addr() -> (String, u16) {
 
         if let Ok(listener) = TcpListener::bind((ip, 0)) {
             let port = listener.local_addr().unwrap().port();
-            if UdpSocket::bind((ip, port)).is_ok() {
+            if UdpSocket::bind((ip, port)).is_ok() && reserve_port(IpAddr::V4(ip), port) {
                 return (ip.to_string(), port);
             }
         }
     }
 
     unreachable!();
+}
+
+/// Get one port that is free on both loopback families.
+///
+/// Some fixtures bind the same port on `127.0.0.1` and `::1`, for example to
+/// compare an IPv4 and an IPv6 echo server. Both pairs are reserved, so no other
+/// test in this process can be handed them.
+pub fn get_dual_stack_listener_port() -> u16 {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+
+    for _ in 0..64 {
+        let port: u16 = rng.random_range(20_000..60_000);
+        if !port_is_available_to_this_process(IpAddr::V4(Ipv4Addr::LOCALHOST), port) {
+            continue;
+        }
+        if !port_is_available_to_this_process(IpAddr::V6(Ipv6Addr::LOCALHOST), port) {
+            continue;
+        }
+        if !os_accepts_both_protocols(IpAddr::V4(Ipv4Addr::LOCALHOST), port) {
+            continue;
+        }
+        if !os_accepts_both_protocols(IpAddr::V6(Ipv6Addr::LOCALHOST), port) {
+            continue;
+        }
+        if !reserve_port(IpAddr::V4(Ipv4Addr::LOCALHOST), port) {
+            continue;
+        }
+        if !reserve_port(IpAddr::V6(Ipv6Addr::LOCALHOST), port) {
+            continue;
+        }
+        return port;
+    }
+
+    panic!("no dual-stack test port is available");
 }
 
 fn get_random_udp_addr() -> (String, u16) {
@@ -166,6 +249,61 @@ async fn wait_for_addr(addr: SocketAddr, wait_timeout: Duration) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocations_are_unique_within_the_process() {
+        let mut seen = HashSet::new();
+        for _ in 0..200 {
+            let (ip, port) = get_random_addr();
+            assert!(
+                seen.insert((ip.clone(), port)),
+                "the allocator handed out {ip}:{port} twice"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handed_out_address_is_never_handed_out_again() {
+        let (first_ip, first_port) = get_random_addr();
+        for _ in 0..300 {
+            let (ip, port) = get_random_addr();
+            assert!(
+                !(ip == first_ip && port == first_port),
+                "the allocator repeated {first_ip}:{first_port}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bound_port_is_never_handed_out() {
+        // Hold one pair the way a fixture does, then allocate many times.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = listener.local_addr().unwrap();
+        for _ in 0..300 {
+            let (ip, port) = get_random_addr();
+            assert!(
+                !(ip == "127.0.0.1" && port == held.port()),
+                "the allocator handed out the bound port {held}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dual_stack_helper_reserves_both_families() {
+        let port = get_dual_stack_listener_port();
+        assert!(!port_is_available_to_this_process(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port
+        ));
+        assert!(!port_is_available_to_this_process(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            port
+        ));
+        for _ in 0..200 {
+            let (ip, other) = get_random_addr();
+            assert!(!(ip == "127.0.0.1" && other == port));
+        }
+    }
 
     #[tokio::test]
     async fn readiness_only_waits_for_pending_listeners() {

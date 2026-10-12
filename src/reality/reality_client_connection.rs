@@ -262,6 +262,22 @@ impl RealityClientConnection {
         Ok(())
     }
 
+    /// Install application keys and reach the Complete state without a peer.
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(mut self) -> io::Result<Self> {
+        let cipher_suite = CipherSuite::AES_128_GCM_SHA256;
+        let key = vec![0; cipher_suite.key_len()];
+        let iv = vec![0; cipher_suite.nonce_len()];
+
+        self.handshake_state = HandshakeState::Complete;
+        self.app_read_key = Some(AeadKey::new(cipher_suite, &key)?);
+        self.app_read_iv = Some(iv.clone());
+        self.app_write_key = Some(AeadKey::new(cipher_suite, &key)?);
+        self.app_write_iv = Some(iv);
+        self.cipher_suite = Some(cipher_suite);
+        Ok(self)
+    }
+
     /// Read TLS messages from the provided reader into internal buffer
     ///
     /// Uses pre-allocated buffer to avoid allocation on every call.
@@ -843,12 +859,19 @@ impl RealityClientConnection {
                         }
                     }
                 }
-                // CONTENT_TYPE_HANDSHAKE is invalid after handshake complete
-                // strip_content_type() validates and returns error for invalid types
-                _ => unreachable!(
-                    "strip_content_type validates content type; unexpected: 0x{:02x}",
-                    content_type
-                ),
+                // A Handshake record after the handshake carries a TLS 1.3
+                // post-handshake message. This connection implements none of
+                // them: KeyUpdate would need new traffic secrets, so unsupported
+                // post-handshake input fails the connection instead of panicking.
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unexpected post-handshake record content type: 0x{:02x}",
+                            content_type
+                        ),
+                    ));
+                }
             }
 
             // Consume the processed record from the buffer (after plaintext borrow ends)
@@ -1004,6 +1027,68 @@ pub fn feed_reality_client_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completed_connection() -> RealityClientConnection {
+        let config = RealityClientConfig {
+            public_key: [1u8; 32],
+            short_id: [0u8; 8],
+            server_name: "localhost".to_string(),
+            cipher_suites: Vec::new(),
+        };
+        RealityClientConnection::new(config)
+            .unwrap()
+            .complete_for_test()
+            .unwrap()
+    }
+
+    /// Encrypt one post-handshake record with the zero application keys that
+    /// `complete_for_test` installs, starting at read-side sequence number 0.
+    fn post_handshake_record(content_type: u8, message: &[u8]) -> Vec<u8> {
+        let key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, &[0u8; 16]).unwrap();
+        let iv = [0u8; 12];
+        let mut seq = 0u64;
+        let mut encryptor = RecordEncryptor::new(&key, &iv, &mut seq);
+        let mut ciphertext = Vec::new();
+        match content_type {
+            CONTENT_TYPE_APPLICATION_DATA => {
+                let mut plaintext = message.to_vec();
+                encryptor
+                    .encrypt_app_data(&mut plaintext, &mut ciphertext)
+                    .unwrap();
+            }
+            CONTENT_TYPE_HANDSHAKE => {
+                encryptor
+                    .encrypt_handshake(message, &mut ciphertext)
+                    .unwrap();
+            }
+            other => panic!("unsupported test content type 0x{other:02x}"),
+        }
+        ciphertext
+    }
+
+    #[test]
+    fn application_data_after_the_handshake_still_reads() {
+        let mut connection = completed_connection();
+        let record = post_handshake_record(CONTENT_TYPE_APPLICATION_DATA, b"payload");
+        connection.read_tls(&mut record.as_slice()).unwrap();
+        connection.process_new_packets().unwrap();
+        let mut plaintext = [0u8; 7];
+        connection.reader().read_exact(&mut plaintext).unwrap();
+        assert_eq!(&plaintext, b"payload");
+    }
+
+    #[test]
+    fn post_handshake_handshake_record_is_rejected_without_panicking() {
+        let mut connection = completed_connection();
+        // KeyUpdate: the one Handshake message a TLS 1.3 peer may send after
+        // the handshake, which this connection does not implement.
+        let record = post_handshake_record(CONTENT_TYPE_HANDSHAKE, &[0x18, 0x00, 0x00, 0x00]);
+        connection.read_tls(&mut record.as_slice()).unwrap();
+        let error = connection
+            .process_new_packets()
+            .expect_err("an unsupported post-handshake record must fail instead of panicking");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
 
     #[test]
     fn handshake_plaintext_is_bounded() {

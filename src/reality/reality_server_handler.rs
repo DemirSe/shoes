@@ -18,6 +18,7 @@ use crate::tls_hello::{ParsedClientHello, parse_server_hello};
 use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
 
+use super::common::CONTENT_TYPE_APPLICATION_DATA;
 use super::fallback_rate_limit::{FallbackLimits, limit_writer};
 use super::{RealityServerConfig, RealityServerConnection};
 use crate::config::server::FallbackRateLimit;
@@ -224,19 +225,28 @@ pub async fn setup_reality_server_stream(
 
         dest_records.extend(new_records);
 
-        // Separate mode: first encrypted record is small, need more records
-        // Keep reading until we have 6 records (SH + CCS + 4 encrypted)
-        // Note: Some servers send NewSessionTicket as a 7th record, but we don't need it
-        if dest_records.len() >= 6 {
+        // The compatibility ChangeCipherSpec record is optional in TLS 1.3, so the
+        // encrypted flight is counted by record type instead of by position.
+        let encrypted_records = dest_records
+            .iter()
+            .skip(1)
+            .filter(|record| record.first() == Some(&CONTENT_TYPE_APPLICATION_DATA))
+            .count();
+
+        // Separate mode: ServerHello, optional CCS, then four encrypted records.
+        if encrypted_records >= 4 {
             log::debug!(
                 "REALITY: Separate mode detected, got {} records",
                 dest_records.len()
             );
             break;
-        } else if dest_records.len() >= 3 {
+        } else if encrypted_records >= 1 {
             // Check if we have enough records using the 512-byte heuristic
-            // Records: [0]=ServerHello, [1]=CCS, [2..]=encrypted handshake
-            let first_encrypted = &dest_records[2];
+            let first_encrypted = dest_records
+                .iter()
+                .skip(1)
+                .find(|record| record.first() == Some(&CONTENT_TYPE_APPLICATION_DATA))
+                .expect("one encrypted record was counted");
             if first_encrypted.len() > 512 {
                 // Combined mode: first encrypted record > 512 bytes contains all messages
                 log::debug!(
@@ -353,6 +363,482 @@ mod cleanup_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    /// A REALITY target whose destination is the local cover listener.
+    fn local_cover_target(
+        dest: NetLocation,
+        private_key: [u8; 32],
+        resolver: Arc<dyn Resolver>,
+    ) -> RealityServerTarget {
+        use crate::client_proxy_chain::InitialHopEntry;
+        use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+        use crate::vless::vless_server_handler::VlessTcpServerHandler;
+
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        RealityServerTarget {
+            limit_fallback_upload: None,
+            limit_fallback_download: None,
+            private_key,
+            short_ids: vec![[0; 8]],
+            dest,
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+            effective_selector: selector.clone(),
+            inner_protocol: InnerProtocol::Normal(Box::new(VlessTcpServerHandler::new(
+                "550e8400-e29b-41d4-a716-446655440000",
+                true,
+                selector,
+                resolver,
+                None,
+            ))),
+            dest_client_chain: ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Box::new(
+                    SocketConnectorImpl::from_config(&crate::config::ClientConfig::default()),
+                ))],
+                Vec::new(),
+            ),
+        }
+    }
+
+    /// Remove the optional TLS 1.3 compatibility CCS record from a cover flight.
+    fn without_change_cipher_spec(flight: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        while offset + 5 <= flight.len() {
+            let len = u16::from_be_bytes([flight[offset + 3], flight[offset + 4]]) as usize;
+            let end = offset + 5 + len;
+            assert!(end <= flight.len(), "truncated cover flight");
+            if flight[offset] != 0x14 {
+                out.extend_from_slice(&flight[offset..end]);
+            }
+            offset = end;
+        }
+        assert!(
+            out.len() < flight.len(),
+            "the cover flight must contain a CCS record to remove"
+        );
+        out
+    }
+
+    /// A cover flight that authenticates one client hello and answers with the
+    /// given TLS records. The client connection is kept so the test can finish
+    /// the REALITY handshake with the same keys the hello used.
+    struct CoverFlight {
+        client: CryptoConnection,
+        hello: Vec<u8>,
+        response: Vec<u8>,
+        listener: tokio::net::TcpListener,
+    }
+
+    async fn cover_flight() -> CoverFlight {
+        use aws_lc_rs::agreement;
+
+        let private_key = [1; 32];
+        let public_key = agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key)
+            .unwrap()
+            .compute_public_key()
+            .unwrap();
+        let mut public_key_bytes = [0u8; 32];
+        public_key_bytes.copy_from_slice(public_key.as_ref());
+
+        let mut client = CryptoConnection::new_reality_client(
+            crate::reality::RealityClientConnection::new(crate::reality::RealityClientConfig {
+                public_key: public_key_bytes,
+                short_id: [0; 8],
+                server_name: "localhost".into(),
+                cipher_suites: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // A large certificate keeps the first encrypted record well above the
+        // 512-byte combined-mode threshold, so the cover layout is deterministic.
+        let cert = rcgen::generate_simple_self_signed(
+            (0..100)
+                .map(|index| format!("host-{index}.example.test"))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                        .into(),
+                )
+                .unwrap();
+        config.send_tls13_tickets = 0;
+        let mut decoy = CryptoConnection::new_rustls_server(
+            rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+        );
+        crate::crypto::feed_crypto_connection(&mut decoy, &hello).unwrap();
+        decoy.process_new_packets().unwrap();
+        let mut response = Vec::new();
+        decoy.write_tls(&mut response).unwrap();
+
+        CoverFlight {
+            client,
+            hello,
+            response,
+            listener,
+        }
+    }
+
+    /// Bound for the cover helper to accept and read the client hello.
+    const COVER_SETUP_BOUND: Duration = Duration::from_secs(5);
+    /// Bound for the server side of one handshake.
+    const SERVER_SETUP_BOUND: Duration = Duration::from_secs(10);
+    /// Bound for the client side of one handshake and its request.
+    const CLIENT_EXCHANGE_BOUND: Duration = Duration::from_secs(8);
+
+    /// What the cover helper observed. It is recorded in shared state so the test
+    /// still sees it when the helper is cancelled.
+    #[derive(Clone, Debug, Default)]
+    struct CoverObservations {
+        accepted: bool,
+        received_hello: usize,
+        hello_matched: bool,
+        bytes_written: usize,
+        error: Option<String>,
+    }
+
+    impl CoverObservations {
+        fn record_error(&mut self, error: impl std::fmt::Display) {
+            if self.error.is_none() {
+                self.error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Run one server handshake against a cover that answers with `response`,
+    /// delivered in `chunks` separate writes.
+    ///
+    /// With `complete_client` the test also drives the REALITY client to the end
+    /// of its handshake. Without it the client side only stays open, which is
+    /// what the unauthenticated forwarding path needs.
+    ///
+    /// `expected_cover_hello` is what the cover must receive; `None` means the
+    /// client hello of this flight. A test uses the parameter to prove that a
+    /// cover mismatch reaches the test result.
+    async fn run_cover_handshake(
+        flight: CoverFlight,
+        response: Vec<u8>,
+        chunks: usize,
+        complete_client: bool,
+        expected_cover_hello: Option<Vec<u8>>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        let address = flight.listener.local_addr().unwrap();
+        let dest = NetLocation::new(
+            crate::address::Address::Hostname("localhost".into()),
+            address.port(),
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let target = local_cover_target(dest, [1; 32], Arc::clone(&resolver));
+
+        let (io, mut peer) = tokio::io::duplex(65540);
+        peer.write_all(&flight.hello).await.unwrap();
+        let mut io: Box<dyn AsyncStream> = Box::new(io);
+        let parsed = crate::tls_hello::read_client_hello(&mut io).await.unwrap();
+
+        // The inner VLESS handler connects to this address after the REALITY
+        // handshake, so the setup can finish with a session.
+        let inner_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inner_target = inner_listener.local_addr().unwrap();
+        let inner_observations = Arc::new(std::sync::Mutex::new(CoverObservations::default()));
+        let inner_log = Arc::clone(&inner_observations);
+        let inner_accept = tokio::spawn(async move {
+            match tokio::time::timeout(COVER_SETUP_BOUND, inner_listener.accept()).await {
+                Ok(Ok((_socket, _))) => {
+                    inner_log.lock().unwrap().accepted = true;
+                    // Keep the accepted session open for the inner handler.
+                    std::future::pending::<()>().await;
+                }
+                Ok(Err(error)) => inner_log.lock().unwrap().record_error(error),
+                Err(_) => inner_log
+                    .lock()
+                    .unwrap()
+                    .record_error("the inner handler did not connect"),
+            }
+        });
+
+        let listener = flight.listener;
+        let expected = expected_cover_hello.unwrap_or_else(|| flight.hello.clone());
+        let cover_observations = Arc::new(std::sync::Mutex::new(CoverObservations::default()));
+        let cover_log = Arc::clone(&cover_observations);
+        let cover = tokio::spawn(async move {
+            let mut socket = match tokio::time::timeout(COVER_SETUP_BOUND, listener.accept()).await
+            {
+                Ok(Ok((socket, _))) => {
+                    cover_log.lock().unwrap().accepted = true;
+                    socket
+                }
+                Ok(Err(error)) => {
+                    cover_log.lock().unwrap().record_error(error);
+                    return;
+                }
+                Err(_) => {
+                    cover_log
+                        .lock()
+                        .unwrap()
+                        .record_error("the client did not connect");
+                    return;
+                }
+            };
+
+            let mut forwarded = vec![0; expected.len()];
+            match tokio::time::timeout(COVER_SETUP_BOUND, socket.read_exact(&mut forwarded)).await {
+                Ok(Ok(_)) => {
+                    let mut log = cover_log.lock().unwrap();
+                    log.received_hello = forwarded.len();
+                    log.hello_matched = forwarded == expected;
+                }
+                Ok(Err(error)) => {
+                    cover_log
+                        .lock()
+                        .unwrap()
+                        .record_error(format!("reading the client hello failed: {error}"));
+                    return;
+                }
+                Err(_) => {
+                    cover_log
+                        .lock()
+                        .unwrap()
+                        .record_error("reading the client hello timed out");
+                    return;
+                }
+            }
+
+            // An empty response is a cover that answers with nothing.
+            let part = response.len().div_ceil(chunks).max(1);
+            for chunk in response.chunks(part) {
+                match socket.write_all(chunk).await {
+                    Ok(()) => cover_log.lock().unwrap().bytes_written += chunk.len(),
+                    Err(error) => {
+                        cover_log
+                            .lock()
+                            .unwrap()
+                            .record_error(format!("writing the cover flight failed: {error}"));
+                        return;
+                    }
+                }
+                if let Err(error) = socket.flush().await {
+                    cover_log
+                        .lock()
+                        .unwrap()
+                        .record_error(format!("flushing the cover flight failed: {error}"));
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // A healthy cover waits for the client Finished, so keep the
+            // connection open until the test cancels this task.
+            std::future::pending::<()>().await;
+        });
+
+        let request = vless_tcp_request(inner_target);
+        let server = tokio::time::timeout(
+            SERVER_SETUP_BOUND,
+            setup_reality_server_stream(io, &target, parsed, &resolver),
+        );
+        let client = async {
+            if !complete_client {
+                // Keep the client side open; the unauthenticated path only
+                // forwards the cover flight to it.
+                let _keep_open = peer;
+                return Ok::<(), std::io::Error>(());
+            }
+            let mut stream =
+                CryptoTlsStream::handshake(peer, flight.client, TlsReadMode::Stream, &[]).await?;
+            stream.write_all(&request).await?;
+            stream.flush().await?;
+            // Hold the connection until the server has the request.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok::<(), std::io::Error>(())
+        };
+        // Capture the exchange outcome first: a timeout must still reach the
+        // helper cleanup below instead of detaching the owned tasks.
+        let exchange = tokio::time::timeout(CLIENT_EXCHANGE_BOUND, async {
+            tokio::join!(server, client)
+        })
+        .await;
+        let exchange_outcome = match exchange {
+            Ok(results) => Ok(results),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the client exchange did not finish",
+            )),
+        };
+
+        // Always cancel and await the owned helpers, whatever the outcome was.
+        cover.abort();
+        let cover_join = cover.await;
+        inner_accept.abort();
+        let inner_join = inner_accept.await;
+
+        let cover_observations = cover_observations.lock().unwrap().clone();
+        let inner_observations = inner_observations.lock().unwrap().clone();
+
+        if let Err(error) = cover_join
+            && !error.is_cancelled()
+        {
+            return Err(std::io::Error::other(format!(
+                "the cover helper failed: {error}"
+            )));
+        }
+        if let Err(error) = inner_join
+            && !error.is_cancelled()
+        {
+            return Err(std::io::Error::other(format!(
+                "the inner accept helper failed: {error}"
+            )));
+        }
+        // The server outcome is the primary result, so it is reported before the
+        // helper observations: a helper that merely waited while the setup failed
+        // is not a separate failure.
+        let (server_result, client_result) = exchange_outcome?;
+        let server_result = match server_result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the server setup did not finish",
+                ));
+            }
+        };
+
+        if let Some(error) = cover_observations.error {
+            return Err(std::io::Error::other(format!("the cover helper: {error}")));
+        }
+        if let Some(error) = inner_observations.error {
+            return Err(std::io::Error::other(format!("the inner helper: {error}")));
+        }
+
+        if !cover_observations.accepted || !cover_observations.hello_matched {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the cover did not receive the client hello: {:?}",
+                    cover_observations
+                ),
+            ));
+        }
+
+        client_result?;
+        Ok(server_result)
+    }
+
+    /// A VLESS TCP request for `target`, which the inner handler needs before it
+    /// can finish the setup.
+    fn vless_tcp_request(target: std::net::SocketAddr) -> Vec<u8> {
+        let mut request = vec![0x00];
+        request.extend_from_slice(&[
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ]);
+        request.push(0x00); // no addons
+        request.push(0x01); // TCP
+        request.extend_from_slice(&target.port().to_be_bytes());
+        match target.ip() {
+            std::net::IpAddr::V4(v4) => {
+                request.push(0x01);
+                request.extend_from_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                request.push(0x03);
+                request.extend_from_slice(&v6.octets());
+            }
+        }
+        request
+    }
+
+    /// Assert that the setup finished with a usable result and report the error
+    /// otherwise. An authenticated TCP request forwards to the destination and an
+    /// unauthenticated one continues as a fallback session.
+    fn expect_setup_ok(result: std::io::Result<TcpServerSetupResult>, context: &str) {
+        match result {
+            Ok(TcpServerSetupResult::TcpForward { .. }) | Ok(TcpServerSetupResult::Session(_)) => {}
+            Ok(_) => panic!("{context}: unexpected setup result variant"),
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cover_that_sends_nothing_times_out_and_is_cleaned_up() {
+        // The cover accepts the hello and answers with nothing, so the server
+        // deadline closes the connection. The fixture must report the timeout
+        // and still cancel and await both helpers.
+        let flight = cover_flight().await;
+        let error = run_cover_handshake(flight, Vec::new(), 1, true, None)
+            .await
+            .err()
+            .expect("a cover that sends nothing must not complete the handshake");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_cover_that_receives_a_different_hello_fails_the_test() {
+        // The helper records what it received; the fixture turns a mismatch into
+        // an error so a broken helper cannot look like a pass.
+        let flight = cover_flight().await;
+        let response = flight.response.clone();
+        let error = run_cover_handshake(flight, response, 1, true, Some(vec![0u8; 8]))
+            .await
+            .err()
+            .expect("a cover mismatch must fail the handshake");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_cover_flight_with_change_cipher_spec_completes_the_handshake() {
+        let flight = cover_flight().await;
+        let response = flight.response.clone();
+        let result = run_cover_handshake(flight, response, 1, true, None).await;
+        expect_setup_ok(
+            result,
+            "a cover flight with CCS must complete the REALITY handshake",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cover_flight_without_change_cipher_spec_completes_the_handshake() {
+        let flight = cover_flight().await;
+        let response = without_change_cipher_spec(&flight.response);
+        let result = run_cover_handshake(flight, response, 1, true, None).await;
+        expect_setup_ok(result, "a TLS 1.3 cover may omit CCS");
+    }
+
+    #[tokio::test]
+    async fn a_cover_flight_without_change_cipher_spec_split_across_reads_completes() {
+        let flight = cover_flight().await;
+        let response = without_change_cipher_spec(&flight.response);
+        let result = run_cover_handshake(flight, response, 3, true, None).await;
+        expect_setup_ok(
+            result,
+            "records arriving in separate reads must still complete",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_client_keeps_a_cover_flight_without_change_cipher_spec() {
+        let mut flight = cover_flight().await;
+        // Corrupt the REALITY envelope: the credentials no longer authenticate,
+        // but the hello stays a valid TLS client hello for the cover.
+        let session_id = 5 + 39;
+        flight.hello[session_id] ^= 0xff;
+        let response = without_change_cipher_spec(&flight.response);
+        let result = run_cover_handshake(flight, response, 1, false, None).await;
+        expect_setup_ok(
+            result,
+            "unauthenticated traffic must be forwarded through the cover",
+        );
+    }
 
     #[tokio::test]
     async fn authenticated_non_vision_oversized_preread_returns_error_without_panicking() {

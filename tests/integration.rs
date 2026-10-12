@@ -7,8 +7,12 @@ mod linux_splice;
 mod parser_boundary_integration;
 #[path = "cases/integration/reality_client_config_test.rs"]
 mod reality_client_config;
+#[path = "cases/integration/reality_unauthenticated_forwarding_test.rs"]
+mod reality_unauthenticated_forwarding;
 #[path = "cases/integration/resource_lifecycle_test.rs"]
 mod resource_lifecycle;
+#[path = "cases/integration/udp_message_edge_integration.rs"]
+mod udp_message_edge_integration;
 #[path = "cases/integration/vless_integration.rs"]
 mod vless;
 #[path = "cases/integration/vless_cross_protocol_udp_test.rs"]
