@@ -17,7 +17,7 @@ use crate::address::NetLocation;
 /// Configuration for Vision VLESS inner protocol
 #[derive(Debug, Clone)]
 pub struct VisionVlessConfig {
-    pub user_id: Box<[u8]>,
+    pub user_id: crate::vless::vless_server_handler::VlessUsers,
     pub udp_enabled: bool,
     pub fallback: Option<NetLocation>,
 }

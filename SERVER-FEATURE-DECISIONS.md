@@ -10,7 +10,9 @@ Canlı sunucu servisi ve istemci ayarları değişmedi.
 16 numaralı özellik canlı sunucuda çalışıyor.
 17 numaralı özellik henüz dağıtılmadı.
 Bu kayıt dağıtım, staging, commit veya push izni vermez.
-Çoklu UUID uygulaması henüz başlamadı.
+Çoklu UUID desteği yerel koda eklendi; canlı sunucuya dağıtılmadı.
+Sahip, paylaşılan UUID için on cihaz sınırını cihaz yönetimiyle uygulamayı seçti.
+Sunucuda otomatik gerçek cihaz sayımı eklenmedi.
 Çalışma sınırlarının kaynağı [proje talimatlarıdır](AGENTS.md).
 Mevcut sunucu yönetimi yeterli kalır.
 Bu kayıt dağıtım, staging, commit veya push izni vermez.
@@ -59,13 +61,17 @@ Aşağıdaki performans beklentileri, ölçüm sonucu değildir.
 
 ### 1. Çoklu UUID
 
-Çoklu UUID desteği aynı REALITY profilinde birden fazla UUID kabul ettirecek.
+Çoklu UUID desteği aynı REALITY profilinde birden fazla UUID kabul eder.
+Tek `user_id` korunur; liste biçimi ve `user_ids` takma adı da kabul edilir.
+Boş, geçersiz ve yinelenen UUID listeleri reddedilir.
+Vision yanıtı kimliği doğrulanan UUID'yi kullanır.
 UUID doğrulaması yalnız bağlantı kurulurken yapılmalı.
 Her pakette kullanıcı araması yapılmamalı.
 Mevcut tek UUID ayarı çalışmaya devam etmeli.
 Aktarım yolunu değiştirmeden eklemek tasarım hedefidir.
 
 Performansı koruduğumuzu ölçümlerle doğrulamamız gerekir.
+Bu yerel uygulama için karşılaştırmalı aktarım/CPU/tahsis ölçümü henüz yapılmadı.
 UUID sayısı gerçek cihaz sayısını göstermez.
 Bu özellik mevcut cihaz sınırını otomatik uygulatmaz.
 

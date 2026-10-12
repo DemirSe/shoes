@@ -6,7 +6,7 @@
 #
 # Requirements:
 #   - macOS with Xcode installed (xcodebuild)
-#   - Rust with rustup (targets added automatically)
+#   - Rust with preinstalled iOS targets and cached locked dependencies
 #
 set -euo pipefail
 
@@ -33,16 +33,19 @@ mkdir -p "$OUTPUT_DIR/device" "$OUTPUT_DIR/sim"
 # Set to 16.0 to match a reasonable modern minimum.
 export IPHONEOS_DEPLOYMENT_TARGET="16.0"
 
-echo "==> Adding iOS Rust targets"
-rustup target add \
-    aarch64-apple-ios \
-    aarch64-apple-ios-sim
+echo "==> Checking preinstalled iOS Rust targets"
+for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+    rustup target list --installed | grep -Fx "$target" >/dev/null || {
+        echo "Error: preinstall Rust target $target before the offline build"
+        exit 1
+    }
+done
 
 echo "==> Building for aarch64-apple-ios (physical device)"
-cargo build --release --target aarch64-apple-ios
+cargo build --release --locked --offline --target aarch64-apple-ios
 
 echo "==> Building for aarch64-apple-ios-sim (Apple Silicon simulator)"
-cargo build --release --target aarch64-apple-ios-sim
+cargo build --release --locked --offline --target aarch64-apple-ios-sim
 
 echo "==> Copying libraries"
 cp "target/aarch64-apple-ios/release/$LIB_NAME"     "$OUTPUT_DIR/device/$LIB_NAME"

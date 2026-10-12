@@ -10,6 +10,7 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::CryptoTlsStream;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
+use crate::option_util::OneOrSome;
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
@@ -24,8 +25,45 @@ use super::vless_util::{
     parse_remote_location_from_reader,
 };
 
+/// Authentication runs once at setup, never in the data transfer path.
+#[derive(Clone)]
+pub struct VlessUsers(Box<[[u8; 16]]>);
+
+impl std::fmt::Debug for VlessUsers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VlessUsers")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
+impl VlessUsers {
+    #[cfg(test)]
+    pub(crate) fn single(id: &[u8]) -> Self {
+        Self(vec![id.try_into().expect("UUID length")].into_boxed_slice())
+    }
+    pub fn new(ids: &OneOrSome<String>) -> Self {
+        Self(
+            ids.iter()
+                .map(|id| {
+                    parse_uuid(id)
+                        .expect("validated UUID")
+                        .try_into()
+                        .expect("UUID length")
+                })
+                .collect(),
+        )
+    }
+
+    pub fn contains(&self, id: &[u8]) -> bool {
+        self.0.iter().fold(0u8, |found, valid| {
+            found | valid.as_slice().ct_eq(id).unwrap_u8()
+        }) != 0
+    }
+}
+
 pub struct VlessTcpServerHandler {
-    user_id: Box<[u8]>,
+    users: VlessUsers,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -35,7 +73,7 @@ pub struct VlessTcpServerHandler {
 impl std::fmt::Debug for VlessTcpServerHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VlessTcpServerHandler")
-            .field("user_id", &self.user_id)
+            .field("users", &self.users)
             .field("udp_enabled", &self.udp_enabled)
             .field("fallback", &self.fallback)
             .finish()
@@ -43,6 +81,7 @@ impl std::fmt::Debug for VlessTcpServerHandler {
 }
 
 impl VlessTcpServerHandler {
+    #[cfg(test)]
     pub fn new(
         user_id: &str,
         udp_enabled: bool,
@@ -50,8 +89,24 @@ impl VlessTcpServerHandler {
         resolver: Arc<dyn Resolver>,
         fallback: Option<NetLocation>,
     ) -> Self {
+        Self::new_users(
+            &OneOrSome::One(user_id.to_owned()),
+            udp_enabled,
+            proxy_selector,
+            resolver,
+            fallback,
+        )
+    }
+
+    pub fn new_users(
+        user_ids: &OneOrSome<String>,
+        udp_enabled: bool,
+        proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+        fallback: Option<NetLocation>,
+    ) -> Self {
         Self {
-            user_id: parse_uuid(user_id).unwrap().into_boxed_slice(),
+            users: VlessUsers::new(user_ids),
             udp_enabled,
             proxy_selector,
             resolver,
@@ -151,7 +206,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
         let header = stream_reader.peek_slice(&mut server_stream, 17).await?;
         let target_id = &header[1..17];
 
-        if self.user_id.ct_eq(target_id).unwrap_u8() == 0 {
+        if !self.users.contains(target_id) {
             debug!("VLESS UUID mismatch");
             if let Some(ref fallback) = self.fallback {
                 return vless_fallback_to_dest(
@@ -292,7 +347,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
 /// Setup a VISION+VLESS stream from a CryptoTlsStream (for REALITY+Vision support)
 pub async fn setup_custom_tls_vision_vless_server_stream<IO>(
     mut tls_stream: CryptoTlsStream<IO>,
-    user_id: &[u8],
+    users: &VlessUsers,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
@@ -323,7 +378,7 @@ where
     let target_id = &header[1..17];
 
     // Verify user ID using constant-time comparison to prevent timing attacks
-    if user_id.ct_eq(target_id).unwrap_u8() == 0 {
+    if !users.contains(target_id) {
         debug!("VLESS/Vision UUID mismatch");
         if let Some(ref fb) = fallback {
             tls_stream.allow_streaming_reads();
@@ -465,7 +520,7 @@ mod tests {
 
     use bytes::{BufMut, BytesMut};
     use futures::future::poll_fn;
-    use tokio::io::ReadBuf;
+    use tokio::io::{AsyncReadExt, ReadBuf};
 
     use crate::crypto::{CryptoConnection, TlsReadMode};
     use crate::xudp::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
@@ -474,6 +529,98 @@ mod tests {
     /// unreachable outside this fixture.
     const SYNTHETIC_XUDP_HOSTNAME: &str = "xudp-resolver.invalid";
     const SYNTHETIC_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn multiple_users() -> VlessUsers {
+        VlessUsers::new(&OneOrSome::Some(vec![
+            SYNTHETIC_UUID.into(),
+            "550e8400-e29b-41d4-a716-446655440001".into(),
+        ]))
+    }
+
+    fn tcp_request(id: &[u8], vision: bool) -> Vec<u8> {
+        let mut request = vec![0];
+        request.extend_from_slice(id);
+        if vision {
+            request.push(2 + XTLS_VISION_FLOW.len() as u8);
+            request.extend_from_slice(&[0x0a, XTLS_VISION_FLOW.len() as u8]);
+            request.extend_from_slice(XTLS_VISION_FLOW.as_bytes());
+        } else {
+            request.push(0);
+        }
+        request.extend_from_slice(&[COMMAND_TCP, 0x01, 0xbb, 1, 127, 0, 0, 1]);
+        request
+    }
+
+    #[tokio::test]
+    async fn multiple_users_authenticate_tcp_udp_and_xudp_only_at_setup() {
+        let users = multiple_users();
+        let (resolver, _) = counting_resolver(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let handler = VlessTcpServerHandler {
+            users: users.clone(),
+            udp_enabled: true,
+            proxy_selector: Arc::new(ClientProxySelector::new(Vec::new())),
+            resolver,
+            fallback: None,
+        };
+        for id in users.0.iter() {
+            for command in [COMMAND_TCP, COMMAND_UDP, COMMAND_MUX] {
+                let mut request = tcp_request(id, false);
+                request[18] = command;
+                if command == COMMAND_MUX {
+                    request.truncate(19);
+                }
+                let (io, mut peer) = tokio::io::duplex(8192);
+                peer.write_all(&request).await.unwrap();
+                let result = handler.setup_server_stream(Box::new(io)).await.unwrap();
+                assert!(match command {
+                    COMMAND_TCP => matches!(result, TcpServerSetupResult::TcpForward { .. }),
+                    COMMAND_UDP => matches!(result, TcpServerSetupResult::BidirectionalUdp { .. }),
+                    _ => matches!(result, TcpServerSetupResult::SessionBasedUdp { .. }),
+                });
+            }
+        }
+        let (io, mut peer) = tokio::io::duplex(8192);
+        peer.write_all(&tcp_request(&[9; 16], false)).await.unwrap();
+        assert!(handler.setup_server_stream(Box::new(io)).await.is_err());
+        assert!(!users.contains(&[9; 16]));
+        assert!(!users.contains(&[0; 15]));
+    }
+
+    #[tokio::test]
+    async fn vision_response_uses_the_authenticated_uuid_from_the_list() {
+        let users = multiple_users();
+        let (resolver, _) = counting_resolver(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        for id in users.0.iter() {
+            let (server_tls, mut client_tls) = tls13_pair().await;
+            client_tls.write_all(&tcp_request(id, true)).await.unwrap();
+            client_tls.flush().await.unwrap();
+            let result = setup_custom_tls_vision_vless_server_stream(
+                server_tls,
+                &users,
+                true,
+                Arc::new(ClientProxySelector::new(Vec::new())),
+                &resolver,
+                None,
+            )
+            .await
+            .unwrap();
+            let TcpServerSetupResult::TcpForward { mut stream, .. } = result else {
+                panic!("expected TCP");
+            };
+            stream.write_all(b"reply").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut response = [0; 18];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client_tls.read_exact(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&response[..2], SERVER_RESPONSE_HEADER);
+            assert_eq!(&response[2..], id);
+        }
+    }
 
     /// Answers the synthetic hostname with one address and counts every lookup.
     #[derive(Debug)]
@@ -658,7 +805,7 @@ mod tests {
         let (server_tls, mut client_tls) = tls13_pair().await;
         client_tls.write_all(&request).await.unwrap();
         client_tls.flush().await.unwrap();
-        let user_id = synthetic_user_id();
+        let user_id = VlessUsers::single(&synthetic_user_id());
 
         let result = setup_custom_tls_vision_vless_server_stream(
             server_tls,
@@ -694,7 +841,7 @@ mod tests {
         let (server_tls, mut client_tls) = tls13_pair().await;
         client_tls.write_all(&request).await.unwrap();
         client_tls.flush().await.unwrap();
-        let user_id = synthetic_user_id();
+        let user_id = VlessUsers::single(&synthetic_user_id());
 
         let result = setup_custom_tls_vision_vless_server_stream(
             server_tls,

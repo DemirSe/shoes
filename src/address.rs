@@ -265,6 +265,14 @@ impl From<NetLocation> for NetLocationPortRange {
 }
 
 impl NetLocationPortRange {
+    pub fn address(&self) -> &Address {
+        &self.address
+    }
+
+    pub fn ports(&self) -> &[u16] {
+        &self.ports
+    }
+
     pub fn new(address: Address, mut ports: Vec<u16>) -> std::io::Result<Self> {
         ports.sort_unstable();
         ports.dedup();

@@ -1,145 +1,36 @@
-name: Test
-
+name: Offline tests
 on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
-
+  workflow_dispatch:
+permissions: {}
 env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  SING_BOX_VERSION: 1.14.1
-  SING_BOX_SHA256: 12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f
-
+  CARGO_NET_OFFLINE: 'true'
+  RUSTUP_AUTO_INSTALL: '0'
+  RUST_BACKTRACE: '0'
 jobs:
-  unit-tests:
-    name: Unit tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo index
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo build
-      uses: actions/cache@v4
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Build
-      run: cargo build --workspace --locked --verbose
-
-    - name: Run local tests
-      run: cargo test --workspace --locked --lib --bins --verbose
-
-    - name: Run host FFI tests
-      run: cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
-
-  tun-macos:
-    name: Rootless TUN (macOS)
-    runs-on: macos-latest
+  local-tests:
+    runs-on: [self-hosted, shoes-offline-linux]
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache Rust build
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-tun-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Run raw-FD and packet tests without a TUN device
-      run: >-
-        cargo test -p shoes --locked --lib --features ffi tun:: -- --test-threads=1
-
-  integration-tests:
-    name: Integration (${{ matrix.name }})
-    needs: unit-tests
-    runs-on: ubuntu-latest
+      - name: Verify pre-provisioned source
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Unit tests
+        run: cargo test --workspace --locked --offline --lib --bins
+      - name: Host FFI tests
+        run: cargo test -p shoes --locked --offline --lib --features ffi -- --test-threads=1
+      - name: Require preinstalled test peer
+        run: test -n "$SHOES_TEST_SING_BOX_BIN" && test -x "$SHOES_TEST_SING_BOX_BIN"
+      - name: Local integration tests
+        run: cargo test -p shoes --locked --offline --features integration-tests --test integration -- --test-threads=1
+  rootless-macos:
+    runs-on: [self-hosted, shoes-offline-macos]
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-        - name: local protocols
-          features: integration-tests
-          target: integration
-          filters: ""
-          peer: sing-box
-
     steps:
-    - uses: actions/checkout@v4
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo index
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo build
-      uses: actions/cache@v4
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Install sing-box test peer
-      if: matrix.peer == 'sing-box'
-      run: |
-        archive="$RUNNER_TEMP/sing-box.tar.gz"
-        curl --fail --location --retry 3 \
-          --output "$archive" \
-          "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz"
-        echo "${SING_BOX_SHA256}  ${archive}" | sha256sum --check --strict
-        tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
-        binary="$RUNNER_TEMP/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box"
-        chmod +x "$binary"
-        echo "SHOES_TEST_SING_BOX_BIN=$binary" >> "$GITHUB_ENV"
-
-    - name: Run integration tests
-      env:
-        TEST_FILTERS: ${{ matrix.filters }}
-      run: |
-        if [ -z "$TEST_FILTERS" ]; then
-          cargo test -p shoes --locked \
-            --features "${{ matrix.features }}" \
-            --test "${{ matrix.target }}" \
-            --verbose -- --test-threads=1
-        else
-          for filter in $TEST_FILTERS; do
-            cargo test -p shoes --locked \
-              --features "${{ matrix.features }}" \
-              --test "${{ matrix.target }}" \
-              --verbose "$filter::" -- --test-threads=1
-          done
-        fi
+      - name: Verify pre-provisioned source
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Rootless TUN tests
+        run: >-
+          cargo test -p shoes --locked --offline --lib --features ffi tun:: -- --test-threads=1

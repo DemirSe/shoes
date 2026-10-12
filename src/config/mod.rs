@@ -14,10 +14,12 @@
 //! - [`singbox::convert_singbox_config`]: Convert sing-box configs to shoes format
 
 mod pem;
+mod production;
 mod types;
 mod validate;
 
 pub use pem::convert_cert_paths;
+pub use production::validate_production_profile;
 pub use types::*;
 pub use validate::{ValidatedConfigs, create_server_configs};
 

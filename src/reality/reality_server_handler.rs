@@ -1887,13 +1887,50 @@ mod cleanup_tests {
     /// handler through a healthy synthetic cover.
     #[tokio::test]
     async fn healthy_authenticated_reality_handshake_still_succeeds() {
+        for vision in [false, true] {
+            for id in [SYNTHETIC_UUID, "550e8400-e29b-41d4-a716-446655440001"] {
+                authenticated_reality_user(id, vision).await;
+            }
+        }
+    }
+
+    async fn authenticated_reality_user(id: &str, vision: bool) {
+        use crate::option_util::OneOrSome;
         use crate::reality::{RealityClientConfig, RealityClientConnection};
+        use crate::vless::vless_server_handler::{VlessTcpServerHandler, VlessUsers};
 
         let private_key = [3u8; 32];
         let public_key = synthetic_public_key(private_key);
         let (resolver, cover_calls) = synthetic_cover_resolver();
         let cover = interactive_cover().await;
-        let target = synthetic_reality_target(private_key, cover.port, resolver.clone());
+        let mut target = synthetic_reality_target(private_key, cover.port, resolver.clone());
+        let ids = OneOrSome::Some(vec![
+            SYNTHETIC_UUID.into(),
+            "550e8400-e29b-41d4-a716-446655440001".into(),
+        ]);
+        target.inner_protocol = if vision {
+            InnerProtocol::VisionVless(crate::tls_server_handler::VisionVlessConfig {
+                user_id: VlessUsers::new(&ids),
+                udp_enabled: true,
+                fallback: None,
+            })
+        } else {
+            InnerProtocol::Normal(Box::new(VlessTcpServerHandler::new_users(
+                &ids,
+                true,
+                target.effective_selector.clone(),
+                resolver.clone(),
+                None,
+            )))
+        };
+        let mut request = synthetic_vless_tcp_request();
+        request[1..17].copy_from_slice(&crate::uuid_util::parse_uuid(id).unwrap());
+        if vision {
+            let flow = b"xtls-rprx-vision";
+            let mut addons = vec![(flow.len() + 2) as u8, 0x0a, flow.len() as u8];
+            addons.extend_from_slice(flow);
+            request.splice(17..18, addons);
+        }
 
         let mut client = RealityClientConnection::new(RealityClientConfig {
             public_key,
@@ -1915,10 +1952,7 @@ mod cleanup_tests {
                 CryptoTlsStream::handshake(client_io, connection, TlsReadMode::Stream, &[])
                     .await
                     .expect("client REALITY handshake");
-            stream
-                .write_all(&synthetic_vless_tcp_request())
-                .await
-                .unwrap();
+            stream.write_all(&request).await.unwrap();
             stream.flush().await.unwrap();
             stream
         });

@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -170,12 +170,18 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
     let config = vless_server_config(proxy_port);
     let (_process, mut file, _) = start_process(&config, true)?;
     ports.wait_for_all_ports().await?;
+    let (_, replacement_port) = ports.get_localhost_listener_port();
     let destination: SocketAddr = format!("127.0.0.1:{echo_port}")
         .parse()
         .map_err(io::Error::other)?;
     let mut existing = vless_tcp_connect(proxy_port, destination).await?;
     round_trip(&mut existing, b"before reload").await?;
-    file.write_all(b"\n# trigger reload\n")?;
+    // Change the address to observe actual retirement. An unchanged address now
+    // reuses its listening socket and deliberately has no connection-refused gap.
+    file.as_file_mut().set_len(0)?;
+    file.rewind()?;
+    writeln!(file, "- global_limits: {{reload_grace_secs: 6}}")?;
+    file.write_all(vless_server_config(replacement_port).as_bytes())?;
     file.flush()?;
 
     // Observe listener retirement rather than assuming notification timing.
@@ -188,7 +194,7 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
     round_trip(&mut existing, b"during reload").await?;
     let mut replacement = timeout(Duration::from_secs(5), async {
         loop {
-            match vless_tcp_connect(proxy_port, destination).await {
+            match vless_tcp_connect(replacement_port, destination).await {
                 Ok(stream) => break stream,
                 Err(_) => sleep(Duration::from_millis(20)).await,
             }
@@ -198,7 +204,7 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
     round_trip(&mut existing, b"after reload").await?;
     round_trip(&mut replacement, b"new generation").await?;
     let mut byte = [0];
-    let closed = timeout(Duration::from_secs(5), existing.read(&mut byte)).await?;
+    let closed = timeout(Duration::from_secs(8), existing.read(&mut byte)).await?;
     assert!(
         matches!(closed, Ok(0) | Err(_)),
         "old generation survived its grace deadline"

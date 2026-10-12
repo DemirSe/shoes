@@ -1397,7 +1397,7 @@ mod tests {
             let result =
                 super::super::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
                     tls,
-                    &uuid,
+                    &super::super::vless_server_handler::VlessUsers::single(&uuid),
                     true,
                     Arc::new(ClientProxySelector::new(Vec::new())),
                     &resolver,
@@ -1452,7 +1452,7 @@ mod tests {
                 );
                 let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
                 let result = super::super::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
-                    tls, &[7; 16], true, Arc::new(ClientProxySelector::new(Vec::new())),
+                    tls, &super::super::vless_server_handler::VlessUsers::single(&[7; 16]), true, Arc::new(ClientProxySelector::new(Vec::new())),
                     &resolver, Some(fallback),
                 ).await.unwrap();
                 let TcpServerSetupResult::Session(session) = result else {

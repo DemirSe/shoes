@@ -504,14 +504,6 @@ impl RealityClientConnection {
         let (server_hs_key, server_hs_iv) =
             derive_traffic_keys(server_handshake_traffic_secret, *cipher_suite)?;
 
-        if *handshake_seq == 0 {
-            log::debug!(
-                "REALITY CLIENT: Server HS key={:02x?}, iv={:02x?}",
-                &server_hs_key[..16],
-                server_hs_iv
-            );
-        }
-
         if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
             return Ok(false);
         }

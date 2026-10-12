@@ -6,7 +6,7 @@
 #
 # Requirements:
 #   - Android NDK: set ANDROID_NDK_HOME, or NDK_HOME, or have ANDROID_HOME with NDK installed
-#   - cargo-ndk: installed automatically if missing
+#   - cargo-ndk and Android Rust targets preinstalled; dependencies cached
 #   - Gradle 8.6+ available as `gradle` in PATH, or ./gradlew in android/
 #   - Java 17+
 #
@@ -37,16 +37,19 @@ if [ -z "${ANDROID_NDK_HOME:-}" ]; then
 fi
 echo "==> Using NDK: $ANDROID_NDK_HOME"
 
-# Install cargo-ndk if needed
+# Never install tools from the network during a build.
 if ! command -v cargo-ndk &>/dev/null; then
-    echo "==> Installing cargo-ndk"
-    cargo install cargo-ndk
+    echo "Error: preinstall cargo-ndk before the offline build"
+    exit 1
 fi
 
-echo "==> Adding Android Rust targets"
-rustup target add \
-    aarch64-linux-android \
-    armv7-linux-androideabi
+echo "==> Checking preinstalled Android Rust targets"
+for target in aarch64-linux-android armv7-linux-androideabi; do
+    rustup target list --installed | grep -Fx "$target" >/dev/null || {
+        echo "Error: preinstall Rust target $target before the offline build"
+        exit 1
+    }
+done
 
 echo "==> Cleaning JNI libs directory"
 rm -rf "$JNI_LIBS_DIR"
@@ -57,7 +60,7 @@ cargo ndk \
     -t armeabi-v7a \
     -P 21 \
     -o "$JNI_LIBS_DIR" \
-    -- build --release --lib
+    -- build --release --lib --locked --offline
 
 echo "==> Built libraries:"
 find "$JNI_LIBS_DIR" -name "*.so" | sort | sed 's|^|  |'
@@ -80,7 +83,7 @@ if ! command -v gradle &>/dev/null; then
     echo "  Or run: sdk install gradle 8.6  (via SDKMAN)"
     exit 1
 fi
-gradle assembleRelease --no-daemon
+gradle assembleRelease --offline --no-daemon
 
 # Copy output
 mkdir -p "$OUTPUT_DIR"

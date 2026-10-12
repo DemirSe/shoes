@@ -50,6 +50,7 @@ OPTIONS:
     -t, --threads NUM    Set the number of worker threads (default: CPU count)
     -d, --dry-run        Parse the config and exit
     --no-reload          Disable automatic config reloading on file changes
+    --production-profile Enforce the public IPv4:443 whatsapp.net REALITY/Vision profile
 
 COMMANDS:
     generate-reality-keypair    Generate a new Reality X25519 keypair
@@ -83,6 +84,15 @@ shoes generate-vless-user-id
 ## Configuration
 
 See [CONFIG.md](./CONFIG.md) for the complete YAML configuration reference.
+
+This server fork offers an opt-in `--production-profile` validator. General
+examples below are not its deployment profile. Enable the validator only through
+an approved deployment. Invalid TCP reloads retain the running generation;
+`--dry-run` failures return a nonzero status. Server `user_id` accepts a scalar or
+a UUID list (`user_ids` alias); the shared UUID's ten-device limit is administrative,
+not inferred from connection or IP counts.
+
+CI requires pre-provisioned offline runners; see [.github/OFFLINE-CI.md](.github/OFFLINE-CI.md).
 
 ## Examples
 

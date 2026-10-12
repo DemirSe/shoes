@@ -23,6 +23,7 @@ mod resources;
 mod routing;
 mod rustls_config_util;
 mod rustls_connection_util;
+mod server_runtime;
 mod slide_buffer;
 mod socket_util;
 mod stream_reader;
@@ -51,37 +52,70 @@ use std::path::Path;
 
 use log::debug;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tcp_server::start_servers;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{Receiver, channel};
 
 use crate::reality::generate_keypair;
 use crate::thread_util::set_num_threads;
-use tcp::*;
 
 #[derive(Debug)]
 struct ConfigChanged;
 
-fn start_notify_thread(config_paths: Vec<String>) -> (RecommendedWatcher, Receiver<ConfigChanged>) {
+fn start_notify_thread(
+    config_paths: Vec<String>,
+) -> std::io::Result<(RecommendedWatcher, Receiver<ConfigChanged>)> {
     let (tx, rx) = channel(1);
+    let cwd = std::env::current_dir()?;
+    let mut paths: Vec<_> = config_paths
+        .iter()
+        .map(|p| {
+            let path = Path::new(p);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            }
+        })
+        .collect();
+    // Keep the configured path to notice an atomic symlink replacement, while
+    // also watching an existing target in a different directory.
+    for path in paths.clone() {
+        if let Ok(target) = std::fs::canonicalize(path)
+            && !paths.contains(&target)
+        {
+            paths.push(target);
+        }
+    }
+    let watched_paths = paths.clone();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
         Ok(event) => {
-            if matches!(event.kind, EventKind::Modify(..)) {
+            if matches!(
+                event.kind,
+                EventKind::Modify(..) | EventKind::Create(..) | EventKind::Remove(..)
+            ) && event.paths.iter().any(|path| watched_paths.contains(path))
+            {
                 let _ = tx.try_send(ConfigChanged {});
             }
         }
-        Err(e) => println!("watch error: {e:?}"),
+        Err(e) => log::error!("Configuration watch error: {e}"),
     })
-    .unwrap();
+    .map_err(std::io::Error::other)?;
 
-    for config_path in config_paths {
+    let mut parents = std::collections::HashSet::new();
+    for config_path in paths {
+        let parent = config_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("config has no parent directory"))?;
+        if !parents.insert(parent.to_path_buf()) {
+            continue;
+        }
         watcher
-            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-            .unwrap();
+            .watch(parent, RecursiveMode::NonRecursive)
+            .map_err(std::io::Error::other)?;
     }
 
-    (watcher, rx)
+    Ok((watcher, rx))
 }
 
 fn print_usage_and_exit(arg0: String) {
@@ -94,6 +128,9 @@ fn print_usage_and_exit(arg0: String) {
     );
     eprintln!("    -d, --dry-run        Parse the config and exit");
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
+    eprintln!(
+        "    --production-profile Enforce the public IPv4:443 whatsapp.net REALITY/Vision profile"
+    );
     eprintln!(
         "    global_limits.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
     );
@@ -121,6 +158,7 @@ fn main() {
     let mut num_threads = 0usize;
     let mut dry_run = false;
     let mut no_reload = false;
+    let mut production_profile = false;
     let mut log_files: Vec<String> = Vec::new();
 
     while !args.is_empty() && args[0].starts_with("-") {
@@ -153,6 +191,9 @@ fn main() {
         } else if args[0] == "--no-reload" {
             args.remove(0);
             no_reload = true;
+        } else if args[0] == "--production-profile" {
+            args.remove(0);
+            production_profile = true;
         } else if args[0] == "--version" || args[0] == "-V" {
             println!("shoes {}", env!("CARGO_PKG_VERSION"));
             return;
@@ -247,113 +288,13 @@ fn main() {
         .build()
         .expect("Could not build tokio runtime");
 
-    runtime.block_on(async move {
-        let mut reload_state = if no_reload {
-            None
-        } else {
-            let (watcher, rx) = start_notify_thread(args.clone());
-            Some((watcher, rx))
-        };
-
-        loop {
-            let configs = match config::load_configs(&args).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to load server configs: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            let (configs, load_file_count) = match config::convert_cert_paths(configs).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to load cert files: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            if load_file_count > 0 {
-                println!("Loaded {load_file_count} certs/keys from files");
-            }
-
-            if dry_run {
-                if let Err(e) = config::create_server_configs(configs) {
-                    eprintln!("Dry run failed, could not create server configs: {e}\n");
-                } else {
-                    println!("Finishing dry run, config parsed successfully.");
-                }
-                return;
-            }
-
-            let mut join_handles = vec![];
-
-            let server_configs = match config::create_server_configs(configs) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to create server configs: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            let config::ValidatedConfigs {
-                configs: server_configs,
-                dns_groups,
-                global_limits,
-            } = server_configs;
-            resources::configure(global_limits).expect("validated global limits");
-            let _resource_reporter = resources::ResourceReporter::start();
-
-            // Build DNS registry from expanded groups (async - resolves hostnames)
-            let mut dns_registry = match dns::build_dns_registry(dns_groups).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Failed to build DNS registry: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            println!("\nStarting {} server(s)..", server_configs.len());
-
-            for server_config in server_configs {
-                // Get the resolver for this server from the registry
-                let dns_ref = match &server_config {
-                    config::Config::Server(s) => s.dns.as_ref(),
-                    config::Config::TunServer(t) => t.dns.as_ref(),
-                    _ => None,
-                };
-                let resolver = dns_registry.get_for_server(dns_ref);
-                join_handles.extend(start_servers(server_config, resolver).await.unwrap());
-            }
-
-            match reload_state.as_mut() {
-                Some((_watcher, rx)) => {
-                    rx.recv().await.unwrap();
-
-                    println!("Configs changed, restarting servers in 3 seconds..");
-
-                    for join_handle in &join_handles {
-                        join_handle.abort();
-                    }
-                    for join_handle in join_handles {
-                        let _ = join_handle.await;
-                    }
-
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-                    // Remove any extra events
-                    while rx.try_recv().is_ok() {}
-                }
-                None => {
-                    // No reload mode - wait forever
-                    // TODO: signal handling?
-                    futures::future::pending::<()>().await;
-                    unreachable!();
-                }
-            }
-        }
-    });
+    if let Err(error) = runtime.block_on(server_runtime::run(
+        args,
+        dry_run,
+        no_reload,
+        production_profile,
+    )) {
+        eprintln!("Server configuration/startup failed: {error}");
+        std::process::exit(1);
+    }
 }

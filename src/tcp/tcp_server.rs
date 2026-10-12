@@ -27,14 +27,13 @@ use crate::tun::start_tun_server;
 use crate::util::write_all;
 
 async fn run_tcp_server(
-    bind_address: SocketAddr,
+    listener: Arc<tokio::net::TcpListener>,
     tcp_config: TcpConfig,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
-    let listener = new_tcp_listener(bind_address, 4096, None)?;
     let mut tasks = crate::listener_tasks::ListenerTasks::new();
 
     loop {
@@ -81,19 +80,10 @@ async fn run_tcp_server(
 
 #[cfg(target_family = "unix")]
 async fn run_unix_server(
-    path_buf: PathBuf,
+    listener: Arc<OwnedUnixListener>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
-    if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
-        println!(
-            "WARNING: replacing file at socket path {}",
-            path_buf.display()
-        );
-        let _ = tokio::fs::remove_file(&path_buf).await;
-    }
-
-    let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
     let mut tasks = crate::listener_tasks::ListenerTasks::new();
 
     loop {
@@ -397,7 +387,12 @@ async fn start_configured_servers(
                 return Err(e);
             }
         },
-        Transport::Udp => todo!(),
+        Transport::Udp => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "UDP listeners are not supported",
+            ));
+        }
     }
 
     if join_handles.is_empty() {
@@ -414,6 +409,134 @@ async fn start_tcp_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
+    let mut next = ListenerRegistry::default();
+    Ok(prepare_tcp_servers(config, resolver, &ListenerRegistry::default(), &mut next)?.start())
+}
+
+/// Keep listening sockets across reloads without SO_REUSEPORT or a bind gap.
+#[derive(Default)]
+pub struct ListenerRegistry {
+    tcp: HashMap<SocketAddr, Arc<tokio::net::TcpListener>>,
+    #[cfg(unix)]
+    unix: HashMap<PathBuf, Arc<OwnedUnixListener>>,
+}
+
+#[cfg(unix)]
+struct OwnedUnixListener {
+    listener: tokio::net::UnixListener,
+    path: PathBuf,
+    identity: (u64, u64),
+}
+
+#[cfg(unix)]
+impl OwnedUnixListener {
+    fn bind(path: PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let listener = crate::socket_util::new_unix_listener(&path, 4096)?;
+        let metadata = std::fs::symlink_metadata(&path)?;
+        Ok(Self {
+            listener,
+            path,
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for OwnedUnixListener {
+    type Target = tokio::net::UnixListener;
+    fn deref(&self) -> &Self::Target {
+        &self.listener
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedUnixListener {
+    fn drop(&mut self) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        // Roll back only a path this process created, never a replacement file.
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && metadata.file_type().is_socket()
+            && (metadata.dev(), metadata.ino()) == self.identity
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+enum PreparedListener {
+    Tcp(
+        Arc<tokio::net::TcpListener>,
+        TcpConfig,
+        Arc<dyn Resolver>,
+        Arc<dyn TcpServerHandler>,
+    ),
+    #[cfg(unix)]
+    Unix(
+        Arc<OwnedUnixListener>,
+        Arc<dyn Resolver>,
+        Arc<dyn TcpServerHandler>,
+    ),
+}
+
+pub struct PreparedTcpServers(Vec<PreparedListener>);
+
+impl PreparedTcpServers {
+    pub fn start(self) -> Vec<JoinHandle<()>> {
+        self.0
+            .into_iter()
+            .map(|entry| {
+                tokio::spawn(async move {
+                    let result = match entry {
+                        PreparedListener::Tcp(listener, config, resolver, handler) => {
+                            run_tcp_server(listener, config, resolver, handler).await
+                        }
+                        #[cfg(unix)]
+                        PreparedListener::Unix(listener, resolver, handler) => {
+                            run_unix_server(listener, resolver, handler).await
+                        }
+                    };
+                    if let Err(error) = result {
+                        log::error!("Listener stopped: {error}");
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+/// Bind every new socket and construct handlers before starting any accept loop.
+pub fn prepare_tcp_servers(
+    config: ServerConfig,
+    resolver: Arc<dyn Resolver>,
+    previous: &ListenerRegistry,
+    next: &mut ListenerRegistry,
+) -> std::io::Result<PreparedTcpServers> {
+    // Legacy protocol factories may panic on malformed certificate material.
+    // Contain that failure before any current listener or session is touched.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prepare_tcp_servers_inner(config, resolver, previous, next)
+    }))
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid server protocol settings",
+        )
+    })?
+}
+
+fn prepare_tcp_servers_inner(
+    config: ServerConfig,
+    resolver: Arc<dyn Resolver>,
+    previous: &ListenerRegistry,
+    next: &mut ListenerRegistry,
+) -> std::io::Result<PreparedTcpServers> {
+    if config.transport != Transport::Tcp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "UDP listeners are not supported",
+        ));
+    }
     let ServerConfig {
         bind_location,
         tcp_settings,
@@ -422,7 +545,7 @@ async fn start_tcp_servers(
         ..
     } = config;
 
-    println!("Starting {} TCP server at {}", protocol, bind_location);
+    debug!("Preparing {} TCP server at {}", protocol, bind_location);
 
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
     // We should always have a direct entry.
@@ -435,7 +558,7 @@ async fn start_tcp_servers(
         resolver.clone(),
     ));
 
-    let mut handles = vec![];
+    let mut prepared = vec![];
 
     match bind_location {
         BindLocation::Address(addresses) => {
@@ -443,41 +566,57 @@ async fn start_tcp_servers(
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
-                    let tcp_handler = handlers
-                        .entry(socket_addr.ip())
-                        .or_insert_with(|| {
-                            create_tcp_server_handler(
-                                protocol.clone(),
-                                &client_proxy_selector,
-                                &resolver,
-                                Some(socket_addr.ip()),
-                            )
-                            .into()
-                        })
-                        .clone();
-                    let tcp_config = tcp_config.clone();
-                    let resolver = resolver.clone();
-                    let handle = tokio::spawn(async move {
-                        run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler)
-                            .await
-                            .unwrap();
-                    });
-                    handles.push(handle);
+                    if next.tcp.contains_key(&socket_addr) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            "duplicate TCP listener address",
+                        ));
+                    }
+                    let tcp_handler = if let Some(handler) = handlers.get(&socket_addr.ip()) {
+                        handler.clone()
+                    } else {
+                        let handler: Arc<dyn TcpServerHandler> = create_tcp_server_handler(
+                            protocol.clone(),
+                            &client_proxy_selector,
+                            &resolver,
+                            Some(socket_addr.ip()),
+                        )
+                        .into();
+                        handlers.insert(socket_addr.ip(), handler.clone());
+                        handler
+                    };
+                    let listener = match previous.tcp.get(&socket_addr) {
+                        Some(listener) => listener.clone(),
+                        None => Arc::new(new_tcp_listener(socket_addr, 4096, None)?),
+                    };
+                    next.tcp.insert(socket_addr, listener.clone());
+                    prepared.push(PreparedListener::Tcp(
+                        listener,
+                        tcp_config.clone(),
+                        resolver.clone(),
+                        tcp_handler,
+                    ));
                 }
             }
         }
         BindLocation::Path(path_buf) => {
             #[cfg(target_family = "unix")]
             {
+                if next.unix.contains_key(&path_buf) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "duplicate Unix listener path",
+                    ));
+                }
                 let tcp_handler: Arc<dyn TcpServerHandler> =
                     create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
                         .into();
-                let handle = tokio::spawn(async move {
-                    run_unix_server(path_buf, resolver, tcp_handler)
-                        .await
-                        .unwrap();
-                });
-                handles.push(handle);
+                let listener = match previous.unix.get(&path_buf) {
+                    Some(listener) => listener.clone(),
+                    None => Arc::new(OwnedUnixListener::bind(path_buf.clone())?),
+                };
+                next.unix.insert(path_buf, listener.clone());
+                prepared.push(PreparedListener::Unix(listener, resolver, tcp_handler));
             }
             #[cfg(not(target_family = "unix"))]
             {
@@ -489,7 +628,7 @@ async fn start_tcp_servers(
         }
     }
 
-    Ok(handles)
+    Ok(PreparedTcpServers(prepared))
 }
 
 #[cfg(test)]

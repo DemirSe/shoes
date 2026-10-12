@@ -84,10 +84,20 @@ rules: string | [RuleConfig]
 ```yaml
 protocol:
   type: vless
-  user_id: string              # UUID
+  user_id: string | [string]   # UUID or UUID list; alias: user_ids
   udp_enabled: true            # Default: true (enables XUDP)
   fallback: string?            # Optional fallback destination for failed auth (e.g., "127.0.0.1:80")
 ```
+
+Existing single-UUID profiles remain valid. A list authenticates any listed UUID
+once at connection setup, including REALITY/Vision, UDP and XUDP. Duplicate UUIDs,
+empty lists and invalid UUIDs are rejected. Vision replies use the UUID that
+authenticated the connection, not the first list entry.
+
+UUID count and connection/IP limits are not device counts. The owner selected
+administrative enforcement of at most ten devices for the shared UUID. Keep the
+shared profile and stock-client protocol; do not describe this as automatic device
+count enforcement. Multiple UUIDs do not alter the data transfer path.
 
 ### TLS Server
 ```yaml
@@ -538,6 +548,26 @@ client_chain:
 
 Configuration changes are automatically detected and applied without restarting. Disable with `--no-reload` flag.
 
+TCP reloads prepare and bind the complete replacement before stopping existing
+accept loops. Unchanged addresses retain their listening sockets. Invalid YAML,
+protocol settings, duplicate addresses or failed new binds retain the current
+generation. Existing TCP connections drain according to `reload_grace_secs`.
+Atomic file replacement is detected by watching the containing directories.
+Both the configured path and its existing canonical target are watched, including
+targets in a different directory. A successful reload refreshes these watches after
+symlink retargeting. If canonicalization fails, the configured path remains watched;
+this does not guarantee detection of every change to a missing symlink target.
+
+New addresses must bind while the old listening sockets are still open. Address
+family changes or overlapping wildcard scopes can therefore be rejected by the
+kernel, especially with dual-stack IPv6 listeners. Such a rejection retains the
+current generation. Use a separately approved controlled restart for conflicting
+address transitions; no automatic stop-and-rebind fallback is attempted.
+
+TUN live replacement is rejected without stopping the existing tunnel; use a
+separately approved controlled restart for TUN configuration changes.
+Existing Unix socket paths are never blindly deleted or overwritten during startup.
+
 ### mTLS (Mutual TLS)
 
 Require client certificates for authentication:
@@ -573,11 +603,23 @@ OPTIONS:
   -t, --threads NUM    Worker threads (default: CPU count)
   -d, --dry-run        Parse config and exit
   --no-reload          Disable hot-reloading
+  --production-profile Enforce this fork's deployment policy
 
 COMMANDS:
   generate-reality-keypair    Generate Reality X25519 keypair
   generate-vless-user-id      Generate a random VLESS user ID (UUID v4)
 ```
+
+`--dry-run` returns a nonzero status for invalid configuration. Unsupported UDP
+listeners are rejected; UDP/XUDP remain available inside the TCP tunnel.
+
+`--production-profile` applies on initial load, dry-run and every reload. It requires
+exactly one explicit public IPv4 TCP 443 listener, exactly `whatsapp.net` for REALITY
+SNI and destination port 443, Vision, VLESS with UDP/XUDP enabled, and no optional
+VLESS fallback or additional TLS targets. It is opt-in to preserve local fixtures.
+The flag must be enabled in a separately approved deployment; this code change
+does not validate or modify the live server profile. Client TUN routing and bypass
+policy remain separate verification tasks.
 
 ## Tips
 

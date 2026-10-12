@@ -11,6 +11,8 @@ mod reality_client_config;
 mod reality_unauthenticated_forwarding;
 #[path = "cases/integration/resource_lifecycle_test.rs"]
 mod resource_lifecycle;
+#[path = "cases/integration/server_lifecycle.rs"]
+mod server_lifecycle;
 #[path = "cases/integration/udp_message_edge_integration.rs"]
 mod udp_message_edge_integration;
 #[path = "cases/integration/vless_integration.rs"]

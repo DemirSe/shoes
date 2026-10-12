@@ -17,8 +17,7 @@ use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tls_server_handler::{
     InnerProtocol, TlsServerHandler, TlsServerTarget, VisionVlessConfig,
 };
-use crate::uuid_util::parse_uuid;
-use crate::vless::vless_server_handler::VlessTcpServerHandler;
+use crate::vless::vless_server_handler::{VlessTcpServerHandler, VlessUsers};
 
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
@@ -40,7 +39,7 @@ pub fn create_tcp_server_handler(
             user_id,
             udp_enabled,
             fallback,
-        } => Box::new(VlessTcpServerHandler::new(
+        } => Box::new(VlessTcpServerHandler::new_users(
             &user_id,
             udp_enabled,
             client_proxy_selector.clone(),
@@ -143,9 +142,7 @@ fn create_tls_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
+            let user_id_bytes = VlessUsers::new(user_id);
             InnerProtocol::VisionVless(VisionVlessConfig {
                 user_id: user_id_bytes,
                 udp_enabled: *udp_enabled,
@@ -222,9 +219,7 @@ fn create_reality_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
+            let user_id_bytes = VlessUsers::new(user_id);
             InnerProtocol::VisionVless(VisionVlessConfig {
                 user_id: user_id_bytes,
                 udp_enabled: *udp_enabled,

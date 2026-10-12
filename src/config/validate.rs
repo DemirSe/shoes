@@ -639,10 +639,10 @@ fn validate_server_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
-    if server_config.transport != Transport::Tcp && server_config.tcp_settings.is_some() {
+    if server_config.transport != Transport::Tcp {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "TCP transport is not selected but TCP settings specified",
+            "UDP listeners are not supported; use TCP transport for UDP/XUDP tunneling",
         ));
     }
 
@@ -927,7 +927,21 @@ fn validate_server_proxy_config(
 ) -> std::io::Result<()> {
     match server_proxy_config {
         ServerProxyConfig::Vless { user_id, .. } => {
-            parse_uuid(user_id)?;
+            let mut seen = HashSet::new();
+            for id in user_id.iter() {
+                if !seen.insert(parse_uuid(id)?) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "duplicate VLESS user ID",
+                    ));
+                }
+            }
+            if seen.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "VLESS requires at least one user ID",
+                ));
+            }
         }
         ServerProxyConfig::Tls {
             tls_targets,
@@ -2279,7 +2293,7 @@ mod tests {
                     .unwrap(),
                 )),
                 protocol: ServerProxyConfig::Vless {
-                    user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                    user_id: OneOrSome::One("550e8400-e29b-41d4-a716-446655440000".to_string()),
                     udp_enabled: true,
                     fallback: None,
                 },
@@ -2327,7 +2341,7 @@ mod tests {
                     .unwrap(),
                 )),
                 protocol: ServerProxyConfig::Vless {
-                    user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                    user_id: OneOrSome::One("550e8400-e29b-41d4-a716-446655440000".to_string()),
                     udp_enabled: true,
                     fallback: None,
                 },
@@ -2387,7 +2401,7 @@ mod tests {
                     .unwrap(),
                 )),
                 protocol: ServerProxyConfig::Vless {
-                    user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                    user_id: OneOrSome::One("550e8400-e29b-41d4-a716-446655440000".to_string()),
                     udp_enabled: true,
                     fallback: None,
                 },
@@ -2438,7 +2452,7 @@ mod tests {
                 .unwrap(),
             )),
             protocol: ServerProxyConfig::Vless {
-                user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                user_id: OneOrSome::One("550e8400-e29b-41d4-a716-446655440000".to_string()),
                 udp_enabled: true,
                 fallback: None,
             },

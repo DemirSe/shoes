@@ -299,7 +299,8 @@ pub struct TlsServerConfig {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
     Vless {
-        user_id: String,
+        #[serde(alias = "user_ids")]
+        user_id: OneOrSome<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
         /// Fallback destination for failed authentication (optional)
@@ -367,7 +368,7 @@ mod tests {
 
     fn vless_protocol() -> ServerProxyConfig {
         ServerProxyConfig::Vless {
-            user_id: TEST_UUID.to_string(),
+            user_id: OneOrSome::One(TEST_UUID.to_string()),
             udp_enabled: true,
             fallback: None,
         }
