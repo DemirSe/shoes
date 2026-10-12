@@ -35,7 +35,6 @@ use super::reality_util::{
 };
 use crate::address::{Address, NetLocation};
 use crate::slide_buffer::SlideBuffer;
-use crate::util::allocate_vec;
 
 /// Configuration for REALITY server connections
 #[derive(Clone)]
@@ -107,9 +106,6 @@ pub struct RealityServerConnection {
     write_seq: u64,
     cipher_suite: Option<CipherSuite>,
 
-    // Pre-allocated buffer for TLS read operations (reused across calls)
-    tls_read_buffer: Box<[u8]>,
-
     // Buffers for I/O - using SlideBuffer for efficient zero-alloc operations
     ciphertext_read_buf: SlideBuffer, // Incoming encrypted TLS records
     ciphertext_write_buf: Vec<u8>,    // Outgoing encrypted TLS records
@@ -134,7 +130,6 @@ impl RealityServerConnection {
             read_seq: 0,
             write_seq: 0,
             cipher_suite: None,
-            tls_read_buffer: allocate_vec(TLS_MAX_RECORD_SIZE).into_boxed_slice(),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
             ciphertext_write_buf: Vec::new(),
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
@@ -162,21 +157,19 @@ impl RealityServerConnection {
     /// Read TLS messages from the provided reader into internal buffer
     ///
     /// This does NOT decrypt - call process_new_packets() for that.
-    /// Uses pre-allocated buffer to avoid allocation on every call.
+    /// Reads directly into the pre-allocated ciphertext buffer's spare
+    /// capacity, avoiding a second copy.
     pub fn read_tls(&mut self, rd: &mut dyn Read) -> io::Result<usize> {
         // Compact if remaining capacity is insufficient for a full TLS record
         if self.ciphertext_read_buf.remaining_capacity() < TLS_MAX_RECORD_SIZE {
             self.ciphertext_read_buf.compact();
         }
 
-        // Never read more than the buffer can hold: an extend beyond capacity
-        // would panic, and a buffer that cannot take another byte must fail as
-        // invalid data instead. Record length bounds keep this unreachable for
-        // well-formed input.
-        let read_len = self
-            .tls_read_buffer
-            .len()
-            .min(self.ciphertext_read_buf.remaining_capacity());
+        // Never read more than the buffer can hold: a read beyond the spare
+        // capacity would panic, and a buffer that cannot take another byte must
+        // fail as invalid data instead. Record length bounds keep this
+        // unreachable for well-formed input.
+        let read_len = TLS_MAX_RECORD_SIZE.min(self.ciphertext_read_buf.remaining_capacity());
         if read_len == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -184,11 +177,13 @@ impl RealityServerConnection {
             ));
         }
 
-        // Read into pre-allocated buffer
-        let n = rd.read(&mut self.tls_read_buffer[..read_len])?;
+        // Read directly into the buffer's spare capacity
+        let n = {
+            let write_slice = self.ciphertext_read_buf.write_slice();
+            rd.read(&mut write_slice[..read_len])?
+        };
         if n > 0 {
-            self.ciphertext_read_buf
-                .extend_from_slice(&self.tls_read_buffer[..n]);
+            self.ciphertext_read_buf.advance_write(n);
         }
         Ok(n)
     }
@@ -1429,6 +1424,23 @@ mod tests {
         let mut received = vec![0u8; payload_len];
         connection.reader().read_exact(&mut received).unwrap();
         assert!(received.iter().all(|byte| *byte == 0xAB));
+    }
+
+    #[test]
+    fn read_tls_buffers_directly_into_the_ciphertext_buffer() {
+        // Reads must land in the ciphertext buffer in order, without a
+        // separate staging buffer.
+        let mut connection = validation_connection();
+        let first = [0xAAu8; 100];
+        let second = [0xBBu8; 50];
+
+        assert_eq!(connection.read_tls(&mut first.as_slice()).unwrap(), 100);
+        assert_eq!(connection.read_tls(&mut second.as_slice()).unwrap(), 50);
+
+        let buffered = connection.ciphertext_read_buf.as_slice();
+        assert_eq!(buffered.len(), 150);
+        assert!(buffered[..100].iter().all(|byte| *byte == 0xAA));
+        assert!(buffered[100..].iter().all(|byte| *byte == 0xBB));
     }
 
     #[test]

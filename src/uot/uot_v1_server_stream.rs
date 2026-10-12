@@ -169,13 +169,15 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for PacketAddrStream<S> {
                     return Poll::Ready(Ok(location));
                 }
                 None => {
-                    let data = this.read_buf.as_slice();
-                    let preview: Vec<u8> = data.iter().take(20).copied().collect();
-                    log::trace!(
-                        "PacketAddrStream: incomplete packet, buf_len={}, first_bytes={:02x?}",
-                        this.read_buf.len(),
-                        preview
-                    );
+                    if log::log_enabled!(log::Level::Trace) {
+                        let data = this.read_buf.as_slice();
+                        let preview: Vec<u8> = data.iter().take(20).copied().collect();
+                        log::trace!(
+                            "PacketAddrStream: incomplete packet, buf_len={}, first_bytes={:02x?}",
+                            this.read_buf.len(),
+                            preview
+                        );
+                    }
                     // Need more data - continue below
                 }
             }

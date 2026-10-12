@@ -2,7 +2,7 @@
 // Wraps any AsyncStream and provides XUDP frame encoding/decoding with session management
 // Used by both VLESS and VMess protocols
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::ready;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -26,8 +26,12 @@ pub struct XudpMessageStream {
     /// Underlying byte stream (VLESS VisionStream, VMess stream, or any TLS stream) that reads/writes raw XUDP frame bytes
     inner_stream: Box<dyn AsyncStream>,
 
-    /// Read buffer for incoming XUDP frames
+    /// Read buffer for incoming XUDP frames. The first `read_filled` bytes are
+    /// frame data; the rest is initialized spare capacity for reads.
     read_buffer: BytesMut,
+
+    /// Logical length of the frame data at the front of `read_buffer`.
+    read_filled: usize,
 
     /// Write buffer for outgoing XUDP frames
     write_buffer: BytesMut,
@@ -48,7 +52,7 @@ pub struct XudpMessageStream {
     resolver_cache: ResolverCache,
 
     /// Buffered incoming message waiting for destination resolution.
-    incoming_message: Option<(Vec<u8>, NetLocation, u16)>,
+    incoming_message: Option<(Bytes, NetLocation, u16)>,
 
     /// EOF flag
     is_eof: bool,
@@ -80,6 +84,7 @@ impl XudpMessageStream {
         Self {
             inner_stream,
             read_buffer: BytesMut::with_capacity(65536),
+            read_filled: 0,
             write_buffer: BytesMut::with_capacity(65536),
             next_route_id: 1,
             wire_sessions: HashMap::new(),
@@ -102,7 +107,12 @@ impl XudpMessageStream {
             "[XUDP] Feeding {} bytes of initial data to read buffer",
             data.len()
         );
-        self.read_buffer.extend_from_slice(data);
+        let filled = self.read_filled;
+        if self.read_buffer.len() - filled < data.len() {
+            self.read_buffer.resize(filled + data.len(), 0);
+        }
+        self.read_buffer[filled..filled + data.len()].copy_from_slice(data);
+        self.read_filled = filled + data.len();
         Ok(())
     }
 
@@ -181,18 +191,18 @@ impl XudpMessageStream {
     ///   Ok(Some((data, destination, session_id))) - Successfully decoded a complete frame
     ///   Ok(None) - Buffer doesn't contain a complete frame yet (need more data)
     ///   Err(e) - Error during decoding
-    fn try_decode_one_frame(&mut self) -> std::io::Result<Option<(Vec<u8>, NetLocation, u16)>> {
+    fn try_decode_one_frame(&mut self) -> std::io::Result<Option<(Bytes, NetLocation, u16)>> {
         loop {
             log::debug!(
                 "[XUDP READ] Attempting to decode frame, buffer len: {}",
-                self.read_buffer.len()
+                self.read_filled
             );
 
             // First, peek at the buffer to determine total frame size WITHOUT consuming anything.
             // We need to check: metadata_len (2 bytes) + metadata + data_len (2 bytes) + data
 
             // Need at least 2 bytes for metadata length
-            if self.read_buffer.len() < 2 {
+            if self.read_filled < 2 {
                 log::debug!("[XUDP READ] Buffer too short for metadata length field");
                 return Ok(None);
             }
@@ -201,7 +211,7 @@ impl XudpMessageStream {
                 u16::from_be_bytes([self.read_buffer[0], self.read_buffer[1]]) as usize;
 
             // Check if we have complete metadata
-            if self.read_buffer.len() < 2 + metadata_len {
+            if self.read_filled < 2 + metadata_len {
                 log::debug!("[XUDP READ] Buffer too short for complete metadata");
                 return Ok(None);
             }
@@ -217,7 +227,7 @@ impl XudpMessageStream {
             let option_byte = self.read_buffer[2 + 3];
             let has_data = option_byte & FrameOption::DATA != 0;
             let data_len_offset = 2 + metadata_len;
-            if has_data && self.read_buffer.len() < data_len_offset + 2 {
+            if has_data && self.read_filled < data_len_offset + 2 {
                 log::debug!("[XUDP READ] Buffer too short for data length field");
                 return Ok(None);
             }
@@ -232,10 +242,10 @@ impl XudpMessageStream {
             };
 
             let total_frame_len = data_len_offset + usize::from(has_data) * (2 + data_len);
-            if self.read_buffer.len() < total_frame_len {
+            if self.read_filled < total_frame_len {
                 log::debug!(
                     "[XUDP READ] Buffer too short for complete frame: have {}, need {}",
-                    self.read_buffer.len(),
+                    self.read_filled,
                     total_frame_len
                 );
                 return Ok(None);
@@ -243,6 +253,8 @@ impl XudpMessageStream {
 
             let metadata = FrameMetadata::decode(&mut self.read_buffer)?
                 .expect("metadata decode should succeed after length check");
+            // Decode consumed exactly the declared metadata envelope.
+            self.read_filled -= 2 + metadata_len;
 
             log::debug!(
                 "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
@@ -255,8 +267,10 @@ impl XudpMessageStream {
 
             if has_data {
                 self.read_buffer.advance(2);
+                self.read_filled -= 2;
             }
-            let data = self.read_buffer.split_to(data_len).to_vec();
+            let data = self.read_buffer.split_to(data_len).freeze();
+            self.read_filled -= data_len;
 
             if metadata.status == SessionStatus::End {
                 self.close_wire_session(metadata.session_id);
@@ -484,26 +498,30 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                 }
             }
 
-            // Read more data from inner stream
-            let original_filled = this.read_buffer.len();
-            this.read_buffer.resize(original_filled + 8192, 0);
-            let mut temp_buf = ReadBuf::new(&mut this.read_buffer[original_filled..]);
+            // Read more data from the inner stream into the initialized spare
+            // capacity. The buffer is zero-filled once when it grows, not on
+            // every read.
+            let filled = this.read_filled;
+            if this.read_buffer.len() - filled < 8192 {
+                this.read_buffer.resize(filled + 8192, 0);
+            }
+            let mut temp_buf = ReadBuf::new(&mut this.read_buffer[filled..filled + 8192]);
 
             log::debug!(
                 "[XUDP SESSION READ] Reading from inner stream, current buffer has {} bytes",
-                original_filled
+                filled
             );
             let poll_result = Pin::new(&mut this.inner_stream).poll_read(cx, &mut temp_buf);
 
             let n = temp_buf.filled().len();
-            this.read_buffer.truncate(original_filled + n);
+            this.read_filled = filled + n;
 
             match ready!(poll_result) {
                 Ok(()) => {
                     log::debug!(
                         "[XUDP SESSION READ] Got {} bytes from inner stream (total buffer: {})",
                         n,
-                        this.read_buffer.len()
+                        this.read_filled
                     );
 
                     if n == 0 {
@@ -757,6 +775,8 @@ mod tests {
     /// Inner stream that serves scripted XUDP frame bytes to the reader.
     struct FrameReader {
         bytes: bytes::Bytes,
+        /// Maximum bytes handed out per poll; `usize::MAX` means no limit.
+        max_chunk: usize,
     }
 
     impl AsyncRead for FrameReader {
@@ -770,7 +790,7 @@ mod tests {
                 // A stream with nothing left to send stays open.
                 return Poll::Pending;
             }
-            let len = buf.remaining().min(this.bytes.len());
+            let len = buf.remaining().min(this.bytes.len()).min(this.max_chunk);
             buf.put_slice(&this.bytes[..len]);
             this.bytes.advance(len);
             Poll::Ready(Ok(()))
@@ -846,6 +866,7 @@ mod tests {
         );
         let mut stream = XudpMessageStream::new(Box::new(FrameReader {
             bytes: frame.freeze(),
+            max_chunk: usize::MAX,
         }));
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -878,6 +899,7 @@ mod tests {
         );
         let mut stream = XudpMessageStream::new(Box::new(FrameReader {
             bytes: frame.freeze(),
+            max_chunk: usize::MAX,
         }));
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -890,6 +912,69 @@ mod tests {
                 .is_pending(),
             "a control frame must not be delivered as a message"
         );
+    }
+
+    #[test]
+    fn a_frame_split_across_single_byte_reads_still_decodes() {
+        // One byte per poll exercises partial-frame accumulation and the
+        // logical buffer length that tracks it.
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 53);
+        let frame = xudp_frame(
+            10,
+            SessionStatus::New,
+            FrameOption::new().with_data(),
+            Some(destination),
+            Some(b"split"),
+        );
+        let mut stream = XudpMessageStream::new(Box::new(FrameReader {
+            bytes: frame.freeze(),
+            max_chunk: 1,
+        }));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0u8; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+
+        match Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf) {
+            Poll::Ready(Ok((session_id, address))) => {
+                assert_eq!(buf.filled(), b"split");
+                assert_eq!(address, "127.0.0.1:53".parse().unwrap());
+                assert!(session_id > 0, "the frame must map to a routed session");
+            }
+            other => panic!("a trickled frame must decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_frame_larger_than_one_read_chunk_decodes_after_buffer_growth() {
+        // A payload beyond the 8192-byte read chunk forces the read buffer to
+        // grow while the frame is still incomplete.
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 53);
+        let payload = vec![0x5Au8; 20_000];
+        let frame = xudp_frame(
+            11,
+            SessionStatus::New,
+            FrameOption::new().with_data(),
+            Some(destination),
+            Some(&payload),
+        );
+        let mut stream = XudpMessageStream::new(Box::new(FrameReader {
+            bytes: frame.freeze(),
+            max_chunk: usize::MAX,
+        }));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = vec![0u8; payload.len()];
+        let mut buf = ReadBuf::new(&mut bytes);
+
+        match Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf) {
+            Poll::Ready(Ok((session_id, address))) => {
+                assert_eq!(buf.filled(), &payload[..]);
+                assert_eq!(address, "127.0.0.1:53".parse().unwrap());
+                assert!(session_id > 0, "the frame must map to a routed session");
+            }
+            other => panic!("a large frame must decode, got {other:?}"),
+        }
     }
 
     fn budgeted_writer(
