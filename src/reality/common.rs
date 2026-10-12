@@ -72,6 +72,25 @@ pub const PLAINTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 /// Combined limit for queued plaintext and ciphertext (matches rustls DEFAULT_BUFFER_LIMIT)
 pub const OUTGOING_BUFFER_LIMIT: usize = 64 * 1024;
 
+/// Bound a TLS record header's declared ciphertext length.
+///
+/// The length field is attacker-controlled and can claim up to 65,535 bytes,
+/// far beyond [`CIPHERTEXT_READ_BUF_CAPACITY`]. Unbounded declared lengths must
+/// fail as invalid data before any buffer is grown to match them.
+#[inline]
+pub fn validate_tls_record_len(record_len: usize) -> io::Result<()> {
+    if record_len > MAX_TLS_CIPHERTEXT_LEN {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "TLS record ciphertext length {} exceeds maximum {}",
+                record_len, MAX_TLS_CIPHERTEXT_LEN
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Strip TLS 1.3 content type trailer from decrypted plaintext slice.
 ///
 /// TLS 1.3 format: content || type_byte
@@ -238,5 +257,14 @@ mod tests {
     fn test_strip_with_padding_invalid_type() {
         let mut plaintext = vec![0x01, 0xFF, 0x00]; // 0xFF with padding
         assert!(strip_content_type_with_padding(&mut plaintext).is_err());
+    }
+
+    #[test]
+    fn tls_record_len_is_bounded_by_the_ciphertext_maximum() {
+        assert!(validate_tls_record_len(0).is_ok());
+        assert!(validate_tls_record_len(MAX_TLS_CIPHERTEXT_LEN).is_ok());
+        let error = validate_tls_record_len(MAX_TLS_CIPHERTEXT_LEN + 1).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(validate_tls_record_len(u16::MAX as usize).is_err());
     }
 }

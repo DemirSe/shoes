@@ -11,6 +11,7 @@ use super::common::{
     HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
     HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, MAX_TLS_PLAINTEXT_LEN,
     PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
+    validate_tls_record_len,
 };
 use super::reality_aead::{AeadKey, decrypt_handshake_message};
 use super::reality_auth::{derive_auth_key, encrypt_session_id, perform_ecdh};
@@ -286,7 +287,22 @@ impl RealityClientConnection {
             self.ciphertext_read_buf.compact();
         }
 
-        let n = rd.read(&mut self.tls_read_buffer[..])?;
+        // Never read more than the buffer can hold: an extend beyond capacity
+        // would panic, and a buffer that cannot take another byte must fail as
+        // invalid data instead. Record length bounds keep this unreachable for
+        // well-formed input.
+        let read_len = self
+            .tls_read_buffer
+            .len()
+            .min(self.ciphertext_read_buf.remaining_capacity());
+        if read_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS ciphertext buffer is full",
+            ));
+        }
+
+        let n = rd.read(&mut self.tls_read_buffer[..read_len])?;
         if n > 0 {
             self.ciphertext_read_buf
                 .extend_from_slice(&self.tls_read_buffer[..n]);
@@ -370,6 +386,10 @@ impl RealityClientConnection {
             .get_u16_be(3)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
             as usize;
+
+        // Bound the declared length before buffering anything. Without this a
+        // malicious cover can claim 65,535 bytes and overflow the read buffer.
+        validate_tls_record_len(record_len)?;
 
         let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
         if self.ciphertext_read_buf.len() < total_record_len {
@@ -525,6 +545,9 @@ impl RealityClientConnection {
             tls_version,
             record_len
         );
+
+        // Bound the declared length before buffering anything else.
+        validate_tls_record_len(record_len)?;
 
         let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
         if self.ciphertext_read_buf.len() < total_record_len {
@@ -801,6 +824,9 @@ impl RealityClientConnection {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
                 as usize;
 
+            // Bound the declared length before buffering or decrypting anything.
+            validate_tls_record_len(record_len)?;
+
             let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
             if self.ciphertext_read_buf.len() < total_record_len {
                 break;
@@ -1020,6 +1046,8 @@ pub fn feed_reality_client_connection(
 mod tests {
     use super::*;
 
+    use crate::reality::common::MAX_TLS_CIPHERTEXT_LEN;
+
     fn completed_connection() -> RealityClientConnection {
         let config = RealityClientConfig {
             public_key: [1u8; 32],
@@ -1079,6 +1107,70 @@ mod tests {
         let error = connection
             .process_new_packets()
             .expect_err("an unsupported post-handshake record must fail instead of panicking");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    #[test]
+    fn a_declared_record_length_beyond_the_ciphertext_maximum_is_rejected() {
+        // A malicious cover can declare a 65,535-byte record. Such a claim must
+        // fail as invalid data instead of filling the read buffer until the next
+        // extend panics on a slice range.
+        let mut connection = completed_connection();
+        let mut record = vec![CONTENT_TYPE_APPLICATION_DATA, 0x03, 0x03, 0xFF, 0xFF];
+        record.extend_from_slice(&[0xAA; 64]);
+        connection.read_tls(&mut record.as_slice()).unwrap();
+        let error = connection
+            .process_new_packets()
+            .expect_err("an over-long declared record must fail instead of panicking");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert_eq!(
+            connection
+                .process_new_packets()
+                .map_err(|e| e.kind())
+                .unwrap_err(),
+            io::ErrorKind::InvalidData,
+            "the failed connection must stay failed"
+        );
+    }
+
+    #[test]
+    fn a_record_at_the_ciphertext_maximum_still_parses() {
+        // A record whose declared length is exactly 16,640 must still decrypt.
+        let mut connection = completed_connection();
+        let payload_len = MAX_TLS_CIPHERTEXT_LEN - 1 - 16;
+        let mut plaintext = vec![0xCD; payload_len];
+        plaintext.push(CONTENT_TYPE_APPLICATION_DATA);
+        let ciphertext_len = plaintext.len() + 16;
+        assert_eq!(ciphertext_len, MAX_TLS_CIPHERTEXT_LEN);
+        let aad = [
+            CONTENT_TYPE_APPLICATION_DATA,
+            0x03,
+            0x03,
+            (ciphertext_len >> 8) as u8,
+            ciphertext_len as u8,
+        ];
+        let key = AeadKey::new(CipherSuite::AES_128_GCM_SHA256, &[0u8; 16]).unwrap();
+        let ciphertext = key.seal(&plaintext, &[0u8; 12], 0, &aad).unwrap();
+        let mut record = aad.to_vec();
+        record.extend_from_slice(&ciphertext);
+
+        connection.read_tls(&mut record.as_slice()).unwrap();
+        connection.process_new_packets().unwrap();
+        let mut received = vec![0u8; payload_len];
+        connection.reader().read_exact(&mut received).unwrap();
+        assert!(received.iter().all(|byte| *byte == 0xCD));
+    }
+
+    #[test]
+    fn feeding_more_than_the_ciphertext_buffer_holds_fails_without_panicking() {
+        // A record header that claims 65,535 bytes, followed by enough data to
+        // fill the read buffer while nothing is processed in between. The
+        // extend must fail as invalid data instead of panicking on a range.
+        let mut connection = completed_connection();
+        let mut data = vec![CONTENT_TYPE_APPLICATION_DATA, 0x03, 0x03, 0xFF, 0xFF];
+        data.resize(TLS_RECORD_HEADER_SIZE + CIPHERTEXT_READ_BUF_CAPACITY, 0xAA);
+        let error = feed_reality_client_connection(&mut connection, &data)
+            .expect_err("an over-long record must not overflow the read buffer");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     }
 

@@ -352,6 +352,15 @@ where
         if progressed {
             *last_active = Instant::now();
         } else if last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
+            // A timed-out association must not report a clean end while output
+            // that was already accepted is still undrained, exactly as when the
+            // drain window closes.
+            if a_buf.has_undrained_output() || b_buf.has_undrained_output() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "association idle timeout reached with accepted output undrained",
+                )));
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -396,7 +405,9 @@ where
 /// After the first direction ends, the remaining one may still deliver messages
 /// for [`EOF_DRAIN_WINDOW`]. Messages that arrive after that absolute window are
 /// discarded. An association whose directions are both open still ends after
-/// [`DEFAULT_ASSOCIATION_TIMEOUT_SECS`] without activity.
+/// [`DEFAULT_ASSOCIATION_TIMEOUT_SECS`] without activity; if accepted output is
+/// still undrained then, the end is reported as a timeout instead of a clean
+/// end.
 ///
 /// [`shutdown()`]: crate::io::AsyncWriteExt::shutdown
 ///
@@ -1262,6 +1273,119 @@ mod tests {
         assert!(
             matches!(copy.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
             "an idle association must still expire"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_timeout_reports_a_reply_the_writer_never_accepted() {
+        // Neither direction ends. The reply is accepted from the peer, but the
+        // idle client's writer stays blocked past the association timeout, so
+        // the end must not be reported as clean.
+        let mut client = ScriptedMessageStream::new(true, vec![ReadStep::Idle]);
+        let mut peer = ScriptedMessageStream::new(
+            true,
+            vec![ReadStep::Message(b"reply".to_vec()), ReadStep::Idle],
+        );
+        let client_state = Arc::clone(&client.state);
+        client_state.lock().unwrap().blocked_writes = usize::MAX;
+        let mut copy = Box::pin(copy_bidirectional_message(
+            &mut client,
+            &mut peer,
+            false,
+            false,
+        ));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(copy.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            client_state.lock().unwrap().writes.is_empty(),
+            "the stalled writer did not accept the reply"
+        );
+
+        tokio::time::advance(Duration::from_secs(
+            u64::from(DEFAULT_ASSOCIATION_TIMEOUT_SECS) + 1,
+        ))
+        .await;
+        let error = match copy.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(error)) => error,
+            other => panic!("a cached reply must not be reported as delivered: {other:?}"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_timeout_reports_a_reply_the_writer_never_flushed() {
+        // Neither direction ends. The reply reaches the idle client's writer,
+        // but its flush never completes, so the end must not be reported as
+        // clean.
+        let mut client = ScriptedMessageStream::new(true, vec![ReadStep::Idle]);
+        let mut peer = ScriptedMessageStream::new(
+            true,
+            vec![ReadStep::Message(b"reply".to_vec()), ReadStep::Idle],
+        );
+        let client_state = Arc::clone(&client.state);
+        client_state.lock().unwrap().blocked_flushes = usize::MAX;
+        let mut copy = Box::pin(copy_bidirectional_message(
+            &mut client,
+            &mut peer,
+            false,
+            false,
+        ));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(copy.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            client_state.lock().unwrap().writes,
+            vec![b"reply".to_vec()],
+            "the writer accepted the reply"
+        );
+
+        tokio::time::advance(Duration::from_secs(
+            u64::from(DEFAULT_ASSOCIATION_TIMEOUT_SECS) + 1,
+        ))
+        .await;
+        let error = match copy.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(error)) => error,
+            other => panic!("a stalled reply flush must not be reported as delivered: {other:?}"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_association_that_drained_still_ends_cleanly() {
+        // The reply is written and flushed while the association is idle, so
+        // the ordinary timeout still releases it cleanly.
+        let mut client = ScriptedMessageStream::new(true, vec![ReadStep::Idle]);
+        let mut peer = ScriptedMessageStream::new(
+            true,
+            vec![ReadStep::Message(b"reply".to_vec()), ReadStep::Idle],
+        );
+        let client_state = Arc::clone(&client.state);
+        let mut copy = Box::pin(copy_bidirectional_message(
+            &mut client,
+            &mut peer,
+            false,
+            false,
+        ));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(copy.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            client_state.lock().unwrap().writes,
+            vec![b"reply".to_vec()],
+            "the reply must be delivered before the timeout"
+        );
+
+        tokio::time::advance(Duration::from_secs(
+            u64::from(DEFAULT_ASSOCIATION_TIMEOUT_SECS) + 1,
+        ))
+        .await;
+        assert!(
+            matches!(copy.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+            "a drained association must still expire cleanly"
         );
     }
 }

@@ -68,8 +68,10 @@ impl RealityServerTarget {
 ///   - Auth failed: forward dest's response, continue bidirectional copy
 ///   - Auth succeeded: build REALITY response matching dest's structure
 ///
-/// A cover that refuses, closes, stalls, or answers with unusable records stops
-/// the connection. Only a usable cover response reaches the forwarding branch.
+/// A cover that refuses, closes, or stalls stops the connection. A readable
+/// answer that cannot back a REALITY handshake (a TLS 1.2 ServerHello, an alert,
+/// or a HelloRetryRequest) is a cover response: it is relayed verbatim for
+/// unauthenticated traffic, while an authenticated request stops.
 #[inline]
 pub async fn setup_reality_server_stream(
     server_stream: Box<dyn AsyncStream>,
@@ -146,10 +148,12 @@ pub async fn setup_reality_server_stream(
         None
     };
 
-    // Read the cover response until it is usable. Use the 512-byte heuristic like
-    // XTLS/REALITY: first encrypted record > 512 bytes = combined mode, <= 512 bytes
-    // = separate mode. Every cover failure below stops the connection instead of
-    // starting transparent forwarding.
+    // Read the cover response until it is usable for mirroring. Use the 512-byte
+    // heuristic like XTLS/REALITY: first encrypted record > 512 bytes = combined
+    // mode, <= 512 bytes = separate mode. A cover failure below (close, reset,
+    // stall, malformed records) stops the connection instead of starting
+    // transparent forwarding; a readable but unusable response follows the
+    // authentication state.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut deframer = TlsDeframer::new();
     let mut dest_records: Vec<Bytes> = Vec::new();
@@ -186,14 +190,38 @@ pub async fn setup_reality_server_stream(
             }
         };
 
-        // When we get the first record (ServerHello), check the cover's TLS version
+        // When we get the first record, check that the cover answered a usable
+        // ServerHello. A readable answer that is not one is still a cover response.
         if dest_records.is_empty() && !new_records.is_empty() {
-            let parsed = parse_server_hello(&new_records[0]).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("REALITY: Failed to parse dest ServerHello: {}", e),
-                )
-            })?;
+            let parsed = match parse_server_hello(&new_records[0]) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    // A readable first record that is not a ServerHello (a cover alert
+                    // or HelloRetryRequest) is a cover response, not a cover failure:
+                    // unauthenticated traffic forwards the already-read bytes, while
+                    // an authenticated request needs the TLS 1.3 structure and stops.
+                    if authenticated_connection.is_some() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("REALITY: Failed to parse dest ServerHello: {}", e),
+                        ));
+                    }
+                    log::debug!(
+                        "REALITY: Dest {} answered a non-ServerHello first record: {}, forwarding",
+                        target.dest,
+                        e
+                    );
+                    dest_records.extend(new_records);
+                    return Ok(start_forward_to_dest(
+                        server_stream,
+                        dest_stream,
+                        dest_records,
+                        deframer.into_remaining_data(),
+                        client_pending,
+                        target.fallback_limits(client_hello_frame.len()),
+                    ));
+                }
+            };
             if !parsed.is_tls13 {
                 // A TLS 1.2 cover serves unauthenticated traffic only. An authenticated
                 // REALITY request needs a TLS 1.3 cover to match its structure.
@@ -1507,6 +1535,24 @@ mod cleanup_tests {
         flight
     }
 
+    /// Readable cover answers that are not a usable ServerHello: a fatal alert
+    /// (content type 0x15) and a HelloRetryRequest. A healthy cover may answer an
+    /// unauthenticated hello with either one, so neither is a cover failure.
+    fn synthetic_non_server_hello_cover_responses() -> [Vec<u8>; 2] {
+        // RFC 8446 section 4.1.3: a HelloRetryRequest is a ServerHello whose
+        // random is this fixed value.
+        const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+            0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65,
+            0xB8, 0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2,
+            0xC8, 0xA8, 0x33, 0x9C,
+        ];
+        // The random starts after the 5-byte record header, the 4-byte handshake
+        // header, and the 2-byte legacy version of `synthetic_server_hello`.
+        let mut retry = synthetic_server_hello(true);
+        retry[11..43].copy_from_slice(&HELLO_RETRY_REQUEST_RANDOM);
+        [tls_record(0x15, &[0x02, 0x28]), retry]
+    }
+
     /// A genuine TLS 1.2 ClientHello and the flight a TLS 1.2 cover answers it with.
     /// Both sides are driven by the production crypto backend, so the records are
     /// real TLS 1.2 records rather than hand-flipped version flags.
@@ -1785,6 +1831,70 @@ mod cleanup_tests {
             .err()
             .expect("an invalid cover ServerHello must stop the connection");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    /// A healthy cover may answer an unauthenticated hello with a readable record
+    /// that is not a ServerHello. That is a cover response, not a cover failure:
+    /// the alert or HelloRetryRequest bytes must reach the client unchanged.
+    #[tokio::test]
+    async fn unauthenticated_client_keeps_a_non_server_hello_cover_response() {
+        let private_key = [5u8; 32];
+        for response in synthetic_non_server_hello_cover_responses() {
+            let (resolver, cover_calls) = synthetic_cover_resolver();
+            let (cover_port, cover) =
+                synthetic_cover(SyntheticCover::Respond(response.clone())).await;
+            let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+            let hello = synthetic_reality_client_hello([9; 8], synthetic_public_key(private_key));
+
+            let (result, mut peer) = setup_against_cover(hello, &target, &resolver).await;
+            assert_eq!(cover_calls.load(Ordering::SeqCst), 1);
+
+            let TcpServerSetupResult::Session(session) = result.expect(
+                "a readable non-ServerHello cover response must forward unauthenticated traffic",
+            ) else {
+                panic!("unauthenticated traffic must return a forwarding session");
+            };
+            let relay = tokio::spawn(session);
+            let mut preread = vec![0u8; response.len()];
+            tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut preread))
+                .await
+                .expect("the cover response must reach the client")
+                .unwrap();
+            assert_eq!(
+                preread, response,
+                "the cover response must reach the client unchanged"
+            );
+            // Nothing follows the relayed cover response: it must not be duplicated.
+            let mut extra = [0u8; 1];
+            let mut read_extra = Box::pin(peer.read(&mut extra));
+            assert!(
+                futures::poll!(read_extra.as_mut()).is_pending(),
+                "the cover response must be relayed exactly once"
+            );
+            relay.abort();
+            cover.abort();
+        }
+    }
+
+    /// The authenticated counterpart: the same readable cover answers cannot back a
+    /// REALITY handshake, so an authenticated request still stops.
+    #[tokio::test]
+    async fn authenticated_client_stops_on_a_non_server_hello_cover_response() {
+        let private_key = [7u8; 32];
+        for response in synthetic_non_server_hello_cover_responses() {
+            let (resolver, _cover_calls) = synthetic_cover_resolver();
+            let (cover_port, cover) = synthetic_cover(SyntheticCover::Respond(response)).await;
+            let target = synthetic_reality_target(private_key, cover_port, resolver.clone());
+            let hello = synthetic_reality_client_hello([0; 8], synthetic_public_key(private_key));
+
+            let (result, _peer) = setup_against_cover(hello, &target, &resolver).await;
+            cover.abort();
+
+            let error = result
+                .err()
+                .expect("an authenticated request needs a usable TLS 1.3 cover response");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        }
     }
 
     #[tokio::test]

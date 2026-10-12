@@ -93,6 +93,17 @@ pub trait AsyncReadTargetedMessage {
     fn targeted_eof_on_empty(&self) -> bool {
         true
     }
+
+    /// Whether the stream's end arrives as an error instead of an empty read.
+    ///
+    /// A stream that can carry empty messages cannot report its end as an
+    /// empty read, because that read is a message. Such a stream reports its
+    /// end as an `UnexpectedEof` error and answers `true` here, so callers can
+    /// treat an expected end differently from a real failure.
+    fn read_error_is_end_of_stream(&self) -> bool {
+        false
+    }
+
     fn poll_read_targeted_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -425,6 +436,11 @@ impl<T: ?Sized + AsyncReadTargetedMessage + Unpin> AsyncReadTargetedMessage for 
     fn targeted_eof_on_empty(&self) -> bool {
         (**self).targeted_eof_on_empty()
     }
+
+    fn read_error_is_end_of_stream(&self) -> bool {
+        (**self).read_error_is_end_of_stream()
+    }
+
     fn poll_read_targeted_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -438,6 +454,11 @@ impl<T: ?Sized + AsyncReadTargetedMessage + Unpin> AsyncReadTargetedMessage for 
     fn targeted_eof_on_empty(&self) -> bool {
         (**self).targeted_eof_on_empty()
     }
+
+    fn read_error_is_end_of_stream(&self) -> bool {
+        (**self).read_error_is_end_of_stream()
+    }
+
     fn poll_read_targeted_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

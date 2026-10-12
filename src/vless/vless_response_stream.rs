@@ -14,6 +14,7 @@ pub struct VlessResponseStream<IO> {
     inner: IO,
     response_pending: bool,
     response_buffer: Vec<u8>,
+    pending_read: Vec<u8>,
 }
 
 impl<IO> VlessResponseStream<IO>
@@ -25,14 +26,16 @@ where
             inner,
             response_pending: true,
             response_buffer: Vec::new(),
+            pending_read: Vec::new(),
         }
     }
 
     fn poll_read_response(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         // Need to read at least 2 bytes for the response header
         while self.response_buffer.len() < 2 {
+            let remaining = 2 - self.response_buffer.len();
             let mut buf = [0u8; 2];
-            let mut read_buf = ReadBuf::new(&mut buf);
+            let mut read_buf = ReadBuf::new(&mut buf[..remaining]);
             ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read_buf))?;
 
             let filled = read_buf.filled();
@@ -79,6 +82,15 @@ where
             total_response_len, version, addon_length
         );
 
+        // Keep any bytes beyond the header so a payload byte coalesced with
+        // the header is not lost. The capped reads above make this empty in
+        // practice; it mirrors VisionStream's remainder handling.
+        if self.response_buffer.len() > total_response_len {
+            self.pending_read
+                .extend_from_slice(&self.response_buffer[total_response_len..]);
+            self.response_buffer.truncate(total_response_len);
+        }
+
         Poll::Ready(Ok(()))
     }
 }
@@ -92,6 +104,11 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        // A read with no capacity is a no-op, like the other streams.
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         // Read VLESS response header on first read
         if self.response_pending {
             match self.poll_read_response(cx) {
@@ -102,6 +119,15 @@ where
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
+        }
+
+        // Serve a payload byte coalesced with the header before touching the
+        // inner stream, so the byte order is preserved.
+        if !self.pending_read.is_empty() {
+            let len = buf.remaining().min(self.pending_read.len());
+            buf.put_slice(&self.pending_read[..len]);
+            self.pending_read.drain(..len);
+            return Poll::Ready(Ok(()));
         }
 
         // Pass through to inner stream
@@ -152,7 +178,7 @@ where
 {
     /// Reads reach the inner socket only after the response header is consumed.
     fn raw_read_socket(&self) -> Option<&TcpStream> {
-        if self.response_pending {
+        if self.response_pending || !self.pending_read.is_empty() {
             return None;
         }
         self.inner.raw_read_socket()
@@ -169,6 +195,7 @@ where
 mod tests {
     use super::*;
     use crate::linux_splice::test_hooks;
+    use std::collections::VecDeque;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{Duration, timeout};
@@ -179,6 +206,95 @@ mod tests {
         let (connector, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
         let (accepted, _) = accepted?;
         Ok((connector?, accepted))
+    }
+
+    /// Scripted inner stream that releases one queued chunk per read, capped
+    /// by the offered buffer like a socket. It reproduces a peer that splits
+    /// the 2-byte response as 1 byte, then coalesces the second header byte
+    /// with the first payload bytes.
+    struct SplitReadIo {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    impl AsyncRead for SplitReadIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let Some(front) = self.chunks.front_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+            if front.is_empty() {
+                self.chunks.pop_front();
+                return Poll::Ready(Ok(()));
+            }
+            let len = buf.remaining().min(front.len());
+            if len == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            buf.put_slice(&front[..len]);
+            front.drain(..len);
+            if front.is_empty() {
+                self.chunks.pop_front();
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for SplitReadIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for SplitReadIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for SplitReadIo {}
+
+    #[tokio::test]
+    async fn split_header_read_preserves_coalesced_payload_byte() -> std::io::Result<()> {
+        let payload = vec![0x11u8, 0x22, 0x33, 0x44];
+        let mut second = vec![0u8];
+        second.extend_from_slice(&payload);
+        let inner = SplitReadIo {
+            chunks: VecDeque::from([vec![0u8], second]),
+        };
+        let mut stream = VlessResponseStream::new(inner);
+        let mut received = vec![0u8; payload.len()];
+        timeout(Duration::from_secs(5), stream.read_exact(&mut received)).await??;
+        assert_eq!(
+            received, payload,
+            "a payload byte coalesced with a split header must survive"
+        );
+        assert!(
+            stream.pending_read.is_empty(),
+            "no coalesced payload byte may be left behind"
+        );
+        Ok(())
     }
 
     #[ignore = "process-wide counters; runs in an isolated process"]

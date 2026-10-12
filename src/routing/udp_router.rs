@@ -304,6 +304,18 @@ impl ServerStream {
             Self::Session(_) => false,
         }
     }
+
+    /// Whether the last server read error was an expected end of stream
+    /// rather than a transport or protocol failure.
+    fn read_error_is_end_of_stream(&self) -> bool {
+        match self {
+            Self::Targeted(stream) => stream.read_error_is_end_of_stream(),
+            // The session trait exposes no end marker; session ends keep the
+            // existing warning treatment.
+            Self::Session(_) => false,
+        }
+    }
+
     fn poll_read_message(
         &mut self,
         cx: &mut Context<'_>,
@@ -628,7 +640,11 @@ impl<'a> UdpRouter<'a> {
                     p
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("server read error: {}", e);
+                    if self.server.read_error_is_end_of_stream() {
+                        debug!("server stream ended: {}", e);
+                    } else {
+                        warn!("server read error: {}", e);
+                    }
                     self.set_server_read_eof();
                     break;
                 }
@@ -1565,7 +1581,7 @@ mod tests {
     use std::future::Future;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
     use crate::async_stream::AsyncStream;
     use crate::resolver::NativeResolver;
@@ -1839,6 +1855,70 @@ mod tests {
             *state.writes.lock().unwrap(),
             vec![Vec::new(), b"payload".to_vec()],
             "an empty datagram is a message and must not end the session read"
+        );
+    }
+
+    /// Encode one sing-mux SOCKS packet-address frame: address, length, payload.
+    fn append_packet_addr_frame(output: &mut Vec<u8>, destination: &SocketAddr, payload: &[u8]) {
+        match destination {
+            SocketAddr::V4(v4) => {
+                output.push(0x01);
+                output.extend_from_slice(&v4.ip().octets());
+                output.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            SocketAddr::V6(v6) => {
+                output.push(0x04);
+                output.extend_from_slice(&v6.ip().octets());
+                output.extend_from_slice(&v6.port().to_be_bytes());
+            }
+        }
+        output.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        output.extend_from_slice(payload);
+    }
+
+    #[tokio::test]
+    async fn a_zero_length_packet_addr_frame_is_forwarded_and_does_not_end_the_read() {
+        let destination = NetLocation::from_str("127.0.0.1:12345", None).unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let state = Arc::new(RemoteState::default());
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        let mut server = ServerStream::Targeted(Box::new(
+            crate::uot::SocksPacketAddrStream::new_socks(stream),
+        ));
+        let mut router = test_router(&mut server);
+
+        router.sessions.insert(
+            0,
+            RoutingSession::new(
+                destination.clone(),
+                1,
+                remote_addr,
+                LookupKey::Destination(destination.clone()),
+                Box::new(RecordingRemote {
+                    state: Arc::clone(&state),
+                }),
+            ),
+        );
+        let SessionLookup::ByDestination(lookup) = &mut router.session_lookup else {
+            unreachable!()
+        };
+        lookup.insert(destination, KeyState::Active(0));
+
+        let mut frames = Vec::new();
+        append_packet_addr_frame(&mut frames, &remote_addr, b"");
+        append_packet_addr_frame(&mut frames, &remote_addr, b"payload");
+        peer.write_all(&frames).await.unwrap();
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+        assert!(
+            !router.server_read_eof,
+            "an empty packet-address datagram must not end the read direction"
+        );
+        assert_eq!(
+            *state.writes.lock().unwrap(),
+            vec![Vec::new(), b"payload".to_vec()]
         );
     }
 

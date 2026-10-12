@@ -107,6 +107,9 @@ struct H2MuxUdpMessageStream {
     // Write buffer for assembling length-prefixed messages
     write_buffer: BytesMut,
     write_pos: usize,
+    /// Set when the stream ended between messages, which is a clean end even
+    /// though it is reported as an error.
+    ended_between_messages: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +129,7 @@ impl H2MuxUdpMessageStream {
             read_buffer: Vec::new(),
             write_buffer: BytesMut::with_capacity(65537),
             write_pos: 0,
+            ended_between_messages: false,
         }
     }
 
@@ -154,6 +158,16 @@ impl std::fmt::Debug for H2MuxUdpMessageStream {
 impl Unpin for H2MuxUdpMessageStream {}
 
 impl AsyncReadMessage for H2MuxUdpMessageStream {
+    /// A length-prefixed frame with a zero length is an empty datagram, so this
+    /// stream reports its end as an error instead of an empty read.
+    fn read_message_eof_on_empty(&self) -> bool {
+        false
+    }
+
+    fn read_error_is_end_of_stream(&self) -> bool {
+        self.ended_between_messages
+    }
+
     fn poll_read_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -171,8 +185,13 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
                         let n = temp_buf.filled().len();
                         if n == 0 {
                             if this.read_header_pos == 0 {
-                                // EOF at message boundary - return empty
-                                return Poll::Ready(Ok(()));
+                                // EOF at a message boundary is a clean end, but it
+                                // must not read as an empty message.
+                                this.ended_between_messages = true;
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "message stream closed",
+                                )));
                             }
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
@@ -285,6 +304,7 @@ impl AsyncMessageStream for H2MuxUdpMessageStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -315,17 +335,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_read_distinguishes_eof_from_truncated_frames() {
-        for (packet, expected_error) in [
-            (b"".as_slice(), None),
-            (b"\0".as_slice(), Some("EOF while reading message header")),
+    async fn message_read_distinguishes_clean_eof_from_truncated_frames() {
+        for (packet, expected_error, expected_clean_end) in [
+            (b"".as_slice(), "message stream closed", true),
+            (b"\0".as_slice(), "EOF while reading message header", false),
             (
                 b"\0\x03a".as_slice(),
-                Some("EOF while reading message data"),
+                "EOF while reading message data",
+                false,
             ),
         ] {
             let (stream, mut peer) = tokio::io::duplex(1024);
             let mut stream = H2MuxUdpMessageStream::new(Box::new(stream));
+            assert!(
+                !stream.read_message_eof_on_empty(),
+                "a zero-length frame cannot mean end-of-stream"
+            );
             peer.write_all(packet).await.unwrap();
             peer.shutdown().await.unwrap();
 
@@ -335,15 +360,105 @@ mod tests {
                 Pin::new(&mut stream).poll_read_message(cx, &mut buffer)
             })
             .await;
-            if let Some(message) = expected_error {
-                let error = result.unwrap_err();
-                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-                assert_eq!(error.to_string(), message);
-            } else {
-                result.unwrap();
-            }
+            let error = result.expect_err("the stream ends as an error, never as an empty read");
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(error.to_string(), expected_error);
+            assert_eq!(stream.read_error_is_end_of_stream(), expected_clean_end);
             assert!(buffer.filled().is_empty());
         }
+    }
+
+    /// A message sink that records every message and reports its own clean end.
+    struct RecordingMessageSink {
+        messages: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl AsyncReadMessage for RecordingMessageSink {
+        fn read_error_is_end_of_stream(&self) -> bool {
+            true
+        }
+
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "sink ended",
+            )))
+        }
+    }
+
+    impl AsyncWriteMessage for RecordingMessageSink {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<()>> {
+            self.messages.lock().unwrap().push(buf.to_vec());
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for RecordingMessageSink {
+        fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for RecordingMessageSink {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for RecordingMessageSink {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for RecordingMessageSink {}
+
+    #[tokio::test]
+    async fn an_empty_message_does_not_end_the_copy() {
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        let mut reader = H2MuxUdpMessageStream::new(Box::new(stream));
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = RecordingMessageSink {
+            messages: Arc::clone(&messages),
+        };
+
+        // An empty message, a payload message, then end-of-stream.
+        let writer = tokio::spawn(async move {
+            peer.write_all(b"\0\0").await.unwrap();
+            peer.write_all(b"\0\x03abc").await.unwrap();
+            peer.shutdown().await.unwrap();
+        });
+
+        crate::copy_bidirectional_message::copy_bidirectional_message(
+            &mut reader,
+            &mut sink,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(
+            *messages.lock().unwrap(),
+            vec![Vec::new(), b"abc".to_vec()],
+            "an empty message must be copied as a message, not read as end-of-stream"
+        );
     }
 
     #[tokio::test]

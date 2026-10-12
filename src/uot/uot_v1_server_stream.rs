@@ -39,6 +39,15 @@ const SOCKS_ADDR_CODEC: AddressCodec = AddressCodec {
     write: write_socks_packet_address,
 };
 
+/// The end of a packet-address stream arrives as an error, because a
+/// zero-length frame is an empty datagram rather than end-of-stream.
+fn packet_addr_stream_closed() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "packet-address stream closed",
+    )
+}
+
 /// Packet-address stream for multi-destination UDP transports.
 pub struct PacketAddrStream<S> {
     stream: S,
@@ -53,6 +62,10 @@ pub struct PacketAddrStream<S> {
     write_buf_sent: usize,
 
     is_eof: bool,
+
+    /// True when the stream ended between frames; false when it ended
+    /// mid-frame.
+    ended_at_boundary: bool,
 }
 
 impl<S: AsyncStream> PacketAddrStream<S> {
@@ -65,6 +78,7 @@ impl<S: AsyncStream> PacketAddrStream<S> {
             write_buf_len: 0,
             write_buf_sent: 0,
             is_eof: false,
+            ended_at_boundary: false,
         }
     }
 
@@ -107,6 +121,18 @@ impl<S: AsyncStream> PacketAddrStream<S> {
 }
 
 impl<S: AsyncStream> AsyncReadTargetedMessage for PacketAddrStream<S> {
+    /// A zero-length payload frame is an empty datagram, so this stream reports
+    /// its end as an error instead of an empty read.
+    fn targeted_eof_on_empty(&self) -> bool {
+        false
+    }
+
+    /// A clean end is reported as an error only so it cannot be mistaken for
+    /// an empty datagram; the field still tells the two cases apart.
+    fn read_error_is_end_of_stream(&self) -> bool {
+        self.ended_at_boundary
+    }
+
     fn poll_read_targeted_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -121,7 +147,7 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for PacketAddrStream<S> {
         );
 
         if this.is_eof {
-            return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
+            return Poll::Ready(Err(packet_addr_stream_closed()));
         }
 
         loop {
@@ -173,7 +199,9 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for PacketAddrStream<S> {
                     log::trace!("PacketAddrStream: read {} bytes from stream", bytes_read);
                     if bytes_read == 0 {
                         this.is_eof = true;
-                        return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
+                        // A leftover partial frame means the peer stopped mid-frame.
+                        this.ended_at_boundary = this.read_buf.is_empty();
+                        return Poll::Ready(Err(packet_addr_stream_closed()));
                     }
                     this.read_buf.advance_write(bytes_read);
                     // Loop to try parsing again
@@ -403,5 +431,83 @@ mod tests {
         let mut actual = vec![0u8; expected.len()];
         server.read_exact(&mut actual).await.unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_zero_length_payload_frame_is_an_empty_datagram() {
+        let source = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 21), 5353));
+        let empty = encode_packet(write_socks_packet_address, &source, b"");
+        let frame = encode_packet(write_socks_packet_address, &source, b"after empty");
+
+        let (client, mut server) = tcp_pair().await.unwrap();
+        let mut stream = PacketAddrStream::new_socks(client);
+        assert!(
+            !stream.targeted_eof_on_empty(),
+            "a zero-length frame cannot mean end-of-stream"
+        );
+
+        let writer = tokio::spawn(async move {
+            server.write_all(&empty).await.unwrap();
+            server.write_all(&frame).await.unwrap();
+        });
+
+        let (location, read_payload) = read_packet(&mut stream).await.unwrap();
+        assert_eq!(location.to_socket_addr_nonblocking(), Some(source));
+        assert!(
+            read_payload.is_empty(),
+            "a zero-length payload frame is an empty datagram"
+        );
+
+        let (location, read_payload) = read_packet(&mut stream).await.unwrap();
+        assert_eq!(location.to_socket_addr_nonblocking(), Some(source));
+        assert_eq!(read_payload.as_slice(), b"after empty");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stream_end_is_reported_as_an_error_not_as_an_empty_frame() {
+        let source = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 23), 5354));
+        let frame = encode_packet(write_socks_packet_address, &source, b"payload");
+
+        let (client, mut server) = tcp_pair().await.unwrap();
+        let mut stream = PacketAddrStream::new_socks(client);
+
+        let writer = tokio::spawn(async move {
+            server.write_all(&frame).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let (location, read_payload) = read_packet(&mut stream).await.unwrap();
+        assert_eq!(location.to_socket_addr_nonblocking(), Some(source));
+        assert_eq!(read_payload.as_slice(), b"payload");
+
+        let error = read_packet(&mut stream).await.unwrap_err();
+        writer.await.unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "packet-address stream closed");
+        assert!(
+            stream.read_error_is_end_of_stream(),
+            "a stream end between frames is a clean end"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncated_frame_is_not_a_clean_stream_end() {
+        let (client, mut server) = tcp_pair().await.unwrap();
+        let mut stream = PacketAddrStream::new_socks(client);
+
+        // A partial SOCKS address: the peer stops in the middle of a frame.
+        let writer = tokio::spawn(async move {
+            server.write_all(&[0x01, 127, 0]).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+
+        let error = read_packet(&mut stream).await.unwrap_err();
+        writer.await.unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            !stream.read_error_is_end_of_stream(),
+            "a mid-frame end must stay a read error"
+        );
     }
 }
