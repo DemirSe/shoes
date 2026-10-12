@@ -15,8 +15,9 @@ const FRAMING_BUFFER_LEN: usize = u16::MAX as usize + 2;
 pub struct VlessMessageStream<S> {
     stream: S,
     /// Framing buffer for incoming messages. It is allocated on the first read
-    /// and given back while the stream waits with no partial message, so a relay
-    /// that is idle between messages does not hold it.
+    /// and kept after a delivered message so the next message reuses it; it
+    /// stays allocated until a poll reports Pending or the stream ends, so a
+    /// relay that is idle between messages does not hold it.
     read_buf: Box<[u8]>,
     read_end_index: usize,
     pending_write: Vec<u8>,
@@ -109,8 +110,9 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
                         this.read_end_index -= total_len;
                     } else {
                         // this.read_end_index == total_len
+                        // The delivered message consumed the whole buffer, so it
+                        // stays allocated for the next message.
                         this.read_end_index = 0;
-                        this.release_read_buf();
                     }
                     return Poll::Ready(Ok(()));
                 }
@@ -307,7 +309,100 @@ mod tests {
 
     impl AsyncStream for ScriptedIo {}
 
-    fn read_one(stream: &mut VlessMessageStream<ScriptedIo>) -> Poll<Result<Vec<u8>>> {
+    /// Inner stream that never becomes readable, so reads stay pending.
+    struct IdleIo;
+
+    impl AsyncRead for IdleIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for IdleIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for IdleIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for IdleIo {}
+
+    /// Inner stream that hands out a fixed number of bytes per poll.
+    struct OneFrameIo {
+        bytes: BytesMut,
+        frame_len: usize,
+    }
+
+    impl AsyncRead for OneFrameIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<Result<()>> {
+            let this = self.get_mut();
+            let len = buf.remaining().min(this.bytes.len()).min(this.frame_len);
+            buf.put_slice(&this.bytes[..len]);
+            this.bytes.advance(len);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for OneFrameIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for OneFrameIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for OneFrameIo {}
+
+    fn read_one<S: AsyncStream>(stream: &mut VlessMessageStream<S>) -> Poll<Result<Vec<u8>>> {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut bytes = [0u8; 64];
@@ -358,6 +453,139 @@ mod tests {
         assert!(
             !stream.read_error_is_end_of_stream(),
             "a truncated frame is not a clean end"
+        );
+    }
+
+    #[test]
+    fn a_delivered_message_keeps_the_framing_buffer_for_reuse() {
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&[0, 4, b'p', b'i', b'n', b'g']);
+        let mut stream = VlessMessageStream::new(ScriptedIo { bytes });
+
+        assert!(
+            matches!(read_one(&mut stream), Poll::Ready(Ok(payload)) if payload == b"ping"),
+            "the frame must be delivered"
+        );
+        assert_eq!(stream.read_end_index, 0);
+        assert!(
+            !stream.read_buf.is_empty(),
+            "a delivered message must keep the framing buffer for the next one"
+        );
+    }
+
+    #[test]
+    fn an_idle_read_gives_the_framing_buffer_back() {
+        let mut stream = VlessMessageStream::new(IdleIo);
+
+        assert!(matches!(read_one(&mut stream), Poll::Pending));
+        assert_eq!(stream.read_end_index, 0);
+        assert!(
+            stream.read_buf.is_empty(),
+            "an idle stream must not hold the framing buffer"
+        );
+    }
+
+    #[test]
+    fn an_idle_read_with_partial_data_keeps_the_framing_buffer() {
+        let mut stream = VlessMessageStream::new(IdleIo);
+        stream.feed_initial_read_data(&[0, 4, b'p']).unwrap();
+
+        assert!(matches!(read_one(&mut stream), Poll::Pending));
+        assert_eq!(stream.read_end_index, 3);
+        assert!(
+            !stream.read_buf.is_empty(),
+            "a partial message must keep the framing buffer"
+        );
+    }
+
+    #[test]
+    fn consecutive_deliveries_reuse_the_retained_framing_buffer() {
+        // Two frames coalesced in one read: the first delivery shifts the
+        // second to the front, and the retained buffer serves it without a
+        // reallocation.
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&[0, 4, b'p', b'i', b'n', b'g']);
+        bytes.extend_from_slice(&[0, 4, b'p', b'o', b'n', b'g']);
+        let mut stream = VlessMessageStream::new(ScriptedIo { bytes });
+
+        assert!(
+            matches!(read_one(&mut stream), Poll::Ready(Ok(payload)) if payload == b"ping"),
+            "the first frame must be delivered"
+        );
+        let retained_ptr = stream.read_buf.as_ptr();
+        assert!(
+            !stream.read_buf.is_empty(),
+            "the framing buffer must be retained after the first delivery"
+        );
+        assert!(
+            matches!(read_one(&mut stream), Poll::Ready(Ok(payload)) if payload == b"pong"),
+            "the second frame must be served from the retained buffer"
+        );
+        assert_eq!(
+            stream.read_buf.as_ptr(),
+            retained_ptr,
+            "consecutive deliveries must not reallocate the framing buffer"
+        );
+        assert!(
+            !stream.read_buf.is_empty(),
+            "the framing buffer must still be retained after the second delivery"
+        );
+    }
+
+    #[test]
+    fn an_end_of_stream_after_a_delivery_gives_the_framing_buffer_back() {
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&[0, 4, b'p', b'i', b'n', b'g']);
+        let mut stream = VlessMessageStream::new(ScriptedIo { bytes });
+
+        assert!(
+            matches!(read_one(&mut stream), Poll::Ready(Ok(payload)) if payload == b"ping"),
+            "the frame must be delivered"
+        );
+        assert!(!stream.read_buf.is_empty());
+
+        // The stream is exhausted now; the next read reports the end and the
+        // framing buffer goes back.
+        match read_one(&mut stream) {
+            Poll::Ready(Err(error)) => {
+                assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+                assert!(stream.ended_between_messages);
+            }
+            other => panic!("the end of the stream must be reported as an error, got {other:?}"),
+        }
+        assert!(
+            stream.read_buf.is_empty(),
+            "the framing buffer must go back at the end of the stream"
+        );
+    }
+
+    #[test]
+    fn a_retained_framing_buffer_is_reused_by_the_next_poll() {
+        // One frame per poll: the second message arrives on a later poll and
+        // must be read into the retained buffer, not a fresh allocation.
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&[0, 4, b'p', b'i', b'n', b'g']);
+        bytes.extend_from_slice(&[0, 4, b'p', b'o', b'n', b'g']);
+        let mut stream = VlessMessageStream::new(OneFrameIo {
+            bytes,
+            frame_len: 6,
+        });
+
+        assert!(
+            matches!(read_one(&mut stream), Poll::Ready(Ok(payload)) if payload == b"ping"),
+            "the first frame must be delivered"
+        );
+        let retained_ptr = stream.read_buf.as_ptr();
+        assert!(!stream.read_buf.is_empty());
+
+        assert!(
+            matches!(read_one(&mut stream), Poll::Ready(Ok(payload)) if payload == b"pong"),
+            "the next poll must serve the second frame"
+        );
+        assert_eq!(
+            stream.read_buf.as_ptr(),
+            retained_ptr,
+            "the next poll must reuse the retained framing buffer"
         );
     }
 }

@@ -23,12 +23,20 @@ pub struct RecordEncryptor<'a> {
     key: &'a AeadKey,
     iv: &'a [u8],
     seq: &'a mut u64,
+    /// Staging buffer reused across fragments, so a fragment does not allocate
+    /// its own plaintext copy on every record.
+    scratch: Vec<u8>,
 }
 
 impl<'a> RecordEncryptor<'a> {
     #[inline]
     pub fn new(key: &'a AeadKey, iv: &'a [u8], seq: &'a mut u64) -> Self {
-        Self { key, iv, seq }
+        Self {
+            key,
+            iv,
+            seq,
+            scratch: Vec::new(),
+        }
     }
 
     /// Encrypt application data into TLS 1.3 records.
@@ -70,10 +78,12 @@ impl<'a> RecordEncryptor<'a> {
             let mut buf = data.to_vec();
             self.encrypt_record_in_place(&mut buf, out, CONTENT_TYPE_HANDSHAKE)?;
         } else {
-            for chunk in data.chunks(MAX_TLS_PLAINTEXT_LEN) {
-                let mut buf = chunk.to_vec();
-                self.encrypt_record_in_place(&mut buf, out, CONTENT_TYPE_HANDSHAKE)?;
-            }
+            let mut scratch = std::mem::take(&mut self.scratch);
+            let result = data.chunks(MAX_TLS_PLAINTEXT_LEN).try_for_each(|chunk| {
+                self.encrypt_fragment(chunk, &mut scratch, out, CONTENT_TYPE_HANDSHAKE)
+            });
+            self.scratch = scratch;
+            result?;
         }
 
         Ok(())
@@ -99,21 +109,28 @@ impl<'a> RecordEncryptor<'a> {
         // For very large data, fragment without padding
         if data.len() > MAX_TLS_PLAINTEXT_LEN {
             // Fragment into multiple records - only pad the last one if needed
-            let chunks: Vec<_> = data.chunks(MAX_TLS_PLAINTEXT_LEN).collect();
-            for (i, chunk) in chunks.iter().enumerate() {
-                let mut buf = chunk.to_vec();
-                if i == chunks.len() - 1 && target_record_size > 0 {
-                    // Last chunk - apply padding
-                    self.encrypt_record_with_padding(
-                        &mut buf,
-                        out,
-                        CONTENT_TYPE_HANDSHAKE,
-                        target_record_size,
-                    )?;
-                } else {
-                    self.encrypt_record_in_place(&mut buf, out, CONTENT_TYPE_HANDSHAKE)?;
-                }
-            }
+            let mut scratch = std::mem::take(&mut self.scratch);
+            let chunk_count = data.chunks(MAX_TLS_PLAINTEXT_LEN).len();
+            let result =
+                data.chunks(MAX_TLS_PLAINTEXT_LEN)
+                    .enumerate()
+                    .try_for_each(|(i, chunk)| {
+                        scratch.clear();
+                        scratch.extend_from_slice(chunk);
+                        if i == chunk_count - 1 && target_record_size > 0 {
+                            // Last chunk - apply padding
+                            self.encrypt_record_with_padding(
+                                &mut scratch,
+                                out,
+                                CONTENT_TYPE_HANDSHAKE,
+                                target_record_size,
+                            )
+                        } else {
+                            self.encrypt_record_in_place(&mut scratch, out, CONTENT_TYPE_HANDSHAKE)
+                        }
+                    });
+            self.scratch = scratch;
+            result?;
             return Ok(());
         }
 
@@ -245,6 +262,20 @@ impl<'a> RecordEncryptor<'a> {
         Ok(())
     }
 
+    /// Stage one fragment in the reused scratch buffer and encrypt it.
+    #[inline]
+    fn encrypt_fragment(
+        &mut self,
+        chunk: &[u8],
+        scratch: &mut Vec<u8>,
+        out: &mut Vec<u8>,
+        content_type: u8,
+    ) -> io::Result<()> {
+        scratch.clear();
+        scratch.extend_from_slice(chunk);
+        self.encrypt_record_in_place(scratch, out, content_type)
+    }
+
     /// Encrypt data larger than 16KB by fragmenting into multiple records.
     #[inline]
     fn encrypt_fragmented(
@@ -253,11 +284,12 @@ impl<'a> RecordEncryptor<'a> {
         out: &mut Vec<u8>,
         content_type: u8,
     ) -> io::Result<()> {
-        for chunk in data.chunks(MAX_TLS_PLAINTEXT_LEN) {
-            let mut buf = chunk.to_vec();
-            self.encrypt_record_in_place(&mut buf, out, content_type)?;
-        }
-        Ok(())
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let result = data
+            .chunks(MAX_TLS_PLAINTEXT_LEN)
+            .try_for_each(|chunk| self.encrypt_fragment(chunk, &mut scratch, out, content_type));
+        self.scratch = scratch;
+        result
     }
 }
 
@@ -539,6 +571,189 @@ mod tests {
         // Each record: header(5) + MAX_TLS_PLAINTEXT_LEN + content_type(1) + tag(16)
         let record_len = TLS_RECORD_HEADER_SIZE + MAX_TLS_PLAINTEXT_LEN + 1 + 16;
         assert_eq!(ciphertext_buf.len(), record_len * 3);
+    }
+
+    #[test]
+    fn test_fragmented_records_match_independent_chunk_encryption() {
+        // The reused scratch must not change the produced record bytes: the
+        // fragmented call has to match encrypting each chunk on its own.
+        let key = [0x21u8; 16];
+        let iv = [0x22u8; 12];
+        let aead_key = AeadKey::new(CS, &key).unwrap();
+        let data = vec![0x5Au8; MAX_TLS_PLAINTEXT_LEN * 2 + 7];
+
+        let mut fragmented = Vec::new();
+        {
+            let mut seq = 0u64;
+            let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut seq);
+            let mut plaintext = data.clone();
+            encryptor
+                .encrypt_app_data(&mut plaintext, &mut fragmented)
+                .unwrap();
+            assert!(plaintext.is_empty(), "the plaintext must still be cleared");
+        }
+
+        let mut per_chunk = Vec::new();
+        {
+            let mut seq = 0u64;
+            for chunk in data.chunks(MAX_TLS_PLAINTEXT_LEN) {
+                let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut seq);
+                let mut plaintext = chunk.to_vec();
+                encryptor
+                    .encrypt_app_data(&mut plaintext, &mut per_chunk)
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(fragmented, per_chunk);
+    }
+
+    #[test]
+    fn test_reused_encryptor_reuses_scratch_and_keeps_records_identical() {
+        let aead_key = AeadKey::new(CS, &[0x31u8; 16]).unwrap();
+        let iv = [0x32u8; 12];
+        let mut seq = 0u64;
+        let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut seq);
+        let mut out = Vec::new();
+
+        let first = vec![0x11u8; MAX_TLS_PLAINTEXT_LEN + 5];
+        let mut plaintext = first.clone();
+        encryptor
+            .encrypt_app_data(&mut plaintext, &mut out)
+            .unwrap();
+        let first_call_len = out.len();
+        assert!(
+            encryptor.scratch.capacity() >= MAX_TLS_PLAINTEXT_LEN + 1 + 16,
+            "the fragment scratch must be retained for reuse"
+        );
+
+        let second = vec![0x22u8; MAX_TLS_PLAINTEXT_LEN + 5];
+        let mut plaintext = second.clone();
+        encryptor
+            .encrypt_app_data(&mut plaintext, &mut out)
+            .unwrap();
+        assert!(out.len() > first_call_len);
+
+        // A fresh encryptor encrypting the same sequence must produce the same bytes.
+        let mut fresh_out = Vec::new();
+        let mut fresh_seq = 0u64;
+        {
+            let mut fresh = RecordEncryptor::new(&aead_key, &iv, &mut fresh_seq);
+            let mut plaintext = first.clone();
+            fresh
+                .encrypt_app_data(&mut plaintext, &mut fresh_out)
+                .unwrap();
+            let mut plaintext = second.clone();
+            fresh
+                .encrypt_app_data(&mut plaintext, &mut fresh_out)
+                .unwrap();
+        }
+
+        assert_eq!(out, fresh_out);
+    }
+
+    #[test]
+    fn test_handshake_with_padding_pads_only_the_last_fragment() {
+        let aead_key = AeadKey::new(CS, &[0x41u8; 16]).unwrap();
+        let iv = [0x42u8; 12];
+        let mut enc_seq = 0u64;
+        let mut ciphertext = Vec::new();
+
+        let data = vec![0x77u8; MAX_TLS_PLAINTEXT_LEN + 100];
+        let target_record_size = TLS_RECORD_HEADER_SIZE + 16 + 200;
+        {
+            let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut enc_seq);
+            encryptor
+                .encrypt_handshake_with_padding(&data, &mut ciphertext, target_record_size)
+                .unwrap();
+        }
+
+        assert_eq!(enc_seq, 2);
+        let first_record_len = TLS_RECORD_HEADER_SIZE + MAX_TLS_PLAINTEXT_LEN + 1 + 16;
+        assert_eq!(ciphertext.len(), first_record_len + target_record_size);
+
+        // Decrypt both records and reassemble the original handshake bytes.
+        let mut dec_seq = 0u64;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut dec_seq);
+        let mut reassembled = Vec::new();
+        let mut offset = 0;
+        while offset < ciphertext.len() {
+            let record_len = u16::from_be_bytes([ciphertext[offset + 3], ciphertext[offset + 4]]);
+            let record = &ciphertext[offset + 5..offset + 5 + record_len as usize];
+            let (content_type, plaintext) =
+                decrypt_record(&mut decryptor, record, record_len).unwrap();
+            assert_eq!(content_type, CONTENT_TYPE_HANDSHAKE);
+            reassembled.extend_from_slice(&plaintext);
+            offset += TLS_RECORD_HEADER_SIZE + record_len as usize;
+        }
+        assert_eq!(reassembled, data);
+    }
+
+    #[test]
+    fn test_fragment_error_keeps_the_scratch_buffer() {
+        let aead_key = AeadKey::new(CS, &[0x51u8; 16]).unwrap();
+        let iv = [0x52u8; 12];
+        let mut seq = u64::MAX;
+        let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut seq);
+        let mut out = Vec::new();
+        let mut plaintext = vec![0x33u8; MAX_TLS_PLAINTEXT_LEN + 8];
+
+        assert!(
+            encryptor
+                .encrypt_app_data(&mut plaintext, &mut out)
+                .is_err(),
+            "an exhausted sequence number must fail"
+        );
+        assert!(
+            encryptor.scratch.capacity() >= MAX_TLS_PLAINTEXT_LEN,
+            "the scratch must be stored back on the error path"
+        );
+    }
+
+    #[test]
+    fn test_fragmented_handshake_matches_independent_chunk_encryption() {
+        let aead_key = AeadKey::new(CS, &[0x61u8; 16]).unwrap();
+        let iv = [0x62u8; 12];
+        let data = vec![0x44u8; MAX_TLS_PLAINTEXT_LEN * 2 + 3];
+
+        let mut fragmented = Vec::new();
+        {
+            let mut seq = 0u64;
+            let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut seq);
+            encryptor.encrypt_handshake(&data, &mut fragmented).unwrap();
+        }
+
+        let mut per_chunk = Vec::new();
+        {
+            let mut seq = 0u64;
+            for chunk in data.chunks(MAX_TLS_PLAINTEXT_LEN) {
+                let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut seq);
+                encryptor.encrypt_handshake(chunk, &mut per_chunk).unwrap();
+            }
+        }
+
+        assert_eq!(fragmented, per_chunk);
+    }
+
+    #[test]
+    fn test_fragmented_handshake_with_zero_target_stays_unpadded() {
+        let aead_key = AeadKey::new(CS, &[0x71u8; 16]).unwrap();
+        let iv = [0x72u8; 12];
+        let mut seq = 0u64;
+        let mut ciphertext = Vec::new();
+        let data = vec![0x55u8; MAX_TLS_PLAINTEXT_LEN + 100];
+
+        {
+            let mut encryptor = RecordEncryptor::new(&aead_key, &iv, &mut seq);
+            encryptor
+                .encrypt_handshake_with_padding(&data, &mut ciphertext, 0)
+                .unwrap();
+        }
+
+        assert_eq!(seq, 2);
+        let full_record_len = TLS_RECORD_HEADER_SIZE + MAX_TLS_PLAINTEXT_LEN + 1 + 16;
+        let tail_record_len = TLS_RECORD_HEADER_SIZE + 100 + 1 + 16;
+        assert_eq!(ciphertext.len(), full_record_len + tail_record_len);
     }
 
     #[test]

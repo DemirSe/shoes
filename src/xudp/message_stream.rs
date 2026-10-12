@@ -579,22 +579,15 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             return Poll::Ready(Ok(()));
         };
         let wire_session_id = route.wire_session_id;
-        let target_location = route.original_destination.clone();
-
         log::debug!(
             "[XUDP SESSION WRITE] Using original destination {} for session {} (response came from {})",
-            target_location,
+            route.original_destination,
             wire_session_id,
             target
         );
-
-        let metadata = FrameMetadata {
-            session_id: wire_session_id,
-            status: SessionStatus::Keep,
-            option: FrameOption::new().with_data(),
-            target: Some(target_location.clone()),
-            network: Some(TargetNetwork::Udp),
-        };
+        // The borrow of `route` ends here; a single clone carries the
+        // destination into the frame metadata below.
+        let target_location = route.original_destination.clone();
 
         log::debug!(
             "[XUDP SESSION WRITE] Encoding {:?} frame: session_id={}, target={}, data_len={}",
@@ -603,6 +596,14 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             target_location,
             buf.len()
         );
+
+        let metadata = FrameMetadata {
+            session_id: wire_session_id,
+            status: SessionStatus::Keep,
+            option: FrameOption::new().with_data(),
+            target: Some(target_location),
+            network: Some(TargetNetwork::Udp),
+        };
 
         // Encode metadata
         metadata.encode(&mut self.write_buffer)?;
@@ -1047,6 +1048,54 @@ mod tests {
             *output.lock().unwrap(),
             [0, 12, 0, 10, 2, 1, 2, 0, 53, 1, 127, 0, 0, 1, 0, 1, b'x']
         );
+    }
+
+    #[test]
+    fn hostname_response_frame_preserves_original_destination_bytes() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let inner = PendingOnceWriter {
+            output: Arc::clone(&output),
+            pending: false,
+        };
+        let mut stream = XudpMessageStream::new(Box::new(inner));
+        let destination = NetLocation::new(Address::Hostname("example.com".to_string()), 443);
+        stream.start_wire_session(10, destination.clone());
+        let route_id = stream
+            .get_or_create_route(10, &destination)
+            .unwrap()
+            .unwrap();
+        let source = "127.0.0.1:53".parse().unwrap();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write_session_message(&mut cx, route_id, b"hi", &source),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_flush_message(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        // The response must carry the original hostname destination, not the
+        // resolved source address. The expected frame is written out by hand
+        // so the check does not depend on the encoder under test.
+        let mut expected: Vec<u8> = vec![
+            0, 20, // metadata length
+            0, 10, // wire session id
+            2,  // SessionStatus::Keep
+            1,  // FrameOption::DATA
+            2,  // TargetNetwork::Udp
+            1, 187, // port 443
+            2,   // address type: hostname
+            11,  // hostname length
+        ];
+        expected.extend_from_slice(b"example.com");
+        expected.extend_from_slice(&[0, 2]); // data length
+        expected.extend_from_slice(b"hi");
+
+        let written = output.lock().unwrap().clone();
+        assert_eq!(written, expected);
     }
 
     #[test]
