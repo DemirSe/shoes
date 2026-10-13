@@ -68,6 +68,7 @@ mod h2mux;
 #[cfg(target_os = "linux")]
 mod linux_splice;
 mod listener_tasks;
+mod memory;
 mod option_util;
 mod prepend_stream;
 mod quic_endpoint;

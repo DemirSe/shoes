@@ -137,6 +137,7 @@ pub async fn run(
     };
     crate::resources::configure(prepared.limits)?;
     let _reporter = crate::resources::ResourceReporter::start();
+    crate::memory::spawn_heap_trim_task();
     let (mut registry, mut tasks, mut has_tun) = prepared.start().await?;
     let mut reload_pending = false;
     loop {

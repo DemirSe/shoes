@@ -416,6 +416,16 @@ Yerel A/B (release + `lto="fat"`, `black_box`, sıra değişimli):
 - REALITY kapak 5 sn deadline (fail-closed tasarım; sahip kısıtı).
 - Reload drenaj birikimi (`--no-reload` ile erişilemez).
 
+## Bellek: periyodik heap trim (2026-10-13)
+
+- Bulgu: 615 eşzamanlı bağlantılık stres sonrası RSS ~272 MB'ta kalıyor (glibc arena rezervi;
+  ikinci aynı stres RSS'i artırmıyor → sızıntı yok). VPS 967 MB RAM.
+- Ölçüm: `malloc_trim(0)` 256-300 MB heap'te 0,02–15 ms; belleği 261 MB → 5 MB iade ediyor;
+  trim sonrası yeniden dokunma cezası ölçülemedi (0 fark).
+- Çözüm: `src/memory.rs` — 5 dk aralıkla, yalnızca RSS > 64 MB **ve** aktif bağlantı < 16 iken,
+  `spawn_blocking` içinde `libc::malloc_trim(0)`. Sıcak yola etkisi yok; wire/stok istemci etkisi yok.
+- Testler: karar mantığı + VmRSS okuma + FFI smoke + (ignored) trim maliyet bench'i.
+
 ## Kararlar (2026-10-13)
 
 - LH-1–LH-5 uygulandı ve kaldı; LH-6/LH-7 kod tavanı olarak uygulandı (4096 stream / 2048 hedef,

@@ -13,6 +13,7 @@ mod h2mux;
 mod linux_splice;
 mod listener_tasks;
 mod logging;
+mod memory;
 mod option_util;
 mod prepend_stream;
 mod quic_endpoint;
