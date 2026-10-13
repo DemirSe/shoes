@@ -431,3 +431,34 @@ Yerel A/B (release + `lto="fat"`, `black_box`, sıra değişimli):
 
 - LH-1–LH-5 uygulandı ve kaldı; LH-6/LH-7 kod tavanı olarak uygulandı (4096 stream / 2048 hedef,
   açık config her zaman kazanır); LH-8–LH-11 belgelendi (kod değişikliği yok).
+
+## Kod sadeleştirme paketi 1 (2026-10-13)
+
+Üç bağımsız model incelemesi (GPT-6.1 Sol, Muse Spark, DS V4.1) + GPT değerlendirmesi
+sonucu seçilen ilk üç madde; her biri ayrı onay + iki bağımsız testten geçti:
+
+| No | Düzeltme | Dosya | Doğrulama |
+|---|---|---|---|
+| E01 | Etkisiz `bind_ip` parametre zinciri kaldırıldı | `src/tcp/tcp_server_handler_factory.rs`, `src/tcp/tcp_server.rs` | GPT onay + Muse/DS test |
+| E06 | Çağrısız FFI log yardımcıları (`write_to_log_file`, `flush_log_file`) kaldırıldı | `src/ffi/common.rs` | GPT onay + Muse/DS test |
+| E05 | Boş startup cleanup döngüsü `?` ile sadeleştirildi | `src/tcp/tcp_server.rs` | GPT şartlı onay + Muse/DS test |
+
+Sıcak yol dokunulmadı; performans regresyonu riski düşük (A/B gerekli görülmedi).
+Son aday kapıları: fmt, clippy `--all-features`, birim 1981/0, FFI 977/0, entegrasyon 97/0.
+Kanıtlar: `~/.local/state/shoes-live/code-review-2026-10-13/`.
+
+### TF01 — Destek testlerinde efemer-port yarışı
+
+Tarih: 2026-10-13. Durum: açık. Öncelik: orta (test güvenilirliği borcu; üretim regresyonu değil).
+
+`port_helper::tests::readiness_uses_the_shared_deadline`, `tests/support/src/port_helper.rs:329`
+üzerinde `unwrap_err()` çağrısına `Ok(())` gelince düşüyor. Test, geçici listener'ı kapattıktan
+sonra bağlantı deniyor; paralel yerel testlerin aynı portu alması beklenen başarısız bağlantıyı
+başarıya çevirebiliyor. Gözlenen hata süre assertion'ı değil, beklenmedik bağlantı başarısıdır.
+
+Muse ve DS bağımsız yeniden üretti; DS aynı hata modunu `shoes` kodunu çalıştırmadan destek
+paketinde üretti (E05 ile ilgisiz). Ölçümler: izole 0/100 ve 0/200; paket threads=8 1/100;
+threads=16 1/20 (+2 ayrı `AddrInUse`). Test/helper dosyası değişmemiştir.
+
+Ayrı görev: başarısız bağlantı/deadline senaryosunu paralel port yeniden kullanımından bağımsız
+tasarlamak; testi atlamak, `Ok` sonucunu başarı saymak veya yeşile kadar tekrar etmek çözüm değildir.

@@ -1,6 +1,5 @@
 //! Factory functions for creating TCP server handlers from config.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -27,12 +26,10 @@ use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 /// * `server_proxy_config` - The protocol configuration
 /// * `client_proxy_selector` - Selector for outbound proxy routing
 /// * `resolver` - DNS resolver
-/// * `bind_ip` - Optional bind IP forwarded to nested TLS/REALITY targets
 pub fn create_tcp_server_handler(
     server_proxy_config: ServerProxyConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
-    bind_ip: Option<IpAddr>,
 ) -> Box<dyn TcpServerHandler> {
     match server_proxy_config {
         ServerProxyConfig::Vless {
@@ -57,24 +54,18 @@ pub fn create_tcp_server_handler(
                 .map(|(sni, config)| {
                     (
                         sni,
-                        create_tls_server_target(config, client_proxy_selector, resolver, bind_ip),
+                        create_tls_server_target(config, client_proxy_selector, resolver),
                     )
                 })
                 .collect::<FxHashMap<String, TlsServerTarget>>();
-            let default_tls_target = default_tls_target.map(|config| {
-                create_tls_server_target(*config, client_proxy_selector, resolver, bind_ip)
-            });
+            let default_tls_target = default_tls_target
+                .map(|config| create_tls_server_target(*config, client_proxy_selector, resolver));
             let reality_server_targets = reality_targets
                 .into_iter()
                 .map(|(sni, config)| {
                     (
                         sni,
-                        create_reality_server_target(
-                            config,
-                            client_proxy_selector,
-                            resolver,
-                            bind_ip,
-                        ),
+                        create_reality_server_target(config, client_proxy_selector, resolver),
                     )
                 })
                 .collect::<FxHashMap<String, TlsServerTarget>>();
@@ -93,7 +84,6 @@ fn create_tls_server_target(
     tls_server_config: TlsServerConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
-    bind_ip: Option<IpAddr>,
 ) -> TlsServerTarget {
     let TlsServerConfig {
         cert,
@@ -152,7 +142,7 @@ fn create_tls_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver);
         InnerProtocol::Normal(handler)
     };
 
@@ -167,7 +157,6 @@ fn create_reality_server_target(
     reality_server_config: RealityServerConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
-    bind_ip: Option<IpAddr>,
 ) -> TlsServerTarget {
     let RealityServerConfig {
         limit_fallback_upload,
@@ -229,7 +218,7 @@ fn create_reality_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver);
         InnerProtocol::Normal(handler)
     };
 

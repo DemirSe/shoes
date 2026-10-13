@@ -3,7 +3,6 @@
 //! This module contains platform-independent code that both iOS and Android use.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -99,26 +98,6 @@ pub fn setup_log_file(path_str: &str) -> i32 {
             0
         }
         Err(_) => -1,
-    }
-}
-
-/// Write a log message to the log file if configured.
-pub fn write_to_log_file(level: log::Level, target: &str, message: &str) {
-    if let Some(file_mutex) = LOG_FILE.get() {
-        let mut guard = file_mutex.lock();
-        if let Some(ref mut writer) = *guard {
-            let _ = writeln!(writer, "{} [{}] {}", level, target, message);
-        }
-    }
-}
-
-/// Flush the log file.
-pub fn flush_log_file() {
-    if let Some(file_mutex) = LOG_FILE.get() {
-        let mut guard = file_mutex.lock();
-        if let Some(ref mut writer) = *guard {
-            let _ = writer.flush();
-        }
     }
 }
 

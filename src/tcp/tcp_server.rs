@@ -381,27 +381,15 @@ async fn start_configured_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = Vec::with_capacity(3);
-
-    match config.transport {
-        Transport::Tcp => match start_tcp_servers(config.clone(), resolver).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
+    let join_handles = match config.transport {
+        Transport::Tcp => start_tcp_servers(config.clone(), resolver).await?,
         Transport::Udp => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "UDP listeners are not supported",
             ));
         }
-    }
+    };
 
     if join_handles.is_empty() {
         return Err(std::io::Error::other(format!(
@@ -587,7 +575,6 @@ fn prepare_tcp_servers_inner(
                             protocol.clone(),
                             &client_proxy_selector,
                             &resolver,
-                            Some(socket_addr.ip()),
                         )
                         .into();
                         handlers.insert(socket_addr.ip(), handler.clone());
@@ -617,8 +604,7 @@ fn prepare_tcp_servers_inner(
                     ));
                 }
                 let tcp_handler: Arc<dyn TcpServerHandler> =
-                    create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
-                        .into();
+                    create_tcp_server_handler(protocol, &client_proxy_selector, &resolver).into();
                 let listener = match previous.unix.get(&path_buf) {
                     Some(listener) => listener.clone(),
                     None => Arc::new(OwnedUnixListener::bind(path_buf.clone())?),
