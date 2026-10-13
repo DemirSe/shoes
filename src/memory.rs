@@ -17,7 +17,7 @@ const TRIM_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 /// Only trim when the resident set exceeds this; a small process does not need
 /// the trim at all.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-const TRIM_RSS_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+const TRIM_RSS_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Only trim while the server is not busy: normal browsing keeps a few dozen
 /// connections open, and the measured trim cost (0.02-15 ms, on a blocking
