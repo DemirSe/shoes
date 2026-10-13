@@ -422,8 +422,9 @@ Yerel A/B (release + `lto="fat"`, `black_box`, sıra değişimli):
   ikinci aynı stres RSS'i artırmıyor → sızıntı yok). VPS 967 MB RAM.
 - Ölçüm: `malloc_trim(0)` 256-300 MB heap'te 0,02–15 ms; belleği 261 MB → 5 MB iade ediyor;
   trim sonrası yeniden dokunma cezası ölçülemedi (0 fark).
-- Çözüm: `src/memory.rs` — 5 dk aralıkla, yalnızca RSS > 64 MB **ve** aktif bağlantı < 16 iken,
+- Çözüm: `src/memory.rs` — 5 dk aralıkla, yalnızca RSS > 64 MB **ve** aktif bağlantı < 128 iken,
   `spawn_blocking` içinde `libc::malloc_trim(0)`. Sıcak yola etkisi yok; wire/stok istemci etkisi yok.
+  (Eşik 16→128: normal kullanım 20-40 bağlantı açtığı için 16 kapısı pratikte hiç açılmıyordu.)
 - Testler: karar mantığı + VmRSS okuma + FFI smoke + (ignored) trim maliyet bench'i.
 
 ## Kararlar (2026-10-13)
