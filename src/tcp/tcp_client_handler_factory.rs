@@ -7,7 +7,6 @@ use log::debug;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::{ClientProxyConfig, RuleActionConfig, RuleConfig, TlsClientConfig};
 use crate::h2mux::H2MuxClientHandler;
-use crate::resolver::Resolver;
 use crate::rustls_config_util::create_client_config;
 use crate::tcp::chain_builder::build_client_chain_group;
 use crate::tcp::tcp_handler::TcpClientHandler;
@@ -18,7 +17,6 @@ use crate::vless::vless_client_handler::VlessTcpClientHandler;
 pub fn create_tcp_client_handler(
     client_proxy_config: ClientProxyConfig,
     default_sni_hostname: Option<String>,
-    resolver: Arc<dyn Resolver>,
 ) -> Box<dyn TcpClientHandler> {
     match client_proxy_config {
         ClientProxyConfig::Direct => {
@@ -110,7 +108,7 @@ pub fn create_tcp_client_handler(
                     *udp_enabled,
                 ))
             } else {
-                let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+                let handler = create_tcp_client_handler(*protocol, None);
 
                 Box::new(TlsClientHandler::new(
                     client_config,
@@ -172,7 +170,7 @@ pub fn create_tcp_client_handler(
                     ),
                 )
             } else {
-                let inner_handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+                let inner_handler = create_tcp_client_handler(*protocol, None);
                 Box::new(crate::reality_client_handler::RealityClientHandler::new(
                     public_key_bytes,
                     short_id_bytes,
@@ -185,10 +183,7 @@ pub fn create_tcp_client_handler(
     }
 }
 
-pub fn create_tcp_client_proxy_selector(
-    rules: Vec<RuleConfig>,
-    resolver: Arc<dyn Resolver>,
-) -> ClientProxySelector {
+pub fn create_tcp_client_proxy_selector(rules: Vec<RuleConfig>) -> ClientProxySelector {
     let rules = rules
         .into_iter()
         .map(|rule_config| {
@@ -198,7 +193,7 @@ pub fn create_tcp_client_proxy_selector(
                     override_address,
                     client_chains,
                 } => {
-                    let chain_group = build_client_chain_group(client_chains, resolver.clone());
+                    let chain_group = build_client_chain_group(client_chains);
                     ConnectAction::new_allow(override_address, chain_group)
                 }
                 RuleActionConfig::Block => ConnectAction::new_block(),

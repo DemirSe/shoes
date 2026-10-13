@@ -226,7 +226,7 @@ mod tests {
     fn test_provider_is_clone() {
         // RuntimeProvider requires Clone
         let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain_group = Arc::new(build_direct_chain_group());
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
         let _cloned = provider.clone();
@@ -241,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn test_bind_udp_works_directly() {
         let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain_group = Arc::new(build_direct_chain_group());
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
 
@@ -262,7 +262,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
         let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain_group = Arc::new(build_direct_chain_group());
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
 
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn test_create_handle() {
         let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain_group = Arc::new(build_direct_chain_group());
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
         let _handle = provider.create_handle();
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn test_quic_binder_available() {
         let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain_group = Arc::new(build_direct_chain_group());
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
         assert!(provider.quic_binder().is_some());
@@ -407,7 +407,7 @@ mod tests {
         );
         let bootstrap = Arc::new(NativeResolver::new());
         let provider = ProxyRuntimeProvider::with_bootstrap(
-            Arc::new(build_direct_chain_group(bootstrap.clone())),
+            Arc::new(build_direct_chain_group()),
             bootstrap,
             Duration::from_secs(5),
         );

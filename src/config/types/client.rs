@@ -48,56 +48,6 @@ impl H2MuxConfig {
     }
 }
 
-/// Custom deserializer for TlsClientConfig.
-fn deserialize_tls_client_config<'de, D>(deserializer: D) -> Result<TlsClientConfig, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct TlsClientConfigTemp {
-        #[serde(default = "default_true")]
-        verify: bool,
-        #[serde(alias = "server_fingerprint", default)]
-        server_fingerprints: NoneOrSome<String>,
-        #[serde(default)]
-        sni_hostname: NoneOrOne<String>,
-        #[serde(alias = "alpn_protocol", default)]
-        alpn_protocols: NoneOrSome<String>,
-        #[serde(default)]
-        tls_buffer_size: Option<usize>,
-        #[serde(default)]
-        key: Option<String>,
-        #[serde(default)]
-        cert: Option<String>,
-        #[serde(default)]
-        vision: bool,
-        protocol: Box<ClientProxyConfig>,
-    }
-
-    let temp = TlsClientConfigTemp::deserialize(deserializer)?;
-
-    Ok(TlsClientConfig {
-        verify: temp.verify,
-        server_fingerprints: temp.server_fingerprints,
-        sni_hostname: temp.sni_hostname,
-        alpn_protocols: temp.alpn_protocols,
-        tls_buffer_size: temp.tls_buffer_size,
-        key: temp.key,
-        cert: temp.cert,
-        vision: temp.vision,
-        protocol: temp.protocol,
-    })
-}
-
-/// Variant deserializer for Tls in ClientProxyConfig enum
-fn deserialize_tls_variant<'de, D>(deserializer: D) -> Result<TlsClientConfig, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserialize_tls_client_config(deserializer)
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
@@ -163,7 +113,6 @@ pub enum ClientProxyConfig {
 
         protocol: Box<ClientProxyConfig>,
     },
-    #[serde(deserialize_with = "deserialize_tls_variant")]
     Tls(TlsClientConfig),
 }
 
@@ -183,7 +132,8 @@ impl ClientProxyConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsClientConfig {
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub verify: bool,
@@ -223,6 +173,245 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     const TEST_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn assert_tls_deserialization_paths(yaml: &str) -> TlsClientConfig {
+        let direct: TlsClientConfig = serde_yaml::from_str(yaml).expect("untagged TLS config");
+        let tagged: ClientProxyConfig =
+            serde_yaml::from_str(&format!("type: tls\n{yaml}")).expect("tagged TLS config");
+        let ClientProxyConfig::Tls(tls) = tagged else {
+            panic!("expected TLS");
+        };
+        assert_eq!(format!("{direct:?}"), format!("{tls:?}"));
+        let serialized = serde_yaml::to_string(&ClientProxyConfig::Tls(tls.clone())).unwrap();
+        let roundtrip: ClientProxyConfig = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(
+            format!("{:?}", ClientProxyConfig::Tls(tls.clone())),
+            format!("{roundtrip:?}")
+        );
+        tls
+    }
+
+    #[test]
+    fn test_tls_deserializer_defaults_and_explicit_fields() {
+        let tls = assert_tls_deserialization_paths(&format!(
+            "protocol:\n  type: vless\n  user_id: {TEST_UUID}\n"
+        ));
+        assert!(tls.verify);
+        assert!(!tls.vision);
+        assert!(matches!(tls.server_fingerprints, NoneOrSome::Unspecified));
+        assert!(matches!(tls.alpn_protocols, NoneOrSome::Unspecified));
+        assert!(matches!(tls.sni_hostname, NoneOrOne::Unspecified));
+        assert!(tls.tls_buffer_size.is_none());
+        assert!(tls.key.is_none());
+        assert!(tls.cert.is_none());
+        let ClientProxyConfig::Vless {
+            user_id,
+            udp_enabled,
+            h2mux,
+        } = *tls.protocol
+        else {
+            panic!("expected VLESS");
+        };
+        assert_eq!(user_id, TEST_UUID);
+        assert!(udp_enabled);
+        assert!(h2mux.is_none());
+
+        let yaml = format!(
+            "verify: false\nvision: true\nserver_fingerprints: [fingerprint]\n\
+             sni_hostname: test.local\nalpn_protocols: [h2, http/1.1]\n\
+             tls_buffer_size: 4096\nkey: test-key\ncert: test-cert\n\
+             protocol:\n  type: vless\n  user_id: {TEST_UUID}\n  udp_enabled: false\n"
+        );
+        let tls = assert_tls_deserialization_paths(&yaml);
+        // Nondefault fields must serialize unchanged, including the nested protocol.
+        assert_eq!(
+            serde_yaml::to_value(&tls).unwrap(),
+            serde_yaml::from_str::<serde_yaml::Value>(&yaml).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_tls_deserializer_alias_null_and_list_matrix() {
+        for (canonical, alias) in [
+            ("server_fingerprints", "server_fingerprint"),
+            ("alpn_protocols", "alpn_protocol"),
+        ] {
+            for value in ["null", "h2", "[h2]", "[h2, http/1.1]", "[]"] {
+                let canonical_tls = assert_tls_deserialization_paths(&format!(
+                    "{canonical}: {value}\nprotocol:\n  type: direct\n"
+                ));
+                let alias_tls = assert_tls_deserialization_paths(&format!(
+                    "{alias}: {value}\nprotocol:\n  type: direct\n"
+                ));
+                assert_eq!(format!("{canonical_tls:?}"), format!("{alias_tls:?}"));
+                let field = if canonical == "server_fingerprints" {
+                    &canonical_tls.server_fingerprints
+                } else {
+                    &canonical_tls.alpn_protocols
+                };
+                match (value, field) {
+                    ("null", NoneOrSome::None) => (),
+                    ("h2", NoneOrSome::One(v)) => assert_eq!(v, "h2"),
+                    ("[h2]", NoneOrSome::Some(v)) => assert_eq!(v, &["h2"]),
+                    ("[h2, http/1.1]", NoneOrSome::Some(v)) => {
+                        assert_eq!(v, &["h2", "http/1.1"]);
+                    }
+                    ("[]", NoneOrSome::Some(v)) => assert!(v.is_empty()),
+                    _ => panic!("unexpected {canonical}: {value} => {field:?}"),
+                }
+                let serialized = serde_yaml::to_value(&alias_tls).unwrap();
+                assert!(serialized.get(alias).is_none());
+                assert_eq!(
+                    serialized.get(canonical).unwrap(),
+                    &serde_yaml::from_str::<serde_yaml::Value>(value).unwrap()
+                );
+            }
+        }
+        let tls = assert_tls_deserialization_paths(
+            "sni_hostname: null\ntls_buffer_size: null\nkey: null\ncert: null\nprotocol:\n  type: direct\n",
+        );
+        assert!(matches!(tls.sni_hostname, NoneOrOne::None));
+        assert!(tls.tls_buffer_size.is_none());
+        assert!(tls.key.is_none());
+        assert!(tls.cert.is_none());
+        let tls = assert_tls_deserialization_paths(
+            "sni_hostname: test.local\nprotocol:\n  type: direct\n",
+        );
+        assert!(matches!(tls.sni_hostname, NoneOrOne::One(ref sni) if sni == "test.local"));
+    }
+
+    #[test]
+    fn test_tls_deserializer_rejection_matrix() {
+        for (fields, error) in [
+            ("wrong_field: true\n", "unknown field `wrong_field`"),
+            (
+                "shadowtls_password: secret\n",
+                "unknown field `shadowtls_password`",
+            ),
+            ("verify: null\n", "invalid type"),
+            ("verify: []\n", "invalid type"),
+            ("vision: null\n", "invalid type"),
+            ("vision: []\n", "invalid type"),
+            ("tls_buffer_size: -1\n", "invalid value"),
+            ("tls_buffer_size: []\n", "invalid type"),
+            (
+                "server_fingerprints: h2\nserver_fingerprint: h2\n",
+                "duplicate field `server_fingerprints`",
+            ),
+            (
+                "alpn_protocols: h2\nalpn_protocol: h2\n",
+                "duplicate field `alpn_protocols`",
+            ),
+            ("verify: true\nverify: false\n", "duplicate field `verify`"),
+        ] {
+            let yaml = format!("{fields}protocol:\n  type: direct\n");
+            let direct = serde_yaml::from_str::<TlsClientConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            // YAML's direct and internally tagged deserializers classify negative usize differently.
+            let direct_error = if fields == "tls_buffer_size: -1\n" {
+                "invalid type"
+            } else {
+                error
+            };
+            assert!(direct.contains(direct_error), "{yaml}: {direct}");
+            let tagged = format!("type: tls\n{yaml}");
+            let err = serde_yaml::from_str::<ClientProxyConfig>(&tagged)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(error), "{tagged}: {err}");
+            let client = format!(
+                "protocol:\n{}",
+                tagged
+                    .lines()
+                    .map(|line| format!("  {line}\n"))
+                    .collect::<String>()
+            );
+            let err = serde_yaml::from_str::<ClientConfig>(&client)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(error), "{client}: {err}");
+        }
+        for (yaml, error) in [
+            ("type: tls\n", "missing field `protocol`"),
+            ("type: tls\nprotocol: null\n", "invalid type"),
+            (
+                "type: tls\nprotocol:\n  type: vless\n",
+                "missing field `user_id`",
+            ),
+            (
+                "type: tls\nprotocol:\n  type: tls\n  typo: true\n  protocol:\n    type: direct\n",
+                "unknown field `typo`",
+            ),
+        ] {
+            let err = serde_yaml::from_str::<ClientProxyConfig>(yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(error), "{yaml}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_tls_deserializer_nested_reality_matrix() {
+        let vless = format!("type: vless\nuser_id: {TEST_UUID}\n");
+        let indent = |yaml: &str| {
+            yaml.lines()
+                .map(|line| format!("  {line}\n"))
+                .collect::<String>()
+        };
+        for fields in [
+            "",
+            "cipher_suite: TLS_AES_128_GCM_SHA256\nsni_hostname: null\nignored_field: true\n",
+            "cipher_suites: [TLS_AES_128_GCM_SHA256]\nshort_id: 0123456789abcdef\nsni_hostname: test.local\nvision: true\n",
+        ] {
+            for inner in [
+                vless.clone(),
+                format!(
+                    "type: tls\nserver_fingerprint: null\nalpn_protocol: []\nprotocol:\n{}",
+                    indent(&vless)
+                ),
+            ] {
+                let reality = format!(
+                    "type: reality\npublic_key: test-public-key\n{fields}protocol:\n{}",
+                    indent(&inner)
+                );
+                let parsed: ClientProxyConfig = serde_yaml::from_str(&reality).unwrap();
+                let ClientProxyConfig::Reality {
+                    short_id,
+                    cipher_suites,
+                    sni_hostname,
+                    ..
+                } = &parsed
+                else {
+                    panic!("expected REALITY");
+                };
+                assert_eq!(
+                    short_id,
+                    if fields.contains("short_id:") {
+                        "0123456789abcdef"
+                    } else {
+                        "0000000000000000"
+                    }
+                );
+                assert_eq!(
+                    sni_hostname.as_deref(),
+                    if fields.contains("test.local") {
+                        Some("test.local")
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(cipher_suites.is_unspecified(), fields.is_empty());
+                let serialized = serde_yaml::to_string(&parsed).unwrap();
+                assert!(!serialized.contains("ignored_field"));
+                let roundtrip: ClientProxyConfig = serde_yaml::from_str(&serialized).unwrap();
+                assert_eq!(format!("{parsed:?}"), format!("{roundtrip:?}"));
+                let tls =
+                    assert_tls_deserialization_paths(&format!("protocol:\n{}", indent(&reality)));
+                assert_eq!(format!("{:?}", tls.protocol), format!("{parsed:?}"));
+            }
+        }
+    }
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig {

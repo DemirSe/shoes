@@ -2333,10 +2333,7 @@ mod tests {
         let resolver: Arc<dyn Resolver> = Arc::new(StalledResolver);
         let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
             vec![crate::address::NetLocationMask::from("0.0.0.0/0").unwrap()],
-            ConnectAction::new_allow(
-                None,
-                crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
-            ),
+            ConnectAction::new_allow(None, crate::tcp::chain_builder::build_direct_chain_group()),
         )]));
         let mut router = UdpRouter::new(&mut server, selector, resolver, false);
         let destination = NetLocation::from_str("delayed.invalid:53", None).unwrap();

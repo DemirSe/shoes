@@ -561,16 +561,15 @@ async fn build_entry_and_plan(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Build client chain group
-    let chain_resolver = Arc::new(NativeResolver::new());
     let chain_group = if spec.client_chains.is_empty() {
-        Arc::new(build_direct_chain_group(chain_resolver))
+        Arc::new(build_direct_chain_group())
     } else {
         let chains = if spec.client_chains.len() == 1 {
             NoneOrSome::One(spec.client_chains[0].clone())
         } else {
             NoneOrSome::Some(spec.client_chains.clone())
         };
-        Arc::new(build_client_chain_group(chains, chain_resolver))
+        Arc::new(build_client_chain_group(chains))
     };
 
     // Build or get bootstrap resolver
@@ -593,7 +592,7 @@ async fn build_entry_and_plan(
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
                 let native = Arc::new(NativeResolver::new());
-                let direct_chain = Arc::new(build_direct_chain_group(native.clone()));
+                let direct_chain = Arc::new(build_direct_chain_group());
                 // Bootstrap resolvers use default timeout (10s) and 2 attempts
                 let bootstrap_entry = ParsedDnsServerEntry::new(
                     bootstrap_server,
@@ -690,7 +689,7 @@ mod tests {
         Arc<dyn Resolver>,
     ) {
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-        let chain = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain = Arc::new(build_direct_chain_group());
         (chain, resolver)
     }
 
@@ -850,8 +849,8 @@ mod tests {
     #[test]
     fn test_different_chain_groups_prevent_pooling() {
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-        let chain_a = Arc::new(build_direct_chain_group(resolver.clone()));
-        let chain_b = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain_a = Arc::new(build_direct_chain_group());
+        let chain_b = Arc::new(build_direct_chain_group());
 
         let entry_a = make_entry(
             ParsedDnsServer::Udp {

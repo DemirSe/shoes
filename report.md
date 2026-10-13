@@ -462,3 +462,26 @@ threads=16 1/20 (+2 ayrı `AddrInUse`). Test/helper dosyası değişmemiştir.
 
 Ayrı görev: başarısız bağlantı/deadline senaryosunu paralel port yeniden kullanımından bağımsız
 tasarlamak; testi atlamak, `Ok` sonucunu başarı saymak veya yeşile kadar tekrar etmek çözüm değildir.
+
+## Kod sadeleştirme paketi 2 (2026-10-13)
+
+Aynı incelemenin 4–7. adayları; her biri GPT onayı + Muse/DS bağımsız testlerinden geçti:
+
+| No | Düzeltme | Dosya | Doğrulama |
+|---|---|---|---|
+| E36 | `validate_and_expand_selection` → `validate_selection` (yanıltıcı ad) | `src/config/validate.rs` | GPT onay + Muse/DS test |
+| E03 | Kopya TLS deserializer birleştirildi (`Deserialize` + `deny_unknown_fields`) | `src/config/types/client.rs` | Şartlı onay → 3 koşul karşılandı (baseline provenance dahil) |
+| E04 | TLS/REALITY target kurulumu iki helper'a çıkarıldı | `src/tcp/tcp_server_handler_factory.rs` | Şartlı onay → koşul 3 izleme görevine |
+| E02 | Etkisiz constructor resolver taşıması kaldırıldı | `src/tcp/`, `src/dns/`, `src/tun/`, `src/client_proxy_selector.rs`, `src/routing/udp_router.rs` (11 dosya) | Şartlı onay → koşul 3 izleme görevine |
+
+Sıcak yol dokunulmadı; runtime resolver sahipliği ve connect yolları korundu (15 kritik dosya byte-identical).
+Son aday kapıları: workspace 1993, FFI 983, parse-only entegrasyon 4, fmt/clippy/check yeşil.
+
+### E02/E04 test kapsamı takibi — açık, orta öncelik
+
+E02 kaynak/sahiplik eşdeğerliği ve bağımsız çevrimdışı kapılarla kabul edildi; tam dinamik matris kapanmadı.
+Ayrı runtime görevinde client-chain direct TCP/UDP ve proxy hostname yolları, DNS bootstrap-proxy tüketimi,
+IPv4/IPv6 sayaçları, hata/literal ve TUN/router resolver kimliği sınansın. E04'ün taşıma/cover görevine
+factory 0/1/N zincir içeriği, hop sayısı/sırası, UDP yeteneği ve override bağımsızlığı eklensin.
+Aynı eski/yeni fixture'lar kullanılsın; kurulum DNS/connect yapmasın. Runtime testleri injected resolver ve
+loopback ile sınırlı olsun; ağ/VPS erişimi yok. Bu kabul hız kazancı veya Hiddify platform uyumu kanıtı değildir.

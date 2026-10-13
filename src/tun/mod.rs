@@ -384,7 +384,7 @@ pub async fn run_tun_from_config(
     }
 
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
+    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules));
 
     run_tun_server(
         tun_server_config,

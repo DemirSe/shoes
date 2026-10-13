@@ -549,10 +549,7 @@ fn prepare_tcp_servers_inner(
 
     let tcp_config = tcp_settings.unwrap_or_else(TcpConfig::default);
 
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
-        rules.clone(),
-        resolver.clone(),
-    ));
+    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules.clone()));
 
     let mut prepared = vec![];
 

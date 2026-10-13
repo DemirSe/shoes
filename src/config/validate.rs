@@ -1208,19 +1208,19 @@ fn validate_client_chain_hop(
 ) -> std::io::Result<()> {
     match hop {
         ClientChainHop::Single(selection) => {
-            validate_and_expand_selection(selection, client_groups, named_pems)?;
+            validate_selection(selection, client_groups, named_pems)?;
         }
         ClientChainHop::Pool(selections) => {
             for selection in selections.iter_mut() {
-                validate_and_expand_selection(selection, client_groups, named_pems)?;
+                validate_selection(selection, client_groups, named_pems)?;
             }
         }
     }
     Ok(())
 }
 
-/// Validates a ConfigSelection and expands group references to inline configs.
-fn validate_and_expand_selection(
+/// Validates a ConfigSelection; group expansion happens in expand_client_chain.
+fn validate_selection(
     selection: &mut ConfigSelection<ClientConfig>,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     named_pems: &HashMap<String, String>,
