@@ -38,7 +38,7 @@ pub struct RealityServerTarget {
     /// For Vision mode, this is passed to the VLESS setup function.
     /// Inner handler already has this selector from construction.
     pub effective_selector: Arc<ClientProxySelector>,
-    /// What to do after Reality termination - normal handler, Vision VLESS, or Naive
+    /// What to do after REALITY termination - normal handler or Vision VLESS
     pub inner_protocol: InnerProtocol,
     /// Client chain for connecting to dest server (for fallback connections).
     pub dest_client_chain: ClientProxyChain,

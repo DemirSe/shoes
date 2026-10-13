@@ -1,7 +1,7 @@
 //! ProxyConnector trait - Wraps protocols on existing streams.
 //!
 //! This trait handles protocol setup for proxy connections. It is responsible for:
-//! - Setting up proxy protocols (VLESS, VMess, SOCKS5, etc.) on existing streams
+//! - Setting up VLESS and TLS/REALITY wrappers on existing streams
 //! - UDP-over-TCP tunneling through proxy protocols
 //!
 //! ## Design
@@ -30,7 +30,7 @@ use crate::tcp::tcp_handler::TcpClientSetupResult;
 ///
 /// ## Implementations
 ///
-/// - `TcpClientConnector`: For all proxy protocols (SOCKS5, HTTP, VMess, VLESS, etc.)
+/// - `ProxyConnectorImpl`: Delegates protocol setup to the configured TCP client handler
 #[async_trait]
 #[allow(
     clippy::double_must_use,

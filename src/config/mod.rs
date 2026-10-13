@@ -4,14 +4,13 @@
 //! - [`types`]: All configuration types (server, client, rules, etc.)
 //! - [`pem`]: PEM file handling and certificate loading
 //! - [`validate`]: Configuration validation and server config creation
-//! - [`singbox`]: Sing-box JSON configuration conversion
-//! - [`convert_util`]: Utilities for preprocessing JSON-like configs
+//! - [`production`]: Opt-in production profile validation
 //!
 //! The main entry points are:
 //! - [`load_configs`]: Load config files from disk
 //! - [`convert_cert_paths`]: Convert PEM file paths to inline data
 //! - [`create_server_configs`]: Validate and create final server configs
-//! - [`singbox::convert_singbox_config`]: Convert sing-box configs to shoes format
+//! - [`validate_production_profile`]: Check the opt-in production requirements
 
 mod pem;
 mod production;

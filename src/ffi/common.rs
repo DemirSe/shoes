@@ -152,7 +152,7 @@ pub fn is_service_running() -> bool {
 /// Start the service from a config YAML string.
 ///
 /// This parses the config YAML and starts both TUN and any Server configs
-/// (like mixed HTTP+SOCKS5 servers) that are defined in the config.
+/// (such as VLESS servers) that are defined in the config.
 /// The config YAML must already have device_fd set in the TUN config.
 pub async fn start_from_config(
     config_yaml: &str,
@@ -218,7 +218,7 @@ pub async fn start_from_config(
         std::io::Error::new(std::io::ErrorKind::InvalidData, "No TUN config found")
     })?;
 
-    // Start TCP servers (like mixed)
+    // Start configured TCP servers
     let mut join_handles = ServerTasks(Vec::new());
 
     for server_config in server_configs {

@@ -1,5 +1,5 @@
 // XUDP frame protocol implementation
-// Protocol-agnostic UDP multiplexing used by VLESS and VMess
+// Protocol-agnostic UDP multiplexing used by VLESS in this build
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::net::{Ipv4Addr, Ipv6Addr};

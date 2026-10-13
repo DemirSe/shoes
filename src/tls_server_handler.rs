@@ -54,7 +54,7 @@ pub enum TlsServerTarget {
 pub struct TlsServerHandler {
     sni_targets: FxHashMap<String, TlsServerTarget>,
     default_target: Option<TlsServerTarget>,
-    // used to resolve ShadowTLS handshake server hostnames and reality fallback destinations
+    // Used for REALITY cover connections and Vision VLESS destination/fallback resolution
     fallback_resolver: Arc<dyn Resolver>,
     tls_buffer_size: Option<usize>,
 }

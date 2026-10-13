@@ -485,3 +485,18 @@ IPv4/IPv6 sayaçları, hata/literal ve TUN/router resolver kimliği sınansın. 
 factory 0/1/N zincir içeriği, hop sayısı/sırası, UDP yeteneği ve override bağımsızlığı eklensin.
 Aynı eski/yeni fixture'lar kullanılsın; kurulum DNS/connect yapmasın. Runtime testleri injected resolver ve
 loopback ile sınırlı olsun; ağ/VPS erişimi yok. Bu kabul hız kazancı veya Hiddify platform uyumu kanıtı değildir.
+
+## Kod sadeleştirme paketi 3 (2026-10-14)
+
+| No | Düzeltme | Kapsam | Doğrulama |
+|---|---|---|---|
+| E11 | Kaldırılmış protokol, modül ve implementasyonlara ilişkin yanıltıcı yorumlar düzeltildi; Android `mixed` örneği VLESS oldu | 9 Rust dosyası; yalnız yorum | Şart karşılandı; nihai kabul; Muse/DS geçti |
+| E20 | DoT/DoH/HTTP-3 ve hickory bağımlılık feature açıklaması düzeltildi | `src/dns/mod.rs`; yalnız yorum | Muse/DS geçti; feature/kurucu yolları doğrulandı |
+
+Toplam 10 dosya, +20/−17; yorum dışı içerik byte-identical. fmt/clippy/birim/FFI kapıları geçti.
+Workspace: lib 978, bin 979, support 36 başarılı; FFI 983 başarılı; başarısız test yok.
+Ana lib/bin ve FFI özetlerindeki 36 ignored test çalıştırılmış sayılmadı.
+Entegrasyon/canlı ağ/perf testi yapılmadı; hız veya tam güvenlik kazanımı iddiası yok. Bu paket için deploy gerekmez.
+
+İsteğe bağlı takip: `Cargo.toml` keywords ve `src/client_proxy_chain.rs` mock etiketlerini güncel kapsamla hizalamak.
+Bunlar runtime destek kanıtı değildir; mevcut kabulün koşulu değildir. Ret literal'leri ve tarihsel atıflar korunur.

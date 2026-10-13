@@ -1,6 +1,6 @@
 // XUDP message stream - protocol-agnostic UDP session multiplexing
 // Wraps any AsyncStream and provides XUDP frame encoding/decoding with session management
-// Used by both VLESS and VMess protocols
+// Used by VLESS in this build
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::ready;
@@ -32,7 +32,7 @@ pub(crate) const MAX_XUDP_ROUTES: usize = 1024;
 pub(crate) const MAX_XUDP_SESSIONS: usize = 16_384;
 
 pub struct XudpMessageStream {
-    /// Underlying byte stream (VLESS VisionStream, VMess stream, or any TLS stream) that reads/writes raw XUDP frame bytes
+    /// Underlying byte stream (e.g. a VLESS VisionStream or TLS stream) carrying raw XUDP frame bytes
     inner_stream: Box<dyn AsyncStream>,
 
     /// Read buffer for incoming XUDP frames. The first `read_filled` bytes are
@@ -122,7 +122,7 @@ impl XudpMessageStream {
     }
 
     /// Feed initial unparsed data into the read buffer
-    /// Used when protocol header parsing (VLESS/VMess) consumed data that belongs to XUDP frames
+    /// Used when VLESS header parsing read ahead into XUDP frame data
     pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
         if data.is_empty() {
             return Ok(());

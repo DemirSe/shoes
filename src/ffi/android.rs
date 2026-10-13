@@ -166,7 +166,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_setLogFile<'local>(
 /// # Arguments
 /// * `unowned` - JNI environment
 /// * `_class` - Java class (unused)
-/// * `config_yaml` - YAML configuration string (includes TUN config with device_fd and optional Server configs like mixed)
+/// * `config_yaml` - YAML configuration string (includes TUN config with device_fd and optional Server configs such as VLESS)
 /// * `protect_callback` - Java object with protect(int fd) method
 ///
 /// # Returns
