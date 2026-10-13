@@ -154,6 +154,16 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for PacketAddrStream<S> {
             // Try to parse a complete packet from buffered data
             match this.try_parse_packet()? {
                 Some((location, payload_start, payload_len)) => {
+                    // A packet larger than the caller's buffer must fail without
+                    // consuming the frame: `ReadBuf::put_slice` panics otherwise,
+                    // and consuming would lose the packet. The buffered frame
+                    // stays intact for the next read with a larger buffer.
+                    if payload_len > buf.remaining() {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "buffer too small for incoming message",
+                        )));
+                    }
                     let data = this.read_buf.as_slice();
                     buf.put_slice(&data[payload_start..payload_start + payload_len]);
 
@@ -417,6 +427,42 @@ mod tests {
         writer.await.unwrap();
 
         assert!(err.to_string().contains("unknown SOCKS packet ATYP: 0"));
+    }
+
+    #[tokio::test]
+    async fn test_small_read_buffer_rejects_without_consuming_the_packet() {
+        let source = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 24), 5355));
+        let payload = b"a packet larger than the small read buffer";
+        let frame = encode_packet(write_socks_packet_address, &source, payload);
+
+        let (client, mut server) = tcp_pair().await.unwrap();
+        let mut stream = PacketAddrStream::new_socks(client);
+
+        let writer = tokio::spawn(async move {
+            server.write_all(&frame).await.unwrap();
+        });
+
+        // A buffer that cannot hold the payload must produce an error instead
+        // of a panic, and the packet must stay buffered for the next read.
+        let mut small = [0u8; 4];
+        let mut small_buf = ReadBuf::new(&mut small);
+        let error =
+            poll_fn(|cx| Pin::new(&mut stream).poll_read_targeted_message(cx, &mut small_buf))
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "buffer too small for incoming message");
+        assert!(
+            small_buf.filled().is_empty(),
+            "the rejected packet must not be partially delivered"
+        );
+
+        // The same packet is delivered intact once the caller offers room.
+        let (location, read_payload) = read_packet(&mut stream).await.unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(location.to_socket_addr_nonblocking(), Some(source));
+        assert_eq!(read_payload, payload);
     }
 
     #[tokio::test]

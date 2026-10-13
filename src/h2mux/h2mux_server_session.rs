@@ -38,6 +38,19 @@ const STREAM_WINDOW_SIZE: u32 = 256 * 1024; // 256 KB per stream
 const CONNECTION_WINDOW_SIZE: u32 = 1 << 20; // 1 MB (matches Go's http2 default)
 const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
+/// Safety ceiling for concurrent streams per connection when the configured
+/// `max_streams_per_connection` is omitted: one peer must not be able to spawn
+/// an unbounded number of stream tasks. An explicit configuration always wins.
+const SAFETY_MAX_STREAMS_PER_CONNECTION: usize = 4096;
+
+/// Effective per-connection stream limit: explicit configuration wins,
+/// otherwise the safety ceiling applies.
+fn effective_max_streams_per_connection() -> usize {
+    crate::resources::limits()
+        .max_streams_per_connection
+        .unwrap_or(SAFETY_MAX_STREAMS_PER_CONNECTION)
+}
+
 /// Channel buffer size for inbound streams
 const INBOUND_BUFFER: usize = 128;
 
@@ -132,11 +145,7 @@ impl H2MuxServerSession {
             .initial_window_size(STREAM_WINDOW_SIZE)
             .initial_connection_window_size(CONNECTION_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
-            .max_concurrent_streams(
-                crate::resources::limits()
-                    .max_streams_per_connection
-                    .unwrap_or(u32::MAX as usize) as u32,
-            )
+            .max_concurrent_streams(effective_max_streams_per_connection() as u32)
             .handshake(conn)
             .await
             .map_err(|e| io::Error::other(format!("H2 server handshake failed: {}", e)))?;
@@ -175,9 +184,9 @@ impl H2MuxServerSession {
         // Skip the first tick which returns immediately
         idle_timer.tick().await;
         let mut tasks = JoinSet::new();
-        let slots = Arc::new(crate::resources::Budget::new(
-            crate::resources::limits().max_streams_per_connection,
-        ));
+        let slots = Arc::new(crate::resources::Budget::new(Some(
+            effective_max_streams_per_connection(),
+        )));
 
         loop {
             tokio::select! {
@@ -611,5 +620,17 @@ mod tests {
         .unwrap();
         drop(inbound);
         drop(stream);
+    }
+
+    #[test]
+    fn omitted_stream_limit_falls_back_to_the_safety_ceiling() {
+        // Without an explicit configuration the per-connection stream count
+        // must be bounded by the safety ceiling instead of unlimited, and the
+        // ceiling value itself is part of the contract.
+        assert_eq!(
+            effective_max_streams_per_connection(),
+            SAFETY_MAX_STREAMS_PER_CONNECTION
+        );
+        assert_eq!(SAFETY_MAX_STREAMS_PER_CONNECTION, 4096);
     }
 }

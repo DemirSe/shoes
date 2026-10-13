@@ -22,6 +22,15 @@ use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
 
 pub(crate) const MAX_XUDP_ROUTES: usize = 1024;
 
+/// Hard cap on live wire sessions in one XUDP stream.
+///
+/// Each session is a small heap record (a map plus a destination, roughly
+/// 150 bytes) and holds no file descriptors, so even the cap stays far below
+/// any memory limit while exceeding what a legitimate client keeps open. The
+/// map still needs a bound: a peer can send `New` frames for fresh session IDs
+/// without ever ending them.
+pub(crate) const MAX_XUDP_SESSIONS: usize = 16_384;
+
 pub struct XudpMessageStream {
     /// Underlying byte stream (VLESS VisionStream, VMess stream, or any TLS stream) that reads/writes raw XUDP frame bytes
     inner_stream: Box<dyn AsyncStream>,
@@ -40,6 +49,17 @@ pub struct XudpMessageStream {
 
     /// Active protocol sessions and their independently routed destinations.
     wire_sessions: HashMap<u16, WireSession>,
+
+    /// Insertion order of wire sessions with their generation, used to evict
+    /// the oldest live session once `MAX_XUDP_SESSIONS` is reached. Entries for
+    /// replaced or closed sessions are skipped lazily when they surface and are
+    /// compacted once the queue outgrows the cap.
+    wire_session_order: VecDeque<(u16, u64)>,
+
+    /// Generation handed to the next wire session. Refreshing a session under
+    /// the same ID gives it a new generation, which marks older queue entries
+    /// stale so they cannot evict the replacement.
+    next_wire_session_generation: u64,
 
     /// Translates router identities back to protocol session IDs and destinations.
     routes: HashMap<MessageSessionId, RoutedSession>,
@@ -61,6 +81,9 @@ pub struct XudpMessageStream {
 struct WireSession {
     default_destination: NetLocation,
     routes: HashMap<NetLocation, MessageSessionId>,
+    /// Identifies this exact session instance in `wire_session_order`, so
+    /// stale order entries cannot evict a replacement that reused the ID.
+    generation: u64,
 }
 
 struct RoutedSession {
@@ -88,6 +111,8 @@ impl XudpMessageStream {
             write_buffer: BytesMut::with_capacity(65536),
             next_route_id: 1,
             wire_sessions: HashMap::new(),
+            wire_session_order: VecDeque::new(),
+            next_wire_session_generation: 0,
             routes: HashMap::new(),
             closed_routes: VecDeque::new(),
             resolver_cache: ResolverCache::new(resolver),
@@ -136,13 +161,55 @@ impl XudpMessageStream {
 
     fn start_wire_session(&mut self, wire_session_id: u16, destination: NetLocation) {
         self.close_wire_session(wire_session_id);
+
+        // Evict the oldest live session while the cap is reached. The queue can
+        // hold stale entries (replaced or closed sessions); a stale entry is
+        // skipped without closing a replacement that reused the same ID.
+        while self.wire_sessions.len() >= MAX_XUDP_SESSIONS {
+            let Some((oldest_id, generation)) = self.wire_session_order.pop_front() else {
+                log::warn!(
+                    "[XUDP SESSION] Wire session limit reached but no live session can be evicted; dropping new session {}",
+                    wire_session_id
+                );
+                return;
+            };
+            let is_live = self
+                .wire_sessions
+                .get(&oldest_id)
+                .is_some_and(|session| session.generation == generation);
+            if is_live {
+                log::debug!(
+                    "[XUDP SESSION] Evicting oldest wire session {} at the {}-session limit",
+                    oldest_id,
+                    MAX_XUDP_SESSIONS
+                );
+                self.close_wire_session(oldest_id);
+            }
+        }
+
+        let generation = self.next_wire_session_generation;
+        self.next_wire_session_generation = generation.wrapping_add(1);
+        // Stale entries are normally skipped by eviction, but a peer that keeps
+        // reopening sessions below the cap would grow the queue forever.
+        // Compacting once the queue outgrows the cap keeps it bounded
+        // (amortized O(1) per session start) without changing eviction order.
+        if self.wire_session_order.len() > MAX_XUDP_SESSIONS {
+            self.wire_session_order.retain(|(id, generation)| {
+                self.wire_sessions
+                    .get(id)
+                    .is_some_and(|session| session.generation == *generation)
+            });
+        }
         self.wire_sessions.insert(
             wire_session_id,
             WireSession {
                 default_destination: destination,
                 routes: HashMap::new(),
+                generation,
             },
         );
+        self.wire_session_order
+            .push_back((wire_session_id, generation));
     }
 
     fn get_or_create_route(
@@ -1203,6 +1270,132 @@ mod tests {
                 .get_or_create_route(20, &rejected_destination)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn wire_session_cap_evicts_the_oldest_session() {
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 53);
+        // One more New frame than the cap allows, all control-only so the
+        // stream processes every session without needing message delivery.
+        let mut frames = bytes::BytesMut::new();
+        for session_id in 0..=MAX_XUDP_SESSIONS as u16 {
+            let frame = xudp_frame(
+                session_id,
+                SessionStatus::New,
+                FrameOption::new(),
+                Some(destination.clone()),
+                None,
+            );
+            frames.extend_from_slice(&frame);
+        }
+        let mut stream = XudpMessageStream::new(Box::new(FrameReader {
+            bytes: frames.freeze(),
+            max_chunk: usize::MAX,
+        }));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0u8; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+
+        assert!(
+            Pin::new(&mut stream)
+                .poll_read_session_message(&mut cx, &mut buf)
+                .is_pending(),
+            "control-only New frames leave the stream waiting for data"
+        );
+        assert_eq!(stream.wire_sessions.len(), MAX_XUDP_SESSIONS);
+        assert!(
+            !stream.wire_sessions.contains_key(&0),
+            "the oldest session must be evicted at the cap"
+        );
+        assert!(
+            stream
+                .wire_sessions
+                .contains_key(&(MAX_XUDP_SESSIONS as u16)),
+            "the newest session must be admitted"
+        );
+    }
+
+    #[test]
+    fn wire_session_eviction_closes_the_oldest_sessions_routes() {
+        let mut stream = XudpMessageStream::new(Box::new(PendingOnceWriter {
+            output: Arc::new(Mutex::new(Vec::new())),
+            pending: false,
+        }));
+        let address = Address::Ipv4("127.0.0.1".parse().unwrap());
+        let oldest_destination = NetLocation::new(address.clone(), 1);
+        stream.start_wire_session(0, oldest_destination.clone());
+        let oldest_route = stream
+            .get_or_create_route(0, &oldest_destination)
+            .unwrap()
+            .unwrap();
+        for session_id in 1..MAX_XUDP_SESSIONS as u16 {
+            let destination = NetLocation::new(address.clone(), session_id + 1);
+            stream.start_wire_session(session_id, destination);
+        }
+        assert_eq!(stream.wire_sessions.len(), MAX_XUDP_SESSIONS);
+        assert_eq!(stream.take_closed_session(), None);
+
+        let new_destination = NetLocation::new(address.clone(), u16::MAX);
+        stream.start_wire_session(MAX_XUDP_SESSIONS as u16, new_destination);
+
+        assert_eq!(stream.wire_sessions.len(), MAX_XUDP_SESSIONS);
+        assert!(!stream.wire_sessions.contains_key(&0));
+        assert_eq!(
+            stream.take_closed_session(),
+            Some(oldest_route),
+            "the evicted session's routes must surface as closed"
+        );
+        assert_eq!(stream.take_closed_session(), None);
+    }
+
+    #[test]
+    fn refreshing_a_wire_session_id_does_not_evict_other_sessions() {
+        let mut stream = XudpMessageStream::new(Box::new(PendingOnceWriter {
+            output: Arc::new(Mutex::new(Vec::new())),
+            pending: false,
+        }));
+        let address = Address::Ipv4("127.0.0.1".parse().unwrap());
+        for session_id in 0..MAX_XUDP_SESSIONS as u16 {
+            let destination = NetLocation::new(address.clone(), session_id + 1);
+            stream.start_wire_session(session_id, destination);
+        }
+        assert_eq!(stream.wire_sessions.len(), MAX_XUDP_SESSIONS);
+
+        // Refreshing session 0 under the same ID replaces its old entry, so the
+        // cap must not force another session out and the stale order entry must
+        // not close the replacement.
+        let replacement_destination = NetLocation::new(address.clone(), 7);
+        stream.start_wire_session(0, replacement_destination.clone());
+        assert_eq!(stream.wire_sessions.len(), MAX_XUDP_SESSIONS);
+        assert_eq!(
+            stream.wire_sessions.get(&0).unwrap().default_destination,
+            replacement_destination
+        );
+        for session_id in 1..MAX_XUDP_SESSIONS as u16 {
+            assert!(
+                stream.wire_sessions.contains_key(&session_id),
+                "session {session_id} must survive the refresh of session 0"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_session_refresh_keeps_the_order_queue_bounded() {
+        let mut stream = XudpMessageStream::new(Box::new(PendingOnceWriter {
+            output: Arc::new(Mutex::new(Vec::new())),
+            pending: false,
+        }));
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 53);
+        stream.start_wire_session(0, destination.clone());
+        for _ in 0..(MAX_XUDP_SESSIONS * 3) {
+            stream.start_wire_session(0, destination.clone());
+        }
+        assert_eq!(stream.wire_sessions.len(), 1);
+        assert!(
+            stream.wire_session_order.len() <= MAX_XUDP_SESSIONS + 1,
+            "reopening one session must not grow the order queue without bound"
         );
     }
 

@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// Omitted admission caps are unlimited; transport buffer sizes remain finite.
+/// Omitted admission caps are unlimited, except the two per-connection caps
+/// that guard against resource exhaustion: `max_streams_per_connection` and
+/// `max_udp_destinations` fall back to code-side safety ceilings (4096 and
+/// 2048) when omitted. Transport buffer sizes remain finite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GlobalLimits {

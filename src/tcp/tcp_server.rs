@@ -50,6 +50,10 @@ async fn run_tcp_server(
             }
         };
         let Some(permit) = crate::resources::try_connection(Some(addr.ip())) else {
+            // The accepted socket is closed on drop; pause so a full budget
+            // cannot turn accept+close into a busy loop.
+            drop(stream);
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
 
@@ -100,6 +104,10 @@ async fn run_unix_server(
             }
         };
         let Some(permit) = crate::resources::try_connection(None) else {
+            // The accepted socket is closed on drop; pause so a full budget
+            // cannot turn accept+close into a busy loop.
+            drop(stream);
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
 

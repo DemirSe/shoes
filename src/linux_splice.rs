@@ -180,9 +180,11 @@ impl SplicePipe {
 
 /// Per-direction splice state for one relay direction.
 ///
-/// The pipe is allocated on the first splice attempt, so an ineligible or idle
-/// direction holds no descriptors. `pending` counts the bytes in the pipe
-/// exactly, which is what keeps the byte order across a fallback.
+/// The pipe is allocated on the first splice attempt and stays allocated for
+/// the rest of the connection; an idle direction keeps its descriptors until
+/// the direction is disabled and the pipe drains, or the state is dropped.
+/// `pending` counts the bytes in the pipe exactly, which is what keeps the
+/// byte order across a fallback.
 #[derive(Debug, Default)]
 pub struct SpliceState {
     pipe: Option<SplicePipe>,

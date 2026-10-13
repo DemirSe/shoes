@@ -59,6 +59,25 @@ const MAX_PENDING_SERVER_WRITES_PER_SESSION: usize = 4;
 
 /// Max concurrent session creation attempts (limits resource usage under burst)
 const MAX_PENDING_CREATES: usize = 16;
+
+/// Safety ceiling for destinations tracked by one routing stream when the
+/// configured `max_udp_destinations` is omitted: each destination holds one
+/// UDP socket, so the ceiling keeps a single peer from exhausting the
+/// process-wide file descriptor budget. An explicit configuration wins.
+const MAX_UDP_DESTINATIONS_PER_STREAM: usize = 2048;
+
+/// Effective per-stream destination limit: explicit configuration wins,
+/// otherwise the safety ceiling applies.
+fn effective_udp_destination_limit() -> usize {
+    crate::resources::limits()
+        .max_udp_destinations
+        .unwrap_or(MAX_UDP_DESTINATIONS_PER_STREAM)
+}
+
+/// True when another destination may not be admitted to this stream.
+fn destination_limit_reached(sessions: usize, pending: usize) -> bool {
+    sessions + pending >= effective_udp_destination_limit()
+}
 const MAX_STARTUP_PACKETS_PER_CREATE: usize = 4;
 const MAX_STARTUP_PACKETS: usize = MAX_PENDING_CREATES * MAX_STARTUP_PACKETS_PER_CREATE;
 const MAX_STARTUP_BYTES: usize = MAX_PENDING_CREATES * MAX_UDP_PACKET_SIZE;
@@ -503,6 +522,11 @@ impl<'a> UdpRouter<'a> {
             ServerStream::Session(_) => SessionLookup::BySessionId(FxHashMap::default()),
         };
 
+        // Skip missed ticks so a stalled runtime cannot queue a burst of ping
+        // checks that all run back to back once the executor resumes.
+        let mut ping_timer = tokio::time::interval(PING_CHECK_INTERVAL);
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         Self {
             server,
             session_lookup,
@@ -528,7 +552,7 @@ impl<'a> UdpRouter<'a> {
             remote_write_pool: BufferPool::new(REMOTE_WRITE_POOL_SIZE),
             server_write_pool: BufferPool::new(SERVER_WRITE_POOL_SIZE),
             expiry_queue: DelayQueue::new(),
-            ping_timer: tokio::time::interval(PING_CHECK_INTERVAL),
+            ping_timer,
             expiry_iteration: 0,
             last_server_write: Instant::now(),
             selector,
@@ -756,11 +780,10 @@ impl<'a> UdpRouter<'a> {
                     }
 
                     if self.pending_creates.len() >= MAX_PENDING_CREATES
-                        || crate::resources::limits()
-                            .max_udp_destinations
-                            .is_some_and(|limit| {
-                                self.sessions.len() + self.pending_creates.len() >= limit
-                            })
+                        || destination_limit_reached(
+                            self.sessions.len(),
+                            self.pending_creates.len(),
+                        )
                     {
                         debug!(
                             "Too many pending creates, dropping new session creation for {}",
@@ -2369,6 +2392,25 @@ mod tests {
         assert_eq!(router.startup_bytes.snapshot().active, 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn ping_timer_skips_missed_ticks_after_a_stall() {
+        let mut server = ServerStream::Targeted(Box::new(PacketSource::default()));
+        let mut router = test_router(&mut server);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        // `interval` reports its first tick immediately.
+        assert!(router.ping_timer.poll_tick(&mut cx).is_ready());
+
+        // A stalled runtime lets several check intervals elapse at once. With
+        // the default burst behavior every missed tick would run back to back.
+        tokio::time::advance(PING_CHECK_INTERVAL * 4).await;
+        assert!(router.ping_timer.poll_tick(&mut cx).is_ready());
+        assert!(
+            router.ping_timer.poll_tick(&mut cx).is_pending(),
+            "missed ticks must be skipped, not queued"
+        );
+    }
+
     #[tokio::test]
     async fn pending_packets_keep_order_and_a_single_flow_burst_uses_bounded_backpressure() {
         let destination = NetLocation::from_str("127.0.0.1:53", None).unwrap();
@@ -2567,5 +2609,17 @@ mod tests {
         assert_eq!(state.shutdown_polls.load(Ordering::SeqCst), 0);
         assert_eq!(state.drops.load(Ordering::SeqCst), 1);
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn omitted_udp_destination_limit_falls_back_to_the_safety_ceiling() {
+        // Without an explicit configuration the per-stream destination count
+        // must be bounded by the safety ceiling instead of unlimited.
+        let limit = effective_udp_destination_limit();
+        assert_eq!(limit, MAX_UDP_DESTINATIONS_PER_STREAM);
+        assert_eq!(MAX_UDP_DESTINATIONS_PER_STREAM, 2048);
+        assert!(!destination_limit_reached(limit - 1, 0));
+        assert!(destination_limit_reached(limit, 0));
+        assert!(destination_limit_reached(limit - 1, 1));
     }
 }

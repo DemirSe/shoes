@@ -372,3 +372,51 @@ Canlı sunucu, gerçek offline runner ve diğer platformlar üzerinde doğrulama
 Hiddify platform matrisi, tünel arızası sonrası sızıntı ve no-bypass uyumluluğu yeniden sınanmadı.
 Karşılaştırmalı hız, CPU ve tahsis ölçümü yapılmadı.
 Bu sonuçlar hız kazancı veya tam güvenlik kanıtı değildir.
+
+---
+
+# Uzun Ufuklu İnceleme (2026-10-13)
+
+Yöntem: iki bağımsız model taraması (av) + çapraz doğrulama (her adayı diğer model doğruladı) +
+iki bağımsız düzeltme + kapılar + yerel A/B. Kısıtlar: wire/format/fingerprint değişikliği yok;
+stok Xray/Hiddify uyumu ve full-TUN TCP `whatsapp.net` SNI yolu korunur. Bu bölüm dağıtım,
+bakım veya ayar değişikliği izni vermez. Değişiklikler commit edilmedi.
+
+## Uygulanan düzeltmeler
+
+| No | Düzeltme | Dosya | Test |
+|---|---|---|---|
+| LH-1 | `PacketAddrStream` teslim yolunda `put_slice` kapasite koruması (gizli panik; paket tüketilmeden `InvalidData`) | `src/uot/uot_v1_server_stream.rs` | `test_small_read_buffer_rejects_without_consuming_the_packet` |
+| LH-2 | UdpRouter ping timer `MissedTickBehavior::Skip` (stall sonrası tick birikimi) | `src/routing/udp_router.rs` | `ping_timer_skips_missed_ticks_after_a_stall` |
+| LH-3 | TCP/Unix accept red yoluna 100 ms throttle (bütçe doluyken accept+close busy-loop) | `src/tcp/tcp_server.rs` | mevcut limit testleri; zamanlayıcı testi eklenmedi |
+| LH-4 | XUDP `wire_sessions` tavanı 16 384 + nesil-damgalı O(1) amortized tahliye | `src/xudp/message_stream.rs` | 4 test: tavan, tahliye rotaları, yenileme, kuyruk sınırı |
+| LH-5 | `SpliceState` yanıltıcı yorumun düzeltilmesi (davranış değişikliği yok) | `src/linux_splice.rs` | — |
+| LH-6 | h2mux per-connection stream tavanı: config yoksa **4096** (açık config kazanır) | `src/h2mux/h2mux_server_session.rs` | `omitted_stream_limit_falls_back_to_the_safety_ceiling` |
+| LH-7 | UDP hedef tavanı: config yoksa **2048** hedef/akış (açık config kazanır) | `src/routing/udp_router.rs` | `omitted_udp_destination_limit_falls_back_to_the_safety_ceiling` |
+
+Kapılar: `fmt` geçti; `clippy -D warnings` geçti; birim 970/0 (35 ignored); FFI 974/0.
+
+Yerel A/B (release + `lto="fat"`, `black_box`, sıra değişimli):
+- LH-1 guard: 0,5 → 0,7 ns/paket (+0,2 ns; gürültü seviyesi).
+- LH-4 oturum başlatma: 32–34 → 56–58 ns/yeni oturum (+24 ns; paket başına değil, oturum kurulumu başına).
+
+## Belgelenen politikalar (uygulanmadı — sahip kararı)
+
+| No | Konu | Durum / öneri |
+|---|---|---|
+| LH-8 | DNS negatif sonuç cache'lenmiyor | Kısmen doğrulandı; kısa TTL (5–30 sn) negatif cache güvenli. XUDP'de çözümleme hatasının oturumu sonlandırması ayrı davranış kararı. Sahip kararı: uygulanmadı. |
+| LH-9 | Splice pipe'ı idle'da bağlantı başına 4 FD tutuyor | Repro'lu; ölçüm + yön `Complete` olduğunda bırakma önerisi. Tam idle-release perf ölçümü ister. |
+| LH-10 | REALITY post-handshake Handshake (KeyUpdate) kaydında bağlantıyı kapatıyor | Stok Go/utls istemcileri KeyUpdate göndermiyor; gerçek fix (trafik sırrı güncelleme) minimal değil → belge. |
+| LH-11 | h2mux `poll_write` Ok(0) desenkronu, h2mux idle drain abort, reload grace drenaj birikimi | Düşük/erişilemez (`--no-reload`); belge. |
+
+## Refute edilenler
+
+- Vision unpadder kısmi UUID düşürmesi (ödünç semantiği; üretimde çağrı yolu yok).
+- Sıfır kapasiteli `ReadBuf` → EOF karışıklığı (çağıranlar boş tampon üretmiyor).
+- REALITY kapak 5 sn deadline (fail-closed tasarım; sahip kısıtı).
+- Reload drenaj birikimi (`--no-reload` ile erişilemez).
+
+## Kararlar (2026-10-13)
+
+- LH-1–LH-5 uygulandı ve kaldı; LH-6/LH-7 kod tavanı olarak uygulandı (4096 stream / 2048 hedef,
+  açık config her zaman kazanır); LH-8–LH-11 belgelendi (kod değişikliği yok).
