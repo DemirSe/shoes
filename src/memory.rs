@@ -19,10 +19,13 @@ const TRIM_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const TRIM_RSS_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Only trim while few connections are active, so a busy server never pays the
-/// trim cost or the page-fault cost that follows it.
+/// Only trim while the server is not busy: normal browsing keeps a few dozen
+/// connections open, and the measured trim cost (0.02-15 ms, on a blocking
+/// thread) stays negligible at that level. A heavily loaded server (hundreds of
+/// connections) is left alone so a burst never pays the trim cost or the
+/// page-fault cost that follows it.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-const TRIM_MAX_ACTIVE_CONNECTIONS: usize = 16;
+const TRIM_MAX_ACTIVE_CONNECTIONS: usize = 128;
 
 /// Whether the heap should be trimmed now.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
