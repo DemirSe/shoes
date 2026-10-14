@@ -4,7 +4,7 @@
 
 use std::io;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -285,80 +285,6 @@ pub fn encode_socks_address(buf: &mut BytesMut, location: &NetLocation) -> io::R
     Ok(())
 }
 
-/// Decode a SOCKS5 address from bytes.
-/// Reserved for synchronous parsing paths.
-#[allow(dead_code)]
-pub fn decode_socks_address(data: &mut &[u8]) -> io::Result<NetLocation> {
-    if data.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "address too short",
-        ));
-    }
-
-    let addr_type = data.get_u8();
-    let address = match addr_type {
-        0x01 => {
-            // IPv4
-            if data.len() < 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "IPv4 address too short",
-                ));
-            }
-            let mut octets = [0u8; 4];
-            octets.copy_from_slice(&data[..4]);
-            data.advance(4);
-            Address::Ipv4(std::net::Ipv4Addr::from(octets))
-        }
-        0x03 => {
-            // Domain
-            if data.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "domain length missing",
-                ));
-            }
-            let len = data.get_u8() as usize;
-            if data.len() < len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "domain too short",
-                ));
-            }
-            let domain = String::from_utf8_lossy(&data[..len]).to_string();
-            data.advance(len);
-            Address::Hostname(domain)
-        }
-        0x04 => {
-            // IPv6
-            if data.len() < 16 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "IPv6 address too short",
-                ));
-            }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&data[..16]);
-            data.advance(16);
-            Address::Ipv6(std::net::Ipv6Addr::from(octets))
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown address type: {}", addr_type),
-            ));
-        }
-    };
-
-    if data.len() < 2 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "port missing"));
-    }
-    let port = data.get_u16();
-
-    Ok(NetLocation::new(address, port))
-}
-
 /// Decode a SOCKS5 address from async reader
 pub async fn decode_socks_address_async<R: AsyncRead + Unpin>(
     reader: &mut R,
@@ -589,26 +515,75 @@ mod tests {
         assert!(err.to_string().contains("hostname too long"));
     }
 
-    #[test]
-    fn test_decode_socks_address_ipv4() {
+    #[tokio::test]
+    async fn test_decode_socks_address_ipv4() {
         let data = [0x01, 127, 0, 0, 1, 0x1F, 0x90]; // 127.0.0.1:8080
         let mut slice = &data[..];
-        let loc = decode_socks_address(&mut slice).unwrap();
+        let loc = decode_socks_address_async(&mut slice).await.unwrap();
 
         assert!(matches!(loc.address(), Address::Ipv4(ip) if ip.octets() == [127, 0, 0, 1]));
         assert_eq!(loc.port(), 8080);
+        assert!(slice.is_empty());
     }
 
-    #[test]
-    fn test_decode_socks_address_ipv6() {
+    #[tokio::test]
+    async fn test_decode_socks_address_ipv6() {
         let mut data = vec![0x04]; // IPv6 type
         data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]); // ::1
         data.extend_from_slice(&[0x00, 0x50]); // port 80
 
         let mut slice = &data[..];
-        let loc = decode_socks_address(&mut slice).unwrap();
+        let loc = decode_socks_address_async(&mut slice).await.unwrap();
 
-        assert!(matches!(loc.address(), Address::Ipv6(_)));
+        assert!(matches!(loc.address(), Address::Ipv6(ip) if ip.is_loopback()));
         assert_eq!(loc.port(), 80);
+        assert!(slice.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decode_socks_address_hostname() {
+        let data = b"\x03\x08test.com\x01\xbb"; // test.com:443
+        let mut slice = &data[..];
+        let loc = decode_socks_address_async(&mut slice).await.unwrap();
+
+        assert!(matches!(loc.address(), Address::Hostname(host) if host == "test.com"));
+        assert_eq!(loc.port(), 443);
+        assert!(slice.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decode_socks_address_unknown_atyp() {
+        let mut slice = &[0x02][..];
+        let err = decode_socks_address_async(&mut slice).await.unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "unknown address type: 2");
+    }
+
+    #[tokio::test]
+    async fn test_decode_socks_address_truncated_input() {
+        let ipv4 = [0x01, 127, 0, 0, 1, 0x1f, 0x90];
+        let ipv6 = [
+            0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x00, 0x50,
+        ];
+        let hostname = b"\x03\x08test.com\x01\xbb";
+
+        for (name, data) in [
+            ("IPv4", &ipv4[..]),
+            ("IPv6", &ipv6[..]),
+            ("hostname", &hostname[..]),
+        ] {
+            // Every incomplete prefix, including missing ATYP, address and port.
+            for prefix_len in 0..data.len() {
+                let mut slice = &data[..prefix_len];
+                let err = decode_socks_address_async(&mut slice).await.unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::UnexpectedEof,
+                    "{name}, prefix length {prefix_len} of {}",
+                    data.len()
+                );
+            }
+        }
     }
 }
