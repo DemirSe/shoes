@@ -428,6 +428,95 @@ mod tests {
     }
 
     #[test]
+    fn w1_tls_deserializer_rejects_string_bools_float_and_overflow_buffer() {
+        let overflow = (usize::MAX as u128) + 1;
+        for fields in [
+            "verify: 'true'\n".to_string(),
+            "vision: 'false'\n".to_string(),
+            "tls_buffer_size: 1.5\n".to_string(),
+            format!("tls_buffer_size: {overflow}\n"),
+        ] {
+            let yaml = format!("{fields}protocol:\n  type: direct\n");
+            let direct = serde_yaml::from_str::<TlsClientConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(direct.contains("invalid"), "{yaml}: {direct}");
+            let tagged = format!("type: tls\n{yaml}");
+            let error = serde_yaml::from_str::<ClientProxyConfig>(&tagged)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid"), "{tagged}: {error}");
+            let client = format!(
+                "protocol:\n{}",
+                tagged
+                    .lines()
+                    .map(|line| format!("  {line}\n"))
+                    .collect::<String>()
+            );
+            let error = serde_yaml::from_str::<ClientConfig>(&client)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid"), "{client}: {error}");
+        }
+    }
+
+    #[test]
+    fn w1_tls_deserializer_rejects_alias_first_duplicates() {
+        for (canonical, alias) in [
+            ("server_fingerprints", "server_fingerprint"),
+            ("alpn_protocols", "alpn_protocol"),
+        ] {
+            let yaml = format!("{alias}: h2\n{canonical}: [http/1.1]\nprotocol:\n  type: direct\n");
+            let expected = format!("duplicate field `{canonical}`");
+            let direct = serde_yaml::from_str::<TlsClientConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(direct.contains(&expected), "{yaml}: {direct}");
+            let error = serde_yaml::from_str::<ClientProxyConfig>(&format!("type: tls\n{yaml}"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&expected), "{yaml}: {error}");
+        }
+    }
+
+    #[test]
+    fn w1_nested_reality_cipher_alias_scalar_and_canonical_list_exact_values() {
+        use crate::reality::CipherSuite;
+        for (fields, expected) in [
+            (
+                "cipher_suite: TLS_AES_128_GCM_SHA256\n",
+                vec![CipherSuite::AES_128_GCM_SHA256],
+            ),
+            (
+                "cipher_suites: [TLS_CHACHA20_POLY1305_SHA256, TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256]\n",
+                vec![
+                    CipherSuite::CHACHA20_POLY1305_SHA256,
+                    CipherSuite::AES_256_GCM_SHA384,
+                    CipherSuite::AES_128_GCM_SHA256,
+                ],
+            ),
+        ] {
+            let reality = format!(
+                "type: reality\npublic_key: test-public-key\n{fields}protocol:\n  type: vless\n  user_id: {TEST_UUID}\n"
+            );
+            let nested = reality
+                .lines()
+                .map(|line| format!("  {line}\n"))
+                .collect::<String>();
+            let tls = assert_tls_deserialization_paths(&format!("protocol:\n{nested}"));
+            let ClientProxyConfig::Reality { cipher_suites, .. } = *tls.protocol else {
+                panic!("expected REALITY");
+            };
+            if fields.starts_with("cipher_suite:") {
+                assert!(matches!(cipher_suites, NoneOrSome::One(_)));
+            } else {
+                assert!(matches!(cipher_suites, NoneOrSome::Some(_)));
+            }
+            assert_eq!(cipher_suites.into_vec(), expected);
+        }
+    }
+
+    #[test]
     fn test_client_config_serialization() {
         let original = create_test_client_config();
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");

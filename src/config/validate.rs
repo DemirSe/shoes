@@ -1327,6 +1327,139 @@ mod tests {
         Ok(validated.configs)
     }
 
+    fn w1_reality_server_yaml(key: &str, extra: &str) -> String {
+        format!(
+            "address: 127.0.0.1:0\nprotocol:\n  type: tls\n  tls_buffer_size: 1\n  reality_targets:\n    whatsapp.net:\n      private_key: '{key}'\n      short_ids: ['zz']\n      {extra}\n      dest: whatsapp.net:443\n      protocol:\n        type: vless\n        user_id: invalid-uuid\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn w1_server_vision_rejects_non_vless_tls_default_and_reality_targets() {
+        for kind in ["tls_targets", "default_tls_target", "reality_targets"] {
+            let fields = if kind == "reality_targets" {
+                "private_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nshort_ids: ['0102030405060708']\ndest: whatsapp.net:443\n"
+            } else {
+                "cert: inline-cert\nkey: inline-key\n"
+            };
+            let target = format!("{fields}vision: true\nprotocol:\n  type: tls\n");
+            let indent = if kind == "default_tls_target" {
+                "    "
+            } else {
+                "      "
+            };
+            let target = target
+                .lines()
+                .map(|line| format!("{indent}{line}\n"))
+                .collect::<String>();
+            let entry = if kind == "default_tls_target" {
+                ""
+            } else {
+                "    whatsapp.net:\n"
+            };
+            let server: ServerConfig = serde_yaml::from_str(&format!(
+                "address: 127.0.0.1:0\nprotocol:\n  type: tls\n  {kind}:\n{entry}{target}"
+            ))
+            .unwrap();
+            let error = validate_configs_test(vec![Config::Server(server)])
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            let message = error.to_string();
+            assert!(message.contains("vision=true"), "{kind}: {message}");
+            assert!(message.contains("not VLESS"), "{kind}: {message}");
+            let expected_target = match kind {
+                "tls_targets" => "TLS target 'whatsapp.net'",
+                "default_tls_target" => "default TLS target",
+                _ => "Reality target 'whatsapp.net'",
+            };
+            assert!(message.contains(expected_target), "{kind}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn w1_reality_invalid_cipher_deserialization_precedes_key_validation() {
+        // Cipher decoding occurs during deserialization even if the invalid key is written first.
+        let yaml = w1_reality_server_yaml("!", "cipher_suites: [NOT_A_CIPHER]");
+        let error = serde_yaml::from_str::<ServerConfig>(&yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("untagged enum NoneOrSome"), "{error}");
+        assert!(!error.contains("invalid private_key"), "{error}");
+        let server: ServerConfig = serde_yaml::from_str(&w1_reality_server_yaml(
+            "!",
+            "cipher_suites: [TLS_AES_128_GCM_SHA256]",
+        ))
+        .unwrap();
+        let error = validate_configs_test(vec![Config::Server(server)])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("invalid private_key"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn w1_server_multiple_errors_preserve_validation_priority() {
+        let mut server: ServerConfig =
+            serde_yaml::from_str(&w1_reality_server_yaml("!", "")).unwrap();
+        server.transport = Transport::Udp;
+        server.rules = NoneOrSome::One(ConfigSelection::GroupName("missing-rules".into()));
+        for expected in [
+            "UDP listeners",
+            "missing-rules",
+            "invalid private_key",
+            "non-hexadecimal",
+            "Invalid uuid",
+            "TLS buffer size",
+        ] {
+            let error = validate_configs_test(vec![Config::Server(server.clone())])
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected}: {error}"
+            );
+            match expected {
+                "UDP listeners" => server.transport = Transport::Tcp,
+                "missing-rules" => server.rules = direct_allow_rule(),
+                _ => {
+                    let ServerProxyConfig::Tls {
+                        reality_targets,
+                        tls_buffer_size,
+                        ..
+                    } = &mut server.protocol
+                    else {
+                        panic!("expected TLS wrapper");
+                    };
+                    let target = reality_targets.get_mut("whatsapp.net").unwrap();
+                    match expected {
+                        "invalid private_key" => {
+                            target.private_key =
+                                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()
+                        }
+                        "non-hexadecimal" => {
+                            target.short_ids = OneOrSome::One("0102030405060708".into())
+                        }
+                        "Invalid uuid" => {
+                            let ServerProxyConfig::Vless { user_id, .. } = &mut target.protocol
+                            else {
+                                panic!("expected VLESS");
+                            };
+                            *user_id =
+                                OneOrSome::One("550e8400-e29b-41d4-a716-446655440000".into());
+                        }
+                        "TLS buffer size" => *tls_buffer_size = None,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+        assert!(
+            validate_configs_test(vec![Config::Server(server)])
+                .await
+                .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn test_validate_config_success() {
         use crate::config::types::ClientConfigGroup;

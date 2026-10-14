@@ -104,7 +104,7 @@ fn create_target_inner_protocol(
     resolver: &Arc<dyn Resolver>,
 ) -> InnerProtocol {
     if vision {
-        // Vision requires VLESS protocol (validated in config/mod.rs)
+        // convert_cert_paths rejects non-VLESS Vision before runtime handler construction.
         if let ServerProxyConfig::Vless {
             user_id,
             udp_enabled,
@@ -470,6 +470,135 @@ mod tests {
             cipher_suites: NoneOrSome::None,
             vision: false,
         }
+    }
+
+    #[tokio::test]
+    async fn w1_vision_nonempty_override_preserves_selector_isolation_and_users() {
+        let resolver: Arc<dyn Resolver> = Arc::new(NoNetworkResolver);
+        let parent = Arc::new(create_tcp_client_proxy_selector(
+            vec![RuleConfig::default()],
+        ));
+        let block = RuleConfig {
+            masks: OneOrSome::One(NetLocationMask::ANY),
+            action: RuleActionConfig::Block,
+        };
+        let targets = targets(
+            ServerProxyConfig::Vless {
+                user_id: OneOrSome::Some(USERS.iter().map(|user| user.to_string()).collect()),
+                udp_enabled: false,
+                fallback: None,
+            },
+            true,
+            NoneOrSome::Some(vec![
+                ConfigSelection::Config(block),
+                ConfigSelection::Config(RuleConfig::default()),
+            ]),
+            &parent,
+            &resolver,
+        );
+        assert!(!Arc::ptr_eq(parts(&targets[0]).0, parts(&targets[1]).0));
+        for target in &targets {
+            let (selector, inner) = parts(target);
+            assert!(!Arc::ptr_eq(selector, &parent));
+            assert!(matches!(
+                selector
+                    .judge(
+                        NetLocation::from_str("127.0.0.1:443", None).unwrap().into(),
+                        &resolver
+                    )
+                    .await
+                    .unwrap(),
+                ConnectDecision::Block
+            ));
+            let InnerProtocol::VisionVless(config) = inner else {
+                panic!("expected Vision VLESS");
+            };
+            for user in USERS {
+                assert!(
+                    config
+                        .user_id
+                        .contains(&crate::uuid_util::parse_uuid(user).unwrap())
+                );
+            }
+            assert!(!config.user_id.contains(&[9; 16]));
+            assert!(!config.udp_enabled);
+            assert!(config.fallback.is_none());
+        }
+        assert!(matches!(
+            parent
+                .judge(
+                    NetLocation::from_str("127.0.0.1:443", None).unwrap().into(),
+                    &resolver
+                )
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn w1_tls_factory_rejects_malformed_pem_certificate_before_key() {
+        // PEM syntax is checked by the factory, not create_server_configs; preserve its panic contract.
+        let resolver: Arc<dyn Resolver> = Arc::new(NoNetworkResolver);
+        let parent = Arc::new(ClientProxySelector::new(Vec::new()));
+        let cert = rcgen::generate_simple_self_signed(vec!["whatsapp.net".into()]).unwrap();
+        let valid_cert = cert.cert.pem();
+        let valid_key = cert.signing_key.serialize_pem();
+        let bad_cert = "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n";
+        let bad_key = "-----BEGIN PRIVATE KEY-----\n$$$\n-----END PRIVATE KEY-----\n";
+        let rejected = |cert: &str, key: &str| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                create_tls_server_target(
+                    TlsServerConfig {
+                        cert: cert.into(),
+                        key: key.into(),
+                        alpn_protocols: NoneOrSome::None,
+                        client_ca_certs: NoneOrSome::None,
+                        client_fingerprints: NoneOrSome::None,
+                        vision: false,
+                        protocol: cover_config(NoneOrSome::None, NoneOrSome::None).protocol,
+                        override_rules: NoneOrSome::None,
+                    },
+                    &parent,
+                    &resolver,
+                )
+            }));
+            let panic = result.expect_err("malformed PEM must be rejected");
+            if let Some(message) = panic.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                panic
+                    .downcast_ref::<&str>()
+                    .expect("text panic")
+                    .to_string()
+            }
+        };
+        let cert_error = rejected(bad_cert, &valid_key);
+        let key_error = rejected(&valid_cert, bad_key);
+        assert!(cert_error.contains("Base64Decode"), "{cert_error}");
+        assert!(key_error.contains("Base64Decode"), "{key_error}");
+        assert_ne!(cert_error, key_error);
+        assert_eq!(rejected(bad_cert, bad_key), cert_error);
+    }
+
+    #[test]
+    fn w1_reality_factory_preserves_cipher_suite_order_without_io() {
+        use crate::reality::CipherSuite;
+        let resolver: Arc<dyn Resolver> = Arc::new(NoNetworkResolver);
+        let parent = Arc::new(ClientProxySelector::new(Vec::new()));
+        let expected = vec![
+            CipherSuite::CHACHA20_POLY1305_SHA256,
+            CipherSuite::AES_256_GCM_SHA384,
+            CipherSuite::AES_128_GCM_SHA256,
+        ];
+        let mut config = cover_config(NoneOrSome::None, NoneOrSome::None);
+        config.cipher_suites = NoneOrSome::Some(expected.clone());
+        let TlsServerTarget::Reality(target) =
+            create_reality_server_target(config, &parent, &resolver)
+        else {
+            panic!("expected REALITY");
+        };
+        assert_eq!(target.cipher_suites, expected);
     }
 
     #[tokio::test]

@@ -3,6 +3,8 @@
 Tam YAML referansı: [CONFIG.md](../CONFIG.md). Bu belge yalnızca bu fork'un
 üretim profilini ve kritik davranışları özetler.
 
+`examples/` çoğunlukla destek garantisi olmayan upstream/legacy örnekler içerir; kapsam için [örnek notuna](../examples/README.md) bakın.
+
 ## Yapı
 
 - Üst düzey liste; her öğe bir **sunucu**, **TUN**, **istemci** veya **kural**

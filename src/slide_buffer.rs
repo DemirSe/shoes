@@ -19,6 +19,7 @@ use std::io::{BufRead, Read};
 use crate::util::allocate_vec;
 
 /// A fixed-capacity sliding buffer with zero-allocation read/write operations.
+/// Pure buffer storage, not an async I/O reader; kept separate from `StreamReader`.
 ///
 /// This buffer maintains start and end offsets into a pre-allocated storage,
 /// allowing efficient append and consume operations without allocating.

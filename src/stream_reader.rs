@@ -2,6 +2,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::util::allocate_vec;
 
+/// Buffered async I/O reader; kept separate from the I/O-independent `SlideBuffer`.
 pub struct StreamReader {
     buf: Box<[u8]>,
     start_offset: usize,

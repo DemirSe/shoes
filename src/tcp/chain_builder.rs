@@ -23,6 +23,7 @@ pub fn build_client_proxy_chain(
             ClientChainHop::Single(selection) => match selection {
                 ConfigSelection::Config(config) => vec![config],
                 ConfigSelection::GroupName(group_name) => {
+                    // Config validation expands group references before this builder runs.
                     panic!(
                         "Group reference '{}' was not resolved during config validation.",
                         group_name
@@ -35,6 +36,7 @@ pub fn build_client_proxy_chain(
                 .flat_map(|selection| match selection {
                     ConfigSelection::Config(config) => vec![config],
                     ConfigSelection::GroupName(group_name) => {
+                        // Pool group references are also expanded during config validation.
                         panic!(
                             "Group reference '{}' was not resolved during config validation.",
                             group_name
@@ -46,6 +48,7 @@ pub fn build_client_proxy_chain(
         .collect();
 
     if hops.is_empty() {
+        // Deserialized OneOrSome rejects empty hop lists; direct callers must uphold this invariant.
         panic!("Client chain must have at least one hop");
     }
 
@@ -82,6 +85,7 @@ pub fn build_client_proxy_chain(
                 .map(|config| {
                     // Subsequent hops MUST NOT have direct protocol
                     if config.protocol.is_direct() {
+                        // validate_direct_connector_positions rejects direct configs at hop 1+.
                         panic!(
                             "protocol: direct is only valid at hop 0. Found direct at hop {} with address {}",
                             hop_index,

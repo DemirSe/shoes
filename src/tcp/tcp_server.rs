@@ -373,6 +373,7 @@ pub async fn start_servers(
             "TUN server is not supported on this platform",
         )),
         Config::Server(server_config) => start_configured_servers(server_config, resolver).await,
+        // Startup receives only the runtime variants emitted by config validation.
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
 }
@@ -544,7 +545,7 @@ fn prepare_tcp_servers_inner(
     debug!("Preparing {} TCP server at {}", protocol, bind_location);
 
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
-    // We should always have a direct entry.
+    // validate_server_config supplies a direct rule when the configured rules are empty.
     assert!(!rules.is_empty());
 
     let tcp_config = tcp_settings.unwrap_or_else(TcpConfig::default);
@@ -638,6 +639,60 @@ mod lifetime_tests {
     use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
     use crate::tcp::socket_connector::SocketConnector;
+
+    #[tokio::test]
+    async fn w1_handler_cache_shares_by_ip_and_isolated_between_preparations() {
+        let mut previous = ListenerRegistry::default();
+        let mut addresses = Vec::new();
+        for ip in ["127.0.0.1", "127.0.0.1", "127.0.0.2"] {
+            let listener = Arc::new(tokio::net::TcpListener::bind((ip, 0)).await.unwrap());
+            let address = listener.local_addr().unwrap();
+            addresses.push(address);
+            // Keep the port-0 listeners open throughout; no close/rebind port race.
+            previous.tcp.insert(address, listener);
+        }
+        assert_ne!(addresses[0].port(), addresses[1].port());
+        let server: ServerConfig = serde_yaml::from_str(&format!(
+            "addresses: [{}, {}, {}]\nprotocol:\n  type: vless\n  user_id: 550e8400-e29b-41d4-a716-446655440000\n",
+            addresses[0], addresses[1], addresses[2]
+        ))
+        .unwrap();
+        let validated = crate::config::create_server_configs(vec![Config::Server(server)]).unwrap();
+        let Config::Server(server) = validated.configs.into_iter().next().unwrap() else {
+            panic!("expected validated server");
+        };
+        let resolver: Arc<dyn Resolver> = Arc::new(PendingResolver);
+        let mut generations = Vec::new();
+        for _ in 0..2 {
+            let prepared = prepare_tcp_servers(
+                server.clone(),
+                resolver.clone(),
+                &previous,
+                &mut ListenerRegistry::default(),
+            )
+            .unwrap();
+            let handlers = prepared
+                .0
+                .iter()
+                .zip(&addresses)
+                .map(|(entry, address)| {
+                    let PreparedListener::Tcp(listener, _, actual_resolver, handler) = entry else {
+                        panic!("expected TCP listener");
+                    };
+                    assert!(Arc::ptr_eq(listener, &previous.tcp[address]));
+                    assert!(Arc::ptr_eq(actual_resolver, &resolver));
+                    handler.clone()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(handlers.len(), 3);
+            assert!(Arc::ptr_eq(&handlers[0], &handlers[1]));
+            assert!(!Arc::ptr_eq(&handlers[0], &handlers[2]));
+            generations.push(handlers);
+        }
+        for (first, second) in generations[0].iter().zip(&generations[1]) {
+            assert!(!Arc::ptr_eq(first, second));
+        }
+    }
 
     #[derive(Debug)]
     struct StalledMessageShutdown {

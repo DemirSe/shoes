@@ -123,7 +123,7 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(interface.as_bytes()))?;
 
-        // This should be handled during config validation.
+        // validate_client_config rejects bind_interface on unsupported platforms before setup.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         panic!("Could not bind to device, unsupported platform.")
     }
@@ -165,7 +165,7 @@ pub fn new_tcp_socket(
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         tcp_socket.bind_device(Some(_b.as_bytes()))?;
 
-        // This should be handled during config validation.
+        // validate_client_config rejects bind_interface on unsupported platforms before setup.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         panic!("Could not bind to device, unsupported platform.")
     }
@@ -221,7 +221,7 @@ pub fn new_tcp_listener(
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(interface.as_bytes()))?;
 
-        // This should be handled during config validation.
+        // Server preparation passes None; direct callers must respect platform support.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         panic!("Could not bind to device, unsupported platform.")
     }
