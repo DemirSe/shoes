@@ -872,7 +872,7 @@ mod tests {
     fn test_chain_mixed_initial_pool() {
         let chain = ClientProxyChain::new(
             vec![
-                proxy_entry(0, 1080, true), // VMess proxy
+                proxy_entry(0, 1080, true), // hop_b proxy
                 proxy_entry(1, 1081, true), // VLESS proxy
                 direct_entry(2),            // Direct
             ],
@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_pool_pairing_fix_socket_proxy_always_paired() {
-        // Create a mixed pool simulating: vmess@1080, vless@1081, direct
+        // Create a mixed pool simulating: hop_b@1080, vless@1081, direct
         // Each with a unique socket ID matching its position
         let chain = ClientProxyChain::new(
             vec![
@@ -992,7 +992,7 @@ mod tests {
 
             match (expected_idx, entry) {
                 (0, InitialHopEntry::Proxy { proxy, .. }) => {
-                    // Entry 0: should be vmess proxy at port 1080
+                    // Entry 0: should be hop_b proxy at port 1080
                     assert_eq!(
                         proxy.proxy_location().port(),
                         1080,
@@ -1082,12 +1082,12 @@ mod tests {
         // - Final hop from udp_final_hop_indices
         let chain = ClientProxyChain::new(
             vec![
-                proxy_entry(0, 1080, false), // HTTP - no UDP (but should be usable for UDP!)
-                proxy_entry(1, 1081, false), // Another HTTP
+                proxy_entry(0, 1080, false), // hop_a - no UDP (but should be usable for UDP!)
+                proxy_entry(1, 1081, false), // Another hop_a
             ],
             vec![vec![
-                mock_proxy(8080, false), // HTTP - no UDP (index 0)
-                mock_proxy(443, true),   // VMess - has UDP (index 1)
+                mock_proxy(8080, false), // hop_a - no UDP (index 0)
+                mock_proxy(443, true),   // hop_b - has UDP (index 1)
                 mock_proxy(444, true),   // VLESS - has UDP (index 2)
             ]],
         );
@@ -1124,7 +1124,7 @@ mod tests {
             let expected_udp_idx = iteration % 2; // 0 or 1 in udp_final_hop_indices
             match expected_udp_idx {
                 0 => {
-                    // udp_final_hop_indices[0] = 1 -> VMess at port 443
+                    // udp_final_hop_indices[0] = 1 -> hop_b at port 443
                     assert_eq!(proxy.proxy_location().port(), 443);
                 }
                 1 => {
@@ -1142,12 +1142,12 @@ mod tests {
         // points to the FINAL subsequent hop, not the initial hop
         let chain = ClientProxyChain::new(
             vec![
-                proxy_entry(0, 1080, false), // HTTP - no UDP
-                proxy_entry(1, 1081, true),  // SOCKS5 - has UDP (irrelevant!)
+                proxy_entry(0, 1080, false), // hop_a - no UDP
+                proxy_entry(1, 1081, true),  // hop_c - has UDP (irrelevant!)
             ],
             vec![vec![
-                mock_proxy(8080, false), // HTTP - no UDP (index 0)
-                mock_proxy(443, true),   // VMess - has UDP (index 1)
+                mock_proxy(8080, false), // hop_a - no UDP (index 0)
+                mock_proxy(443, true),   // hop_b - has UDP (index 1)
                 mock_proxy(444, true),   // VLESS - has UDP (index 2)
             ]],
         );
@@ -1159,19 +1159,19 @@ mod tests {
         assert!(!chain.udp_uses_initial_hop);
 
         // udp_final_hop_indices should point to indices in the FINAL subsequent hop
-        // NOT the initial hop! Only indices 1 and 2 (VMess, VLESS) support UDP
+        // NOT the initial hop! Only indices 1 and 2 (hop_b, VLESS) support UDP
         assert_eq!(chain.udp_final_hop_indices, vec![1, 2]);
     }
 
     #[test]
     fn test_chain_intermediate_hop_no_udp_final_hop_has_udp() {
-        // direct -> http (no UDP) -> vmess (has UDP)
+        // direct -> hop_a (no UDP) -> hop_b (has UDP)
         // Should support UDP because only final hop matters
         let chain = ClientProxyChain::new(
             vec![direct_entry(0)],
             vec![
-                vec![mock_proxy(8080, false)], // HTTP - no UDP
-                vec![mock_proxy(443, true)],   // VMess - has UDP
+                vec![mock_proxy(8080, false)], // hop_a - no UDP
+                vec![mock_proxy(443, true)],   // hop_b - has UDP
             ],
         );
         assert_eq!(chain.num_hops(), 3);
@@ -1180,14 +1180,14 @@ mod tests {
 
     #[test]
     fn test_chain_all_intermediate_no_udp_final_has_udp() {
-        // direct -> http -> socks5 -> vmess
+        // direct -> hop_a -> hop_c -> hop_b
         // Three intermediate hops, none with UDP, but final has UDP
         let chain = ClientProxyChain::new(
             vec![direct_entry(0)],
             vec![
-                vec![mock_proxy(8080, false)], // HTTP - no UDP
-                vec![mock_proxy(1080, false)], // SOCKS5 - no UDP
-                vec![mock_proxy(443, true)],   // VMess - has UDP
+                vec![mock_proxy(8080, false)], // hop_a - no UDP
+                vec![mock_proxy(1080, false)], // hop_c - no UDP
+                vec![mock_proxy(443, true)],   // hop_b - has UDP
             ],
         );
         assert_eq!(chain.num_hops(), 4);
@@ -1196,13 +1196,13 @@ mod tests {
 
     #[test]
     fn test_chain_intermediate_has_udp_final_no_udp() {
-        // direct -> vmess (has UDP) -> http (no UDP)
+        // direct -> hop_b (has UDP) -> hop_a (no UDP)
         // Should NOT support UDP because final hop doesn't
         let chain = ClientProxyChain::new(
             vec![direct_entry(0)],
             vec![
-                vec![mock_proxy(443, true)],   // VMess - has UDP
-                vec![mock_proxy(8080, false)], // HTTP - no UDP
+                vec![mock_proxy(443, true)],   // hop_b - has UDP
+                vec![mock_proxy(8080, false)], // hop_a - no UDP
             ],
         );
         assert_eq!(chain.num_hops(), 3);
@@ -1211,13 +1211,13 @@ mod tests {
 
     #[test]
     fn test_chain_pooled_final_hop_partial_udp() {
-        // direct -> [http (no UDP), vmess (has UDP), vless (has UDP)]
+        // direct -> [hop_a (no UDP), hop_b (has UDP), vless (has UDP)]
         // Should support UDP because final hop pool has UDP-capable connectors
         let chain = ClientProxyChain::new(
             vec![direct_entry(0)],
             vec![vec![
-                mock_proxy(8080, false), // HTTP - no UDP
-                mock_proxy(443, true),   // VMess - has UDP
+                mock_proxy(8080, false), // hop_a - no UDP
+                mock_proxy(443, true),   // hop_b - has UDP
                 mock_proxy(444, true),   // VLESS - has UDP
             ]],
         );
@@ -1227,13 +1227,13 @@ mod tests {
 
     #[test]
     fn test_chain_pooled_final_hop_no_udp() {
-        // direct -> [http, socks5] (neither has UDP)
+        // direct -> [hop_a, hop_c] (neither has UDP)
         // Should NOT support UDP
         let chain = ClientProxyChain::new(
             vec![direct_entry(0)],
             vec![vec![
-                mock_proxy(8080, false), // HTTP - no UDP
-                mock_proxy(1080, false), // SOCKS5 - no UDP
+                mock_proxy(8080, false), // hop_a - no UDP
+                mock_proxy(1080, false), // hop_c - no UDP
             ]],
         );
         assert_eq!(chain.num_hops(), 2);
@@ -1242,16 +1242,16 @@ mod tests {
 
     #[test]
     fn test_chain_complex_multi_hop_mixed_udp() {
-        // direct -> http (no UDP) -> socks5 (no UDP) -> [http (no), vmess (yes)]
-        // Should support UDP: intermediate hops don't matter, final pool has vmess
+        // direct -> hop_a (no UDP) -> hop_c (no UDP) -> [hop_a (no), hop_b (yes)]
+        // Should support UDP: intermediate hops don't matter, final pool has hop_b
         let chain = ClientProxyChain::new(
             vec![direct_entry(0)],
             vec![
-                vec![mock_proxy(8080, false)], // HTTP - no UDP
-                vec![mock_proxy(1080, false)], // SOCKS5 - no UDP
+                vec![mock_proxy(8080, false)], // hop_a - no UDP
+                vec![mock_proxy(1080, false)], // hop_c - no UDP
                 vec![
-                    mock_proxy(8081, false), // HTTP - no UDP
-                    mock_proxy(443, true),   // VMess - has UDP
+                    mock_proxy(8081, false), // hop_a - no UDP
+                    mock_proxy(443, true),   // hop_b - has UDP
                 ],
             ],
         );
