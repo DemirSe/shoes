@@ -219,7 +219,7 @@ fn get_random_udp_addr() -> (String, u16) {
 }
 
 /// Wait for an address (IP, port) to be ready for connections by attempting TCP connections.
-/// Retries every 100ms for up to the specified timeout duration.
+/// Retries every 100ms, capped by the remaining timeout duration.
 /// Returns Ok(()) if address becomes available, Err if timeout is reached.
 async fn wait_for_addr(addr: SocketAddr, wait_timeout: Duration) -> std::io::Result<()> {
     let deadline = Instant::now() + wait_timeout;
@@ -241,9 +241,16 @@ async fn wait_for_addr(addr: SocketAddr, wait_timeout: Duration) -> std::io::Res
             return Ok(());
         }
 
-        // Wait a bit before retrying
-        sleep(Duration::from_millis(100)).await;
+        // A failed connect must not add a full retry interval past the deadline.
+        sleep(readiness_retry_delay(
+            deadline.saturating_duration_since(Instant::now()),
+        ))
+        .await;
     }
+}
+
+fn readiness_retry_delay(remaining: Duration) -> Duration {
+    Duration::from_millis(100).min(remaining)
 }
 
 #[cfg(test)]
@@ -320,15 +327,40 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_uses_the_shared_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Bind without listening: connects are refused while the kernel keeps
+        // other tests and processes from taking this address until we are done.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(false).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        assert_eq!(
+            TcpListener::bind(addr).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert_eq!(
+            TcpStream::connect(addr).await.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
 
         let wait_timeout = Duration::from_millis(25);
         let started = Instant::now();
         let error = wait_for_addr(addr, wait_timeout).await.unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= wait_timeout);
+        assert!(elapsed < Duration::from_secs(1));
+        drop(socket);
+    }
+
+    #[test]
+    fn readiness_retry_delay_is_capped_by_remaining_budget() {
+        // Check the exact budget independently of wall-clock scheduling jitter.
+        for millis in [0, 25, 100, 250] {
+            assert_eq!(
+                readiness_retry_delay(Duration::from_millis(millis)),
+                Duration::from_millis(millis.min(100))
+            );
+        }
     }
 }
