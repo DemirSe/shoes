@@ -37,16 +37,6 @@ mod h2mux_stream;
 pub use h2mux_client_handler::H2MuxClientHandler;
 pub use h2mux_server_session::handle_h2mux_session;
 
-// Reserved for future use (e.g., session pooling, direct stream access)
-#[allow(unused_imports)]
-pub use h2mux_client_session::H2MuxClientSession;
-#[allow(unused_imports)]
-pub use h2mux_padding::H2MuxPaddingStream;
-#[allow(unused_imports)]
-pub use h2mux_server_session::{H2MuxServerSession, InboundStream};
-#[allow(unused_imports)]
-pub use h2mux_stream::H2MuxStream;
-
 /// Magic destination used to identify mux connections
 pub const MUX_DESTINATION_HOST: &str = "sp.mux.sing-box.arpa";
 pub const MUX_DESTINATION_PORT: u16 = 444;
@@ -66,16 +56,6 @@ impl MuxProtocol {
             0 => Some(Self::Smux),
             1 => Some(Self::Yamux),
             2 => Some(Self::H2Mux),
-            _ => None,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "" | "h2mux" => Some(Self::H2Mux),
-            "smux" => Some(Self::Smux),
-            "yamux" => Some(Self::Yamux),
             _ => None,
         }
     }

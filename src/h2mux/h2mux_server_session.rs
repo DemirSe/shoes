@@ -588,7 +588,8 @@ async fn handle_h2mux_udp_packet_addr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::h2mux::{H2MuxClientSession, H2MuxOptions};
+    use crate::h2mux::H2MuxOptions;
+    use crate::h2mux::h2mux_client_session::H2MuxClientSession;
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]

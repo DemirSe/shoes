@@ -116,31 +116,6 @@ impl<T> NoneOrSome<T> {
             NoneOrSome::Some(v) => NoneOrSome::Some(v.into_iter().map(f).collect()),
         }
     }
-
-    pub fn _filter<F>(self, f: F) -> Self
-    where
-        F: Fn(&T) -> bool,
-    {
-        match self {
-            NoneOrSome::Unspecified => NoneOrSome::Unspecified,
-            NoneOrSome::None => NoneOrSome::None,
-            NoneOrSome::One(item) => {
-                if f(&item) {
-                    NoneOrSome::One(item)
-                } else {
-                    NoneOrSome::None
-                }
-            }
-            NoneOrSome::Some(v) => {
-                let filtered: Vec<T> = v.into_iter().filter(f).collect();
-                if filtered.is_empty() {
-                    NoneOrSome::None
-                } else {
-                    NoneOrSome::Some(filtered)
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -199,16 +174,6 @@ impl<T> OneOrSome<T> {
         match self {
             OneOrSome::One(item) => Box::new(SingleItemIter(Some(item))),
             OneOrSome::Some(v) => Box::new(v.iter_mut()),
-        }
-    }
-
-    pub fn _contains(&self, x: &T) -> bool
-    where
-        T: PartialEq,
-    {
-        match self {
-            OneOrSome::One(item) => item == x,
-            OneOrSome::Some(v) => v.contains(x),
         }
     }
 }

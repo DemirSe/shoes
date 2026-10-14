@@ -305,7 +305,9 @@ mod tests {
         for _ in 0..16 {
             let (client, peer) = tokio::io::duplex(65536);
             let peer = tokio::spawn(async move {
-                let mut session = super::super::H2MuxServerSession::new(peer).await.unwrap();
+                let mut session = super::super::h2mux_server_session::H2MuxServerSession::new(peer)
+                    .await
+                    .unwrap();
                 let mut inbound = session.accept().await.unwrap();
                 let mut bytes = [0; 3];
                 inbound.stream.read_exact(&mut bytes).await.unwrap();
