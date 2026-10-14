@@ -44,6 +44,20 @@ döner.
   H2MUX 4096 akış/bağlantı, UDP 2048 hedef/akış, XUDP 16 384 tel oturumu.
 - **Açık yapılandırma her zaman kazanır.**
 
+### Etkisiz kabul edilen QUIC alanları
+
+Şu `global_limits` alanları doğrulamadan geçer ve mevcut profilleri bozmamak
+için korunur; bu fork'ta üretim davranışına bağlı değildir:
+
+- `quic_socket_buffer`: hiçbir soket kurucusuna aktarılmaz; soket tamponları
+  sistem varsayılanında kalır.
+- `quic_receive_window`, `quic_send_window`, `quic_stream_window`: pencereleri
+  uygulayan kod yalnız testlerde derlenip çağrılır; üretim QUIC taşıyıcısı bu
+  alanları okumaz. Değerler doğrulanır, taşıyıcıya uygulanmaz.
+
+Alanları silmek (`deny_unknown_fields`) mevcut profilleri reddettirebilir;
+etkinleştirmek davranış değişikliğidir ve sahip kararı + ölçüm gerektirir.
+
 ## Örnek iskelet (yer tutucular)
 
 Gerçek değerler (adres, UUID, anahtar, short_id) burada **yer tutucudur** ve

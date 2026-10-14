@@ -500,3 +500,29 @@ Entegrasyon/canlı ağ/perf testi yapılmadı; hız veya tam güvenlik kazanım�
 
 İsteğe bağlı takip: `Cargo.toml` keywords ve `src/client_proxy_chain.rs` mock etiketlerini güncel kapsamla hizalamak.
 Bunlar runtime destek kanıtı değildir; mevcut kabulün koşulu değildir. Ret literal'leri ve tarihsel atıflar korunur.
+
+## Ölçüm ve garanti kampanyası (2026-10-14)
+
+Kod incelemesinin "Ölçüm sonrası" 6 adayı (E10, E14, E19, E26, E34, E35) ölçüldü; her ölçüm
+bağımsız bir doğrulama ajanıyla yeniden üretildi. Sahip kuralı: test + **kesin performans
+garantisi** olmadan hiçbir değişiklik tutulmaz.
+
+| Madde | Ölçüm/garanti | Karar |
+|---|---|---|
+| E19 | Üretim `bin` ikilisi **bit-aynı** (bayt düzeyinde; 11 999 sembol stream'i eşit) | **Tutuldu** |
+| E10 | Çekirdek gövde komut-eşdeğer; UDP çağıranı ve h2 flush monomorfizasyonları farklı | Düşürüldü (garanti yok) |
+| E35 | TLS kurulumları + yaygın global kodgen kayması (XUDP/REALITY/h2 gövdeleri farklı) | Düşürüldü (garanti yok) |
+| E14 | +%0,34 aktarım / +%0,79 kısa oturum; kontrol bandında (gürültü) | Uygulanmadı |
+| E26 | Sıcak-poll kazancı yok; soyutlama büyüyor (+33 satır) | Uygulanmadı |
+| E34 | Yazma −%6,4; parse +%1,4; C deneyi parse artışının dispatch'ten gelmediğini gösterdi (alan/yerleşim şüphelisi) | Ek ölçüm gerekli |
+
+- E19'un üretimde bayt-nötrlüğü ayrıca doğrulandı: commit'li durum ile çalışma ağacı (E19 + testler +
+  doküman) aynı deploy-profil ikilisini üretir (`5f1557e7…`).
+- E02/E04 test kapsamı borcu 12 dinamik testle kapatıldı (client-chain resolver sayaçları, DNS
+  bootstrap tüketimi, TUN/UDP-router kimliği, factory 0/1/N matrisi; determinizm 10/10).
+- E09/E15/E23/E28 "belgele" kararları uygulandı: `CONFIG.md` (h2mux no-op havuz limitleri),
+  `docs/konfigurasyon.md` (etkisiz QUIC alanları), `docs/sorun-giderme.md` (log marker önceliği).
+- Ölçümler: tek makine (i5-1135G7), fat LTO, sıra değişimli turlar + A/A-B/B kontrolleri; canlı A/B yok.
+  Toplam hızlanma iddiası yok; E19 yalnız kodgen-nötr bir bakım refaktörüdür.
+- Düşürülen adayların patch'leri ve tüm ölçüm raporları yerel arşivde:
+  `~/.local/state/shoes-live/measurements-2026-10-14/`.

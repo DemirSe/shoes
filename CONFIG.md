@@ -264,13 +264,22 @@ H2MUX multiplexes multiple proxy streams over a single HTTP/2 connection, reduci
 
 ```yaml
 h2mux:
-  max_connections: 4           # Maximum connections to maintain (default: 4)
-  min_streams: 4               # Min streams before opening new connection (default: 4)
-  max_streams: 0               # Max streams per connection, 0 = unlimited (default: 0)
+  max_connections: 4           # Accepted for profile compatibility; not applied (see note)
+  min_streams: 4               # Accepted for profile compatibility; not applied (see note)
+  max_streams: 0               # Accepted for profile compatibility; not applied (see note)
   padding: false               # Enable padding for traffic obfuscation (default: false)
 ```
 
+**Connection pool limits are not applied in this fork.** `max_connections`,
+`min_streams` and `max_streams` are parsed, validated and kept so existing
+profiles stay valid (`deny_unknown_fields`), but they have no runtime effect:
+there is no connection pool, and every supplied transport creates its own H2MUX
+session. Only `padding` reaches the session options. Activating these limits
+would be a new behavior and needs a separately approved change with measurements.
+
 **Server support:** H2MUX is auto-detected on servers. No configuration needed.
+The per-connection stream ceiling is separate and server-side: 4096 unless
+`global_limits.max_streams_per_connection` is set.
 
 ### TLS Client
 ```yaml

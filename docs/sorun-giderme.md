@@ -35,6 +35,25 @@ journalctl -u shoes --since "-2 min" -o cat | grep -i resource | tail -n 3
 bash server-monitor.sh 5 12
 ```
 
+## Günlük düzeyi (marker dosyaları)
+
+Düzey şu öncelikle belirlenir:
+
+1. `.shoes-trace` marker dosyası → TRACE
+2. `.shoes-debug` marker dosyası → DEBUG
+3. `RUST_LOG` ortam değişkeni (`hedef=düzey` sözdizimi desteklenir)
+4. Varsayılan: yalnız ERROR
+
+Marker dosyaları, çalışan ikilinin bulunduğu dizinde aranır.
+
+**Release sınırı:** Normal release derlemesinde `log/release_max_level_info`
+etkindir; DEBUG/TRACE log makroları derleme sırasında statik olarak elenir.
+Marker dosyaları release ikilide bu düzeyleri geri getirmez.
+
+**Tanı ve gizlilik:** Marker dosyaları yalnız geçici tanı içindir; kalıcı açık
+bırakılmaz. Ham günlük ve kimlik bilgisi raporlara eklenmez
+(bkz. [guvenlik-ve-limitler.md](guvenlik-ve-limitler.md)).
+
 ## Ölçüm tuzakları
 
 | Tuzak | Doğrusu |
