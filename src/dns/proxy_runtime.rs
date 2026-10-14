@@ -232,6 +232,112 @@ mod tests {
         let _cloned = provider.clone();
     }
 
+    #[tokio::test]
+    async fn e02_bootstrap_hostname_proxy_to_literal_upstream_ipv4_ipv6() {
+        use crate::client_proxy_chain::resolver_tests::{
+            Answer, LOOPBACKS, RecordingResolver, assert_vless_request, bounded, chain, hostname,
+            vless_config,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for ip in LOOPBACKS {
+            let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let proxy_name = hostname(address.port());
+            let recording =
+                RecordingResolver::new(proxy_name.clone(), Answer::Addresses(vec![address]));
+            let resolver: Arc<dyn Resolver> = recording.clone();
+            let group = Arc::new(ClientChainGroup::new(vec![chain(vless_config(
+                proxy_name.clone(),
+                true,
+            ))]));
+            let provider = ProxyRuntimeProvider::with_bootstrap(
+                group,
+                resolver.clone(),
+                Duration::from_secs(3),
+            );
+            assert!(Arc::ptr_eq(&provider.bootstrap_resolver, &resolver));
+            assert!(Arc::ptr_eq(&provider.clone().bootstrap_resolver, &resolver));
+            recording.assert_calls(&[]);
+            // Both ends remain loopback. Hold both listeners throughout setup.
+            let upstream_listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, 0))
+                .await
+                .unwrap();
+            let upstream = upstream_listener.local_addr().unwrap();
+            let future = provider.connect_tcp(upstream, None, None);
+            recording.assert_calls(&[]);
+            let mut stream = bounded(future).await.unwrap();
+            let (mut peer, _) = bounded(listener.accept()).await.unwrap();
+            assert_vless_request(
+                &mut peer,
+                1,
+                &NetLocation::from_ip_addr(ip, upstream.port()),
+            )
+            .await;
+            // A minimal fixture proxy relays bytes to the literal upstream.
+            // This checks the returned provider stream, not just its constructor.
+            let mut relay = bounded(tokio::net::TcpStream::connect(upstream))
+                .await
+                .unwrap();
+            let (mut upstream_peer, _) = bounded(upstream_listener.accept()).await.unwrap();
+            bounded(async {
+                stream.0.write_all(b"request").await.unwrap();
+                let mut bytes = [0; 7];
+                peer.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"request");
+                relay.write_all(&bytes).await.unwrap();
+                upstream_peer.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"request");
+                upstream_peer.write_all(b"answer").await.unwrap();
+                let mut reply = [0; 6];
+                relay.read_exact(&mut reply).await.unwrap();
+                peer.write_all(&[0, 0]).await.unwrap();
+                peer.write_all(&reply).await.unwrap();
+                stream.0.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"answer");
+            })
+            .await;
+            recording.assert_calls(&[proxy_name]);
+            drop(stream);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn e02_bootstrap_resolution_is_inside_effective_connect_timeout() {
+        use crate::client_proxy_chain::resolver_tests::{
+            Answer, RecordingResolver, chain, hostname, vless_config,
+        };
+        let configured = Duration::from_millis(100);
+        for requested in [
+            None,
+            Some(Duration::from_millis(40)),
+            Some(Duration::from_secs(5)),
+        ] {
+            let name = hostname(443);
+            let recording = RecordingResolver::new(name.clone(), Answer::Pending);
+            let group = Arc::new(ClientChainGroup::new(vec![chain(vless_config(
+                name.clone(),
+                true,
+            ))]));
+            let provider =
+                ProxyRuntimeProvider::with_bootstrap(group, recording.clone(), configured);
+            recording.assert_calls(&[]);
+            let effective = requested.map_or(configured, |timeout| timeout.min(configured));
+            let mut connect =
+                provider.connect_tcp("127.0.0.1:53".parse().unwrap(), None, requested);
+            assert!(futures::poll!(&mut connect).is_pending());
+            recording.assert_calls(std::slice::from_ref(&name));
+            tokio::time::advance(effective - Duration::from_millis(1)).await;
+            assert!(futures::poll!(&mut connect).is_pending());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let error = connect.await.err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(error.to_string().ends_with(&format!("after {effective:?}")));
+            recording.assert_calls(&[name]);
+        }
+    }
+
     #[test]
     fn test_spawn_handle_is_clone() {
         let handle = TokioSpawnHandle;

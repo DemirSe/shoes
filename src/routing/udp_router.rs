@@ -1613,6 +1613,48 @@ mod tests {
     use crate::xudp::message_stream::MAX_XUDP_ROUTES;
 
     #[tokio::test]
+    async fn e02_udp_router_retains_and_consumes_supplied_resolver_ipv4_ipv6() {
+        use crate::client_proxy_chain::resolver_tests::{
+            Answer, LOOPBACKS, RecordingResolver, assert_udp_roundtrip, bounded, hostname,
+        };
+        use crate::config::RuleConfig;
+        use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+        for ip in LOOPBACKS {
+            let peer = tokio::net::UdpSocket::bind(SocketAddr::new(ip, 0))
+                .await
+                .unwrap();
+            let address = peer.local_addr().unwrap();
+            let name = hostname(address.port());
+            let recording = RecordingResolver::new(name.clone(), Answer::Addresses(vec![address]));
+            let resolver: Arc<dyn Resolver> = recording.clone();
+            let source = PacketSource::default();
+            let mut server = ServerStream::Targeted(Box::new(source));
+            let selector = Arc::new(create_tcp_client_proxy_selector(
+                vec![RuleConfig::default()],
+            ));
+            let mut router = UdpRouter::new(&mut server, selector, resolver.clone(), false);
+            assert!(Arc::ptr_eq(&router.resolver, &resolver));
+            recording.assert_calls(&[]);
+            let waker = noop_waker();
+            router.start_session_creation(
+                &mut Context::from_waker(&waker),
+                InboundPacket {
+                    destination: name.clone(),
+                    session_id: 0,
+                },
+                b"startup",
+            );
+            assert_eq!(router.pending_creates.len(), 1);
+            // Run the real captured future: DNS pins the address for the connector.
+            let pending = router.pending_creates.pop().unwrap();
+            let mut result = bounded(pending.future).await.unwrap();
+            assert_eq!(result.resolved_addr, address);
+            assert_udp_roundtrip(&mut result.remote, &peer).await;
+            recording.assert_calls(&[name]);
+        }
+    }
+
+    #[tokio::test]
     async fn empty_router_finishes_on_peer_eof() {
         let (stream, peer) = tokio::io::duplex(1024);
         drop(peer);

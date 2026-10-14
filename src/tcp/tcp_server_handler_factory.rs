@@ -446,4 +446,163 @@ mod tests {
             }
         }
     }
+
+    fn cover_config(
+        hops: NoneOrSome<ClientChainHop>,
+        rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    ) -> RealityServerConfig {
+        RealityServerConfig {
+            private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            short_ids: OneOrSome::One("".into()),
+            dest: NetLocation::from_str("whatsapp.net:443", None).unwrap(),
+            protocol: ServerProxyConfig::Vless {
+                user_id: OneOrSome::One(USERS[0].into()),
+                udp_enabled: true,
+                fallback: None,
+            },
+            dest_client_chain: hops,
+            override_rules: rules,
+            limit_fallback_upload: None,
+            limit_fallback_download: None,
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: NoneOrSome::None,
+            vision: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn e04_cover_factory_zero_one_many_pools_order_udp_and_override_independence() {
+        use crate::client_proxy_chain::resolver_tests::{assert_hops, hostname, vless_config};
+        let resolver: Arc<dyn Resolver> = Arc::new(NoNetworkResolver);
+        let parent = Arc::new(create_tcp_client_proxy_selector(
+            vec![RuleConfig::default()],
+        ));
+        let block = RuleConfig {
+            masks: OneOrSome::One(NetLocationMask::ANY),
+            action: RuleActionConfig::Block,
+        };
+        let hop = |port, udp| {
+            ClientChainHop::Single(ConfigSelection::Config(vless_config(hostname(port), udp)))
+        };
+        for (input, expected) in [
+            (NoneOrSome::None, vec![vec![(None, true)]]),
+            (NoneOrSome::Some(Vec::new()), vec![vec![(None, true)]]),
+            (
+                NoneOrSome::One(hop(10001, false)),
+                vec![vec![(Some(hostname(10001)), false)]],
+            ),
+            (
+                NoneOrSome::Some(vec![hop(10002, true)]),
+                vec![vec![(Some(hostname(10002)), true)]],
+            ),
+            (
+                NoneOrSome::Some(vec![
+                    hop(10003, true),
+                    ClientChainHop::Pool(OneOrSome::Some(vec![
+                        ConfigSelection::Config(vless_config(hostname(10004), false)),
+                        ConfigSelection::Config(vless_config(hostname(10005), true)),
+                    ])),
+                    hop(10006, false),
+                ]),
+                vec![
+                    vec![(Some(hostname(10003)), true)],
+                    vec![
+                        (Some(hostname(10004)), false),
+                        (Some(hostname(10005)), true),
+                    ],
+                    vec![(Some(hostname(10006)), false)],
+                ],
+            ),
+            (
+                NoneOrSome::Some(vec![
+                    ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())),
+                    hop(10007, false),
+                    hop(10008, true),
+                ]),
+                vec![
+                    vec![(None, true)],
+                    vec![(Some(hostname(10007)), false)],
+                    vec![(Some(hostname(10008)), true)],
+                ],
+            ),
+        ] {
+            for rules in [
+                NoneOrSome::None,
+                NoneOrSome::One(ConfigSelection::Config(block.clone())),
+            ] {
+                let overridden = !rules.is_empty();
+                let config = cover_config(input.clone(), rules);
+                let TlsServerTarget::Reality(target) =
+                    create_reality_server_target(config, &parent, &resolver)
+                else {
+                    unreachable!()
+                };
+                assert_eq!(target.dest, hostname(443));
+                assert_hops(&target.dest_client_chain, &expected);
+                assert_eq!(
+                    Arc::ptr_eq(&target.effective_selector, &parent),
+                    !overridden
+                );
+                let decision = target
+                    .effective_selector
+                    .judge(hostname(443).into(), &resolver)
+                    .await
+                    .unwrap();
+                assert_eq!(matches!(decision, ConnectDecision::Block), overridden);
+            }
+        }
+    }
+
+    #[test]
+    fn e04_cover_factory_transport_wrappers_keep_whatsapp_sni_without_io() {
+        use crate::client_proxy_chain::resolver_tests::{
+            assert_first_proxy_sni, assert_hops, hostname,
+        };
+        use crate::config::ClientProxyConfig;
+        let resolver: Arc<dyn Resolver> = Arc::new(NoNetworkResolver);
+        let parent = Arc::new(ClientProxySelector::new(Vec::new()));
+        for kind in ["tls", "reality"] {
+            for explicit_sni in [false, true] {
+                // Parse ordinary client configs so the real recursive factory runs.
+                let sni = if explicit_sni {
+                    "sni_hostname: whatsapp.net"
+                } else {
+                    ""
+                };
+                let security = if kind == "tls" {
+                    "verify: false"
+                } else {
+                    "public_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n  short_id: ''"
+                };
+                let yaml = format!(
+                    "address: whatsapp.net:443\nprotocol:\n  type: {kind}\n  {security}\n  {sni}\n  protocol:\n    type: vless\n    user_id: {}\n    udp_enabled: true\n",
+                    USERS[0]
+                );
+                let client: ClientConfig = serde_yaml::from_str(&yaml).unwrap();
+                assert!(matches!(
+                    client.protocol,
+                    ClientProxyConfig::Tls(_) | ClientProxyConfig::Reality { .. }
+                ));
+                let config = cover_config(
+                    NoneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                        client.clone(),
+                    ))),
+                    NoneOrSome::None,
+                );
+                let TlsServerTarget::Reality(target) =
+                    create_reality_server_target(config, &parent, &resolver)
+                else {
+                    unreachable!()
+                };
+                assert_hops(
+                    &target.dest_client_chain,
+                    &[vec![(Some(hostname(443)), true)]],
+                );
+                assert_first_proxy_sni(&target.dest_client_chain);
+                assert_eq!(target.dest, hostname(443));
+            }
+        }
+    }
 }

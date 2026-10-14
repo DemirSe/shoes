@@ -587,6 +587,65 @@ mod lifecycle_tests {
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::task::{Context, Poll};
 
+    #[tokio::test]
+    async fn e02_tun_manager_retains_and_consumes_supplied_resolver_ipv4_ipv6() {
+        use crate::address::NetLocationMask;
+        use crate::client_proxy_chain::{
+            ClientChainGroup,
+            resolver_tests::{
+                Answer, LOOPBACKS, RecordingResolver, assert_vless_request, bounded, chain,
+                hostname, vless_config,
+            },
+        };
+        use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+        for ip in LOOPBACKS {
+            let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let name = hostname(address.port());
+            let recording = RecordingResolver::new(name.clone(), Answer::Addresses(vec![address]));
+            let resolver: Arc<dyn Resolver> = recording.clone();
+            let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+                vec![NetLocationMask::ANY],
+                ConnectAction::new_allow(
+                    None,
+                    ClientChainGroup::new(vec![chain(vless_config(name.clone(), true))]),
+                ),
+            )]));
+            let (_input, from_tun) = mpsc::channel(1);
+            let (to_tun, _output) = mpsc::channel(1);
+            let (wake, _receiver) = super::super::wake::Wake::new().unwrap();
+            let (reader, writer) =
+                super::super::udp_handler::UdpHandler::new(from_tun, to_tun, wake).split();
+            let mut manager = TunUdpManager::new(
+                reader,
+                writer,
+                selector,
+                resolver.clone(),
+                TunResourceLimits::default(),
+            );
+            assert!(Arc::ptr_eq(&manager.resolver, &resolver));
+            recording.assert_calls(&[]);
+            let target = SocketAddr::new(ip, 53);
+            manager.handle_packet(
+                SocketAddr::new(ip, 12345),
+                target,
+                PacketBuffer::copy_from_slice(b"fixture"),
+            );
+            let (mut peer, _) = bounded(listener.accept()).await.unwrap();
+            assert_vless_request(&mut peer, 2, &NetLocation::from_ip_addr(ip, 53)).await;
+            let mut bytes = [0; 9];
+            bounded(tokio::io::AsyncReadExt::read_exact(&mut peer, &mut bytes))
+                .await
+                .unwrap();
+            assert_eq!(&bytes, b"\x00\x07fixture");
+            recording.assert_calls(&[name]);
+            // Dropping the manager aborts its session; no real TUN device is opened.
+            drop(manager);
+        }
+    }
+
     #[derive(Default)]
     struct FlushState {
         mode: AtomicU8,

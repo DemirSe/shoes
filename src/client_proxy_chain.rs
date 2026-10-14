@@ -600,6 +600,9 @@ impl ClientChainGroup {
 }
 
 #[cfg(test)]
+pub(crate) mod resolver_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
