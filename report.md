@@ -526,3 +526,27 @@ garantisi** olmadan hiçbir değişiklik tutulmaz.
   Toplam hızlanma iddiası yok; E19 yalnız kodgen-nötr bir bakım refaktörüdür.
 - Düşürülen adayların patch'leri ve tüm ölçüm raporları yerel arşivde:
   `~/.local/state/shoes-live/measurements-2026-10-14/`.
+
+## Stable release 2026-10-14
+
+**Tag:** `stable-2026-10-14` (bu bölümü içeren commit) · **Canlı binary:** `5f1557e7…`
+
+### Kapsam
+- İnceleme paketi 1: E01 (`bind_ip`), E06 (FFI log kalıntıları), E05 (startup cleanup) + TF01 kaydı.
+- İnceleme paketi 2: E36 (ad), E03 (serde), E04 (target helper'ları), E02 (resolver taşıması) + E02/E04 test kapsamı takibi.
+- İnceleme paketi 3: E11/E20 (yanıltıcı yorumlar + DNS feature belgesi).
+- Ölçüm kampanyası: E19 (rustls makro; üretim bin bit-aynı kanıtı), E02/E04 için 12 dinamik test,
+  E09/E15/E23/E28 belgele notları.
+
+### Doğrulama (release anı)
+- Kapılar: fmt, clippy `--all-targets --all-features -D warnings`, workspace 2023, FFI 998, entegrasyon 97/0.
+- Canlı: `5f1557e7…`, active, NRestarts=0, açık genel IPv4 TCP 443 dinliyor;
+  unit `8240b7ce…` + config `3b22cce9…` değişmedi.
+- Rollback: `b853b7cd…` → `release-5f1557e7-1791999343/rollback.bin` (+receipt).
+
+### Bu release'e alınmayanlar (bilinçli)
+- E10/E35: kesin performans garantisi yok (üretim kodgen farkı) — patch'ler arşivde.
+- E14/E26: ölçüm/analiz sonucu kazanç yok.
+- E34: ek ölçüm gerekli (C deneyi parse artışının dispatch'ten gelmediğini gösterdi).
+- İkinci temizlik paketi (E07/E08/E13/E30/E31/E33/E15): API/platform kapsam teyidi bekliyor.
+- TF01 port flake'i, `examples/` temizliği, sinyal yönetimi ve LH-8…LH-11: kayıtlı borçlar.
