@@ -449,7 +449,10 @@ Kanıtlar: `~/.local/state/shoes-live/code-review-2026-10-13/`.
 
 ### TF01 — Destek testlerinde efemer-port yarışı
 
-Tarih: 2026-10-13. Durum: açık. Öncelik: orta (test güvenilirliği borcu; üretim regresyonu değil).
+Tarih: 2026-10-13. Durum: **kapandı (2026-10-15, W2)**. Öncelik: orta (test güvenilirliği borcu; üretim regresyonu değil).
+Düzeltme: port, bağlı ama listen etmeyen TCP soketiyle tutuluyor (gelen SYN → RST; port dış süreçlere kapalı).
+Kanıt: 18 hücreli matris (boşta+yüklü, threads=1/4/8/16) **2.840 koşu, 0 başarısız, 0 TF01**; bağımsız Muse doğrulaması
+(kernel deneyi 7/7 EADDRINUSE/ECONNREFUSED + 702 koşu 0 hata).
 
 `port_helper::tests::readiness_uses_the_shared_deadline`, `tests/support/src/port_helper.rs:329`
 üzerinde `unwrap_err()` çağrısına `Ok(())` gelince düşüyor. Test, geçici listener'ı kapattıktan
@@ -526,6 +529,10 @@ garantisi** olmadan hiçbir değişiklik tutulmaz.
   Toplam hızlanma iddiası yok; E19 yalnız kodgen-nötr bir bakım refaktörüdür.
 - Düşürülen adayların patch'leri ve tüm ölçüm raporları yerel arşivde:
   `~/.local/state/shoes-live/measurements-2026-10-14/`.
+- **Takip (2026-10-15):** E34 düşürüldü (C deneyi: parse artışı dispatch'ten değil; alan/layout + B'ye özgü
+  kodgen; batch32 parse sinyali ve garanti kuralı altında kabul edilemez). İkinci temizlik paketi
+  (E07/E08/E13/E30/E31) kodgen kapısında takıldı: deploy ikilisinde erişilebilir H2Mux/Vision/UDP/TUN
+  fonksiyonlarında gerçek komut farkları → alınmadı (patch ve kanıt arşivde).
 
 ## Stable release 2026-10-14
 
@@ -550,3 +557,12 @@ garantisi** olmadan hiçbir değişiklik tutulmaz.
 - E34: ek ölçüm gerekli (C deneyi parse artışının dispatch'ten gelmediğini gösterdi).
 - İkinci temizlik paketi (E07/E08/E13/E30/E31/E33/E15): API/platform kapsam teyidi bekliyor.
 - TF01 port flake'i, `examples/` temizliği, sinyal yönetimi ve LH-8…LH-11: kayıtlı borçlar.
+
+## Belgele notları (2026-10-14)
+
+- **E16:** `examples/README.md` legacy/upstream kapsamını açıklar; kaldırılmış protokol örnekleri destek kanıtı değildir. Silme/arşivleme yapılmadı.
+- **E17:** `src/lib.rs` crate-geneli `allow(dead_code)` gerçek çağrısız kodu da maskeler. `src/ffi/mod.rs` desktop `ffi` derlemesindeki mobil ortak yardımcıları, `src/option_util.rs` ise yalnız bazı platformlarda kullanılan `is_one` kontrolünü kapsar. İzinler korundu; toplu kaldırma çok-platformlu doğrulama kapsamını büyütür.
+- **E22:** `src/ffi/stub.rs::stub_warning` depo içinde çağrısızdır; desktop `ffi` feature'ıyla dışa açılan public API olduğu için korunur. Harici kullanım bilinmiyor.
+- **E24:** Doğrulama/dönüşümden sonra kurulan zincir, sunucu ve soket yollarındaki invariant yorumları netleştirildi. Public yardımcıların doğrulamasız çağrılması için güvenlik garantisi verilmez; panic davranışı değişmedi.
+- **E27:** `StreamReader` async I/O okuyucusu, `SlideBuffer` saf tampondur. Rolleri farklı olduğundan birleştirme reddedildi; ayrı kalırlar.
+- **E32:** `TimeoutResolver::new` ve `DEFAULT_TIMEOUT` public API olarak korunur; harici tüketici olabilir. Depo içi kurulum `with_timeout` kullanır; dış kullanım doğrulanmış değildir.
