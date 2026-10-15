@@ -561,6 +561,14 @@ TCP reloads prepare and bind the complete replacement before stopping existing
 accept loops. Unchanged addresses retain their listening sockets. Invalid YAML,
 protocol settings, duplicate addresses or failed new binds retain the current
 generation. Existing TCP connections drain according to `reload_grace_secs`.
+
+On Unix, the CLI handles SIGTERM and SIGINT by stopping listeners, removing
+owned Unix socket paths, and waiting for accepted TCP connections (including
+earlier reload generations). Shutdown grace is `min(reload_grace_secs, 30)`
+seconds; remaining connections are cancelled at the deadline. Zero grace
+cancels immediately. Normal signal shutdown exits with status 0. This does not
+add signal handling to the library/FFI or promise graceful TUN shutdown.
+CLI runtime teardown waits at most one additional second for background work.
 Atomic file replacement is detected by watching the containing directories.
 Both the configured path and its existing canonical target are watched, including
 targets in a different directory. A successful reload refreshes these watches after

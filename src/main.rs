@@ -25,6 +25,7 @@ mod routing;
 mod rustls_config_util;
 mod rustls_connection_util;
 mod server_runtime;
+mod shutdown_signal;
 mod slide_buffer;
 mod socket_util;
 mod stream_reader;
@@ -133,7 +134,7 @@ fn print_usage_and_exit(arg0: String) {
         "    --production-profile Enforce the public IPv4:443 whatsapp.net REALITY/Vision profile"
     );
     eprintln!(
-        "    global_limits.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
+        "    global_limits.reload_grace_secs sets TCP drain grace (default: 300; shutdown capped at 30s)"
     );
     eprintln!("    -V, --version        Print version information and exit");
     eprintln!();
@@ -283,6 +284,11 @@ fn main() {
         mt
     };
 
+    let shutdown = shutdown_signal::listen().unwrap_or_else(|error| {
+        eprintln!("Could not initialize shutdown signals: {error}");
+        std::process::exit(1);
+    });
+
     let runtime = builder
         .enable_io()
         .enable_time()
@@ -294,8 +300,12 @@ fn main() {
         dry_run,
         no_reload,
         production_profile,
+        shutdown,
     )) {
         eprintln!("Server configuration/startup failed: {error}");
         std::process::exit(1);
     }
+    // Connection draining has an explicit deadline. Do not then wait forever
+    // for unrelated blocking maintenance work while dropping the CLI runtime.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }

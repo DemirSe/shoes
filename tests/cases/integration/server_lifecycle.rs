@@ -369,3 +369,147 @@ async fn failed_preparation_rolls_back_only_owned_unix_socket_paths() {
         "retiring a listener must release its own socket path"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn signals_stop_listeners_drain_active_transfers_and_exit_zero() {
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Cover both signals, runtime flavors, watcher modes and deadline expiry.
+    for (signal, threads, no_reload, stalled, grace) in [
+        (libc::SIGTERM, "1", true, false, 3),
+        (libc::SIGINT, "2", false, false, 3),
+        (libc::SIGTERM, "2", false, true, 1),
+        (libc::SIGINT, "1", true, true, 0),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("listener.socket");
+        let config = directory.path().join("server.yaml");
+        let log = directory.path().join("server.log");
+        std::fs::write(
+            &config,
+            format!(
+                "- global_limits: {{ reload_grace_secs: {grace} }}\n- path: '{}'\n  protocol:\n    type: vless\n    user_id: '{ID}'\n",
+                socket.display()
+            ),
+        )
+        .unwrap();
+        let mut command = Command::new(binary());
+        command
+            .args(["--threads", threads, "--log-file"])
+            .arg(&log)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if no_reload {
+            command.arg("--no-reload");
+        }
+        let mut child = Child(command.arg(&config).spawn().unwrap());
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(stream) = tokio::net::UnixStream::connect(&socket).await {
+                    break stream;
+                }
+                assert!(child.0.try_wait().unwrap().is_none());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (destination, echo_task) = echo().await;
+        let mut request = vec![0];
+        request.extend_from_slice(&shoes_test_support::vless::parse_uuid(ID).unwrap());
+        request.extend_from_slice(&[0, 1]);
+        request.extend_from_slice(&destination.to_be_bytes());
+        request.extend_from_slice(&[1, 127, 0, 0, 1]);
+        stream.write_all(&request).await.unwrap();
+        let mut response = [0; 2];
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, [0, 0]);
+
+        if !no_reload && !stalled {
+            // The active connection now belongs to a retired generation. Signal
+            // shutdown must wait for that drain worker, not only current listeners.
+            let replacement = config.with_extension("new");
+            std::fs::copy(&config, &replacement).unwrap();
+            std::fs::rename(replacement, &config).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .contains("Configuration reloaded successfully")
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        let started = Instant::now();
+        // SAFETY: signal only our owned live child; its PID fits pid_t.
+        assert_eq!(
+            unsafe { libc::kill(child.0.id() as libc::pid_t, signal) },
+            0
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown must remove the owned listener before draining");
+        assert!(tokio::net::UnixStream::connect(&socket).await.is_err());
+
+        if !stalled {
+            assert!(child.0.try_wait().unwrap().is_none());
+            // Transfer after listener removal proves accepted work is still alive.
+            let data = vec![0x5a; 128 * 1024];
+            let (mut reader, mut writer) = stream.split();
+            let send = async {
+                writer.write_all(&data).await.unwrap();
+                writer.shutdown().await.unwrap();
+            };
+            let receive = async {
+                let mut reply = Vec::new();
+                reader.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, data);
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(send, receive);
+            })
+            .await
+            .unwrap();
+            drop(stream);
+        }
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("signal shutdown must be bounded");
+        assert_eq!(status.code(), Some(0));
+        if stalled && grace > 0 {
+            assert!(started.elapsed() >= Duration::from_secs(grace));
+            assert!(
+                std::fs::read_to_string(&log)
+                    .unwrap()
+                    .contains("grace expired")
+            );
+        }
+        assert!(!socket.exists());
+        echo_task.abort();
+    }
+}

@@ -12,6 +12,10 @@ use crate::tcp::tcp_server::{
 };
 
 type Tasks = FuturesUnordered<JoinHandle<()>>;
+type ConfigWatcher = (
+    notify::RecommendedWatcher,
+    tokio::sync::mpsc::Receiver<crate::ConfigChanged>,
+);
 
 async fn load(paths: &Vec<String>, production: bool) -> io::Result<ValidatedConfigs> {
     let configs = config::load_configs(paths).await?;
@@ -122,6 +126,7 @@ pub async fn run(
     dry_run: bool,
     no_reload: bool,
     production: bool,
+    shutdown: impl Future<Output = io::Result<()>>,
 ) -> io::Result<()> {
     let validated = load(&paths, production).await?;
     if dry_run {
@@ -138,12 +143,40 @@ pub async fn run(
     crate::resources::configure(prepared.limits)?;
     let _reporter = crate::resources::ResourceReporter::start();
     crate::memory::spawn_heap_trim_task();
+    crate::listener_tasks::enable_shutdown_drain();
     let (mut registry, mut tasks, mut has_tun) = prepared.start().await?;
+    tokio::select! {
+        biased;
+        signal = shutdown => {
+            log::info!("Shutdown requested; stopping listeners");
+            stop(&mut tasks).await;
+            // Releasing the registry closes listening sockets and removes owned
+            // Unix socket paths before waiting for accepted connections.
+            drop(registry);
+            let grace = std::time::Duration::from_secs(
+                crate::resources::limits().reload_grace_secs.min(30),
+            );
+            crate::listener_tasks::wait_for_shutdown(grace).await;
+            signal
+        }
+        // Keep the entire reload future cancellable, including debounce and I/O.
+        result = serve(&paths, production, &mut registry, &mut tasks, &mut has_tun, &mut watcher) => result,
+    }
+}
+
+async fn serve(
+    paths: &Vec<String>,
+    production: bool,
+    registry: &mut ListenerRegistry,
+    tasks: &mut Tasks,
+    has_tun: &mut bool,
+    watcher: &mut Option<ConfigWatcher>,
+) -> io::Result<()> {
     let mut reload_pending = false;
     loop {
         tokio::select! {
             ended = tasks.next() => {
-                stop(&mut tasks).await;
+                stop(tasks).await;
                 return Err(listener_exit_error(ended));
             }
             event = async {
@@ -155,14 +188,14 @@ pub async fn run(
             } => {
                 reload_pending = false;
                 if event.is_none() {
-                    stop(&mut tasks).await;
+                    stop(tasks).await;
                     return Err(io::Error::other("configuration watcher stopped"));
                 }
                 // Keep current listeners serving throughout debounce and preparation.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if let Some((_, rx)) = watcher.as_mut() { while rx.try_recv().is_ok() {} }
-                let replacement = match load(&paths, production).await {
-                    Ok(validated) => PreparedGeneration::prepare(validated, &registry, true, has_tun).await,
+                let replacement = match load(paths, production).await {
+                    Ok(validated) => PreparedGeneration::prepare(validated, registry, true, *has_tun).await,
                     Err(error) => Err(error),
                 };
                 match replacement {
@@ -181,12 +214,12 @@ pub async fn run(
                         } else { None };
                         // All TCP binds succeeded. Unchanged addresses reuse live sockets.
                         crate::resources::configure(next.limits)?;
-                        stop(&mut tasks).await;
-                        (registry, tasks, has_tun) = next.start().await?;
+                        stop(tasks).await;
+                        (*registry, *tasks, *has_tun) = next.start().await?;
                         // Do not discard a change queued while preparing the replacement.
                         // The new watcher may not have existed when that edit occurred.
                         reload_pending = watcher.as_mut().is_some_and(|(_, rx)| rx.try_recv().is_ok());
-                        watcher = next_watcher;
+                        *watcher = next_watcher;
                         log::info!("Configuration reloaded successfully");
                     }
                 }
