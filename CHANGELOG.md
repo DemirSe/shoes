@@ -296,7 +296,7 @@ Multi-hop proxy chains with load balancing support. Traffic can now be routed th
 - **Round-robin chains**: Specify multiple chains and rotate between them for load distribution
 - **Pool-based load balancing**: At each hop, use a pool of proxies for load balancing
 - New config fields: `client_chain` (singular) and `client_chains` (multiple)
-- See `examples/multi_hop_chain.yaml` for usage examples
+- See `CONFIG.md` for client chain configuration
 
 ### TUIC v5 Zero-RTT Handshake
 New `zero_rtt_handshake` option for TUIC v5 servers enables 0-RTT (0.5-RTT for server) handshakes for faster connection establishment.

@@ -3,7 +3,7 @@
 Tam YAML referansı: [CONFIG.md](../CONFIG.md). Bu belge yalnızca bu fork'un
 üretim profilini ve kritik davranışları özetler.
 
-`examples/` çoğunlukla destek garantisi olmayan upstream/legacy örnekler içerir; kapsam için [örnek notuna](../examples/README.md) bakın.
+`examples/` yalnız desteklenen profillerin örneklerini içerir (VLESS/TLS, REALITY, TUN, direct); kapsam için [örnek notuna](../examples/README.md) bakın.
 
 ## Yapı
 
