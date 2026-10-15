@@ -558,6 +558,22 @@ garantisi** olmadan hiçbir değişiklik tutulmaz.
 - İkinci temizlik paketi (E07/E08/E13/E30/E31/E33/E15): API/platform kapsam teyidi bekliyor.
 - TF01 port flake'i, `examples/` temizliği, sinyal yönetimi ve LH-8…LH-11: kayıtlı borçlar.
 
+## Takip güncellemesi (2026-10-15)
+
+- **Ö1 — sinyal yönetimi uygulandı ve canlıda:** `src/shutdown_signal.rs` (libc sinyal maskesi + `sigwait` thread)
+  ile SIGTERM/SIGINT düzgün kapanış: kabul döngüleri durur, bağlantılar sınırlı süre drenaj edilir
+  (`min(reload_grace_secs, 30)` sn; süre aşımında iptal), süreç 0 koduyla çıkar. **Yeni bağımlılık yok**
+  (tokio `signal` özelliği `signal-hook-registry` gerektiriyor; çevrimdışı registry'de yok → libc tabanlı tasarım).
+  Lifecycle testleri 10/10 (iki sinyal, soket temizliği, reload sonrası transfer, timeout, sıfır grace);
+  hedefli A/B: throughput −%0,39 [−1,47, +1,47], marj %2 (bağımsız doğrulandı); kodgen kollateralı
+  117/133 sınıflandırıldı, 16 açık kayıt belgeli. Canlı `0590a4c4…`; systemd restart'ı temiz drenajla geçti.
+- **Examples temizliği (W9):** 34 stale YAML silindi (kaldırılmış protokol/aktarım içerenler), 4 desteklenen
+  örnek kaldı (`reality_basic`, `reality_vision`, `vless_over_tls`, `tun_vpn`); README/docs/CHANGELOG güncellendi.
+- **Ek temizlikler:** E33 (test-only senkron decoder kaldırıldı; `.text` byte-özdeş), E07+E13 (ölü yardımcılar ve
+  re-export'lar; deploy ikilisi bit-aynı). E08/E30/E31 kodgen kapısında bırakıldı.
+- **Kalan borçlar:** TF01 teorik `elapsed < 1s` penceresi; `tun_vpn.yaml` yorum bloklarındaki stale örnekler;
+  LH-8…LH-11; Ö2/Ö5, ClientHello 64 KB tampon, `copy_bidirectional_message` 64 KB politikası; mobil hedef doğrulaması.
+
 ## Belgele notları (2026-10-14)
 
 - **E16:** `examples/README.md` legacy/upstream kapsamını açıklar; kaldırılmış protokol örnekleri destek kanıtı değildir. Silme/arşivleme yapılmadı.
