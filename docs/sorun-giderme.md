@@ -132,7 +132,7 @@ Yedek temizliği her zaman ayrı onaylı bakım işlemidir.
 
 ## Kayıtlar nerede?
 
-- `report.md` — inceleme ve karar kayıtları (depoda).
+- Tarihsel inceleme notları — Git geçmişi (`git log --all -- report.md`).
 - `SERVER-FEATURE-DECISIONS.md` — özellik kararları (depoda).
 - `~/.local/state/shoes-live/` — canlı ölçüm, izleme script'leri, karar kayıtları.
 - `~/.pi/agent/server-ssh.json` — bağlantı ayrıntıları (yerel).

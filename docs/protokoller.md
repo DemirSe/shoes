@@ -98,4 +98,4 @@ istemci                sunucu (shoes)                 hedef
 ## İlgili belgeler
 
 - Yapılandırma karşılıkları: [konfigurasyon.md](konfigurasyon.md)
-- Karar gerekçeleri: [kararlar.md](kararlar.md), [report.md](../report.md)
+- Karar gerekçeleri: [kararlar.md](kararlar.md), [SERVER-FEATURE-DECISIONS.md](../SERVER-FEATURE-DECISIONS.md)

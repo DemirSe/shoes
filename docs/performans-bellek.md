@@ -1,8 +1,8 @@
 # Performans ve Bellek Geçmişi
 
 Bu belge, bu fork'ta yapılan performans ve bellek çalışmalarının özetini tutar.
-Ayrıntılı inceleme kayıtları: [report.md](../report.md) ve
-`~/.local/state/shoes-live/` altındaki yerel kayıtlar.
+Ayrıntılı inceleme kayıtları Git geçmişinde (`git log --all -- report.md`) ve
+`~/.local/state/shoes-live/` altındaki yerel kayıtlarda bulunur.
 
 ## Çalışma turları
 

@@ -1,8 +1,7 @@
 # Kararlar ve Kısıtlar
 
 Bu belge, sahibin verdiği kararları ve gerekçelerini özetler.
-Tam kayıtlar: [SERVER-FEATURE-DECISIONS.md](../SERVER-FEATURE-DECISIONS.md),
-[report.md](../report.md).
+Tam karar kaydı: [SERVER-FEATURE-DECISIONS.md](../SERVER-FEATURE-DECISIONS.md).
 
 ## Değişmeyen kısıtlar
 

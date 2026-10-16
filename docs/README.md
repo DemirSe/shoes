@@ -33,11 +33,11 @@ ve sorun giderme.
 
 Alan tanımları, test komutları ve deploy adımları kendi esas belgelerinde güncellenir.
 Özet belgeler bunları yeniden çoğaltmaz; ilgili kaynağa bağlanır.
-`report.md`, eski changelog girdileri ve tarihli ölçümler geçmiş kayıttır.
+Eski changelog girdileri ve tarihli ölçümler geçmiş kayıttır.
 Tarihsel öneriler güncel davranış veya canlı durum kanıtı sayılmaz.
+Kaldırılan inceleme kaydı Git geçmişinden `git log --all -- report.md` ile bulunabilir.
 
 Depodaki diğer belgeler: [CONFIG.md](../CONFIG.md) (tam YAML referansı),
-[report.md](../report.md) (inceleme ve karar kayıtları),
 [SERVER-FEATURE-DECISIONS.md](../SERVER-FEATURE-DECISIONS.md) (özellik kararları),
 [.github/OFFLINE-CI.md](../.github/OFFLINE-CI.md) (CI ön koşulları).
 

@@ -103,7 +103,8 @@ rollback. Live steps always need separate owner approval.
 - [CONTRIBUTING.md](CONTRIBUTING.md): toolchain, verification commands and contributor/release checklist.
 - [docs/operasyon.md](docs/operasyon.md): deployment, health, rollback and retention procedure.
 - [docs/kararlar.md](docs/kararlar.md): current scope; the owner record preserves decisions.
-- `report.md`, dated performance sections and old changelog entries: history, not current live-state evidence.
+- Dated performance sections and old changelog entries: history, not current live-state evidence.
+  Removed review notes remain available through `git log --all -- report.md`.
 
 Use `implemented locally`, `verified locally`, and `deployed` as distinct statuses.
 Live status requires a dated approved deployment receipt; never infer it from a source change.
