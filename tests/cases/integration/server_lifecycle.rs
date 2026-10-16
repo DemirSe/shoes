@@ -66,6 +66,25 @@ fn dry_run_invalid_uuid_and_udp_transport_fail_without_panic() {
     assert!(exits(&profile(18443, ID), false, true).0.success());
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn dry_run_does_not_start_allocator_reclamation() {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(profile(18443, ID).as_bytes()).unwrap();
+    let output = Command::new(binary())
+        .args(["--dry-run", "--threads", "1"])
+        .arg(file.path())
+        .env("RUST_LOG", "info")
+        .env_remove("_RJEM_MALLOC_CONF")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr)
+            .contains("Jemalloc background reclamation enabled")
+    );
+}
+
 #[test]
 fn occupied_port_exits_in_both_reload_modes_without_panic() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -405,6 +424,7 @@ async fn signals_stop_listeners_drain_active_transfers_and_exit_zero() {
             .args(["--threads", threads, "--log-file"])
             .arg(&log)
             .env("RUST_LOG", "info")
+            .env_remove("_RJEM_MALLOC_CONF")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if no_reload {
@@ -422,6 +442,12 @@ async fn signals_stop_listeners_drain_active_transfers_and_exit_zero() {
         })
         .await
         .unwrap();
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("Jemalloc background reclamation enabled")
+        );
         let (destination, echo_task) = echo().await;
         let mut request = vec![0];
         request.extend_from_slice(&shoes_test_support::vless::parse_uuid(ID).unwrap());

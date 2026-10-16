@@ -1,4 +1,6 @@
 mod address;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod allocator;
 mod async_stream;
 mod buf_reader;
 mod client_proxy_chain;
@@ -288,6 +290,12 @@ fn main() {
         eprintln!("Could not initialize shutdown signals: {error}");
         std::process::exit(1);
     });
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if !dry_run && let Err(error) = allocator::configure_reclamation() {
+        eprintln!("Could not configure allocator reclamation: {error}");
+        std::process::exit(1);
+    }
 
     let runtime = builder
         .enable_io()

@@ -1,10 +1,10 @@
 //! Periodic glibc heap trimming.
 //!
-//! A burst of connections can leave freed buffers retained by the allocator,
-//! so the resident set stays high until those pages are returned to the OS.
-//! A rare, idle-only trim returns that memory without touching active paths:
-//! the measured cost is about 15 ms for a 300 MB heap, and re-faulting the
-//! pages costs nothing measurable because the buffers are written on reuse.
+//! This only attempts to return free pages owned by glibc to the OS. The Linux
+//! CLI uses jemalloc for Rust allocations, which `malloc_trim` cannot purge;
+//! native dependencies may still allocate through glibc. Process RSS includes
+//! both allocators and is only a trigger, not a measure of reclaimable memory.
+//! A successful call does not establish which workload caused the allocation.
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::time::Duration;
@@ -19,11 +19,9 @@ const TRIM_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const TRIM_RSS_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Only trim while the server is not busy: normal browsing keeps a few dozen
-/// connections open, and the measured trim cost (0.02-15 ms, on a blocking
-/// thread) stays negligible at that level. A heavily loaded server (hundreds of
-/// connections) is left alone so a burst never pays the trim cost or the
-/// page-fault cost that follows it.
+/// Avoid trimming above this connection count. The snapshot is a heuristic:
+/// fewer connections do not prove low traffic, and activity can change before
+/// the blocking task runs. This is not a latency or page-fault guarantee.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const TRIM_MAX_ACTIVE_CONNECTIONS: usize = 128;
 
@@ -44,8 +42,8 @@ fn process_rss_bytes() -> Option<u64> {
 
 /// Spawn the periodic heap-trim task.
 ///
-/// The task never runs on the hot path: it wakes on an interval, and only an
-/// idle process above the RSS threshold is trimmed, on a blocking thread.
+/// The task wakes on an interval and attempts glibc-only reclamation on a
+/// blocking thread when the RSS and connection-count heuristics permit it.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn spawn_heap_trim_task() {
     tokio::spawn(async {
@@ -63,7 +61,7 @@ pub fn spawn_heap_trim_task() {
             if should_trim(rss, active) {
                 let released = tokio::task::spawn_blocking(|| {
                     // SAFETY: `malloc_trim` is a thread-safe glibc call that
-                    // releases free heap pages; it never invalidates live
+                    // releases free glibc heap pages; it never invalidates live
                     // allocations.
                     unsafe { libc::malloc_trim(0) }
                 })
@@ -122,6 +120,9 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
 
+        // Vec uses the enclosing target's global allocator: glibc in the library
+        // test executable, jemalloc in the Linux CLI test executable. Results
+        // from one target must not be attributed to the other allocator.
         let chunk = 65536usize;
         let count = (256 * 1024 * 1024) / chunk;
         let blocks: Vec<Vec<u8>> = (0..count).map(|_| vec![0x5Au8; chunk]).collect();
