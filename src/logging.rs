@@ -21,23 +21,61 @@ pub trait LogWriter: Send + Sync {
 pub struct StderrWriter;
 
 impl LogWriter for StderrWriter {
-    fn write_log(&self, _record: &Record, formatted: &str) {
-        let sanitized: String = formatted
-            .chars()
-            .map(|c| {
-                if c.is_ascii_graphic() || c == ' ' {
-                    c
-                } else {
-                    '?'
-                }
-            })
-            .collect();
-        let _ = writeln!(std::io::stderr(), "{sanitized}");
+    fn write_log(&self, record: &Record, formatted: &str) {
+        let line = stderr_log_line(record.level(), formatted, stderr_is_journal());
+        let _ = std::io::stderr().write_all(line.as_bytes());
     }
 
     fn flush(&self) {
         let _ = std::io::stderr().flush();
     }
+}
+
+/// Match the actual stderr descriptor, not just an inherited environment flag.
+/// Plain terminals, redirected files and non-Linux platforms retain their format.
+fn stderr_is_journal() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(stream) = std::env::var("JOURNAL_STREAM") else {
+            return false;
+        };
+        let Ok(metadata) = std::fs::metadata("/proc/self/fd/2") else {
+            return false;
+        };
+        journal_stream_matches(&stream, metadata.dev(), metadata.ino())
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn journal_stream_matches(stream: &str, device: u64, inode: u64) -> bool {
+    let Some((dev, ino)) = stream.split_once(':') else {
+        return false;
+    };
+    dev.parse::<u64>() == Ok(device) && ino.parse::<u64>() == Ok(inode)
+}
+
+fn stderr_log_line(level: Level, formatted: &str, journal: bool) -> String {
+    let mut line = String::with_capacity(formatted.len() + 4);
+    if journal {
+        line.push_str(match level {
+            Level::Error => "<3>",
+            Level::Warn => "<4>",
+            Level::Info => "<6>",
+            Level::Debug | Level::Trace => "<7>",
+        });
+    }
+    line.extend(formatted.chars().map(|c| {
+        if c.is_ascii_graphic() || c == ' ' {
+            c
+        } else {
+            '?'
+        }
+    }));
+    line.push('\n');
+    line
 }
 
 /// Writes to a file opened at init time. Each log line is a single write() syscall
@@ -291,6 +329,97 @@ pub fn resolve_directives() -> Vec<Directive> {
 mod tests {
     use super::*;
     use log::Level;
+
+    #[test]
+    fn journal_priorities_map_levels_and_plain_stderr_is_unchanged() {
+        for (level, prefix) in [
+            (Level::Error, "<3>"),
+            (Level::Warn, "<4>"),
+            (Level::Info, "<6>"),
+            (Level::Debug, "<7>"),
+            (Level::Trace, "<7>"),
+        ] {
+            assert_eq!(
+                stderr_log_line(level, "record", true),
+                format!("{prefix}record\n")
+            );
+            assert_eq!(stderr_log_line(level, "record", false), "record\n");
+        }
+        assert_eq!(
+            stderr_log_line(Level::Error, "a\n<0>forged\r\x1b\u{2028}", true),
+            "<3>a?<0>forged???\n"
+        );
+    }
+
+    #[test]
+    fn journal_stream_requires_matching_device_and_inode() {
+        assert!(journal_stream_matches("12:34", 12, 34));
+        for stream in ["", "12", "12:35", "13:34", "x:34", "12:34:56"] {
+            assert!(!journal_stream_matches(stream, 12, 34));
+        }
+    }
+
+    #[test]
+    fn close_details_are_debug_only_but_summary_is_visible_by_default() {
+        let default = logger_from(parse_directives(""));
+        assert!(!default.matches(Level::Debug, "shoes::tcp::connection_errors"));
+        assert!(default.matches(Level::Error, "shoes::connection_errors"));
+        let debug = logger_from(parse_directives("debug"));
+        assert!(debug.matches(Level::Debug, "shoes::tcp::connection_errors"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stderr_detects_the_actual_journal_descriptor_in_a_child_process() {
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+
+        const CHILD: &str = "SHOES_TEST_JOURNAL_WRITER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            for level in [
+                Level::Error,
+                Level::Warn,
+                Level::Info,
+                Level::Debug,
+                Level::Trace,
+            ] {
+                StderrWriter.write_log(&Record::builder().level(level).build(), "safe\n<0>forged");
+            }
+            return;
+        }
+        for matched in [true, false] {
+            let (mut reader, writer) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let metadata =
+                std::fs::metadata(format!("/proc/self/fd/{}", writer.as_raw_fd())).unwrap();
+            let stream = format!(
+                "{}:{}",
+                metadata.dev(),
+                metadata.ino() + u64::from(!matched)
+            );
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "logging::tests::stderr_detects_the_actual_journal_descriptor_in_a_child_process", "--nocapture"])
+                .env(CHILD, "1")
+                .env("JOURNAL_STREAM", stream)
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(OwnedFd::from(writer)))
+                .spawn().unwrap();
+            let mut output = String::new();
+            reader.read_to_string(&mut output).unwrap();
+            assert!(child.wait().unwrap().success());
+            let expected = if matched {
+                "<3>safe?<0>forged\n<4>safe?<0>forged\n<6>safe?<0>forged\n<7>safe?<0>forged\n<7>safe?<0>forged\n".to_owned()
+            } else {
+                "safe?<0>forged\n".repeat(5)
+            };
+            assert_eq!(output, expected);
+        }
+    }
 
     #[test]
     fn file_log_lines_preserve_printable_text_and_neutralize_controls() {

@@ -1,4 +1,5 @@
 pub mod chain_builder;
+mod connection_errors;
 pub mod proxy_connector;
 pub mod proxy_connector_impl;
 pub mod socket_connector;

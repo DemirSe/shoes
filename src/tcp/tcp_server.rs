@@ -74,9 +74,9 @@ async fn run_tcp_server(
         tasks.spawn(async move {
             let _permit = permit;
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
-                error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+                super::connection_errors::record(e.kind());
             } else {
-                debug!("{}:{} finished successfully", addr.ip(), addr.port());
+                debug!("TCP connection finished successfully");
             }
         });
     }
@@ -95,7 +95,7 @@ async fn run_unix_server(
             result = listener.accept() => result,
             _ = tasks.join_next(), if !tasks.is_empty() => continue,
         };
-        let (stream, addr) = match accepted {
+        let (stream, _addr) = match accepted {
             Ok(v) => v,
             Err(e) => {
                 error!("Accept failed: {e:?}");
@@ -116,9 +116,9 @@ async fn run_unix_server(
         tasks.spawn(async move {
             let _permit = permit;
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
-                error!("{addr:?} finished with error: {e:?}");
+                super::connection_errors::record(e.kind());
             } else {
-                debug!("{addr:?} finished successfully");
+                debug!("Unix connection finished successfully");
             }
         });
     }

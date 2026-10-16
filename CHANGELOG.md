@@ -4,6 +4,15 @@
 
 These are local source changes, not a published release or proof of live deployment.
 
+- Replace outer TCP/Unix per-connection error logs with process-wide, kind-only
+  error counts, emitted on failure at most once per 30 seconds. Keep pending
+  counts and the rate gate across reloads; no reporting timer or dependency added.
+  Preserve operational errors; debug close details no longer include addresses
+  or raw error messages. Release builds still omit DEBUG/TRACE macros.
+- Prefix stderr records with systemd severity only when Linux JOURNAL_STREAM
+  matches the actual stderr descriptor. Plain stderr and file formats stay
+  unchanged; journal filtering still requires SyslogLevelPrefix=yes on deployment.
+
 - Reject unknown keys in server VLESS/TLS, TLS-target and REALITY-target blocks
   instead of silently ignoring misspelled policy fields. Keep documented aliases
   and defaults; add parser, reload and prepared-example dry-run regressions.

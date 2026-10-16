@@ -187,6 +187,10 @@ impl Proxy {
     }
 
     async fn start_with_symlink(symlink_mode: bool) -> Self {
+        Self::start_with_logging(symlink_mode, "info").await
+    }
+
+    async fn start_with_logging(symlink_mode: bool, level: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("server.yaml");
         let log = directory.path().join("server.log");
@@ -208,7 +212,7 @@ impl Proxy {
             .args(["--threads", "1", "--log-file"])
             .arg(&log)
             .arg(&config)
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", level)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -282,6 +286,100 @@ impl Proxy {
         assert_eq!(response, [0, 0]);
         stream
     }
+}
+
+#[tokio::test]
+async fn connection_error_flood_is_bounded_and_gate_survives_reload() {
+    let proxy = Proxy::start().await;
+    // Readiness itself closes an unauthenticated connection. Wait for its
+    // immediate summary before creating a burst and replacing the generation.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if std::fs::read_to_string(&proxy.log)
+                .unwrap()
+                .contains("Connection close error counts")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let fail = async {
+        for _ in 0..20 {
+            let mut stream = TcpStream::connect(("127.0.0.1", proxy.port)).await.unwrap();
+            stream
+                .write_all(b"invalid-header-private-sentinel")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            let mut reply = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut reply))
+                .await
+                .unwrap();
+        }
+    };
+    fail.await;
+    let log = std::fs::read_to_string(&proxy.log).unwrap();
+    assert_eq!(log.matches("Connection close error counts").count(), 1);
+    assert!(!log.contains("finished with error"));
+    assert!(!log.contains("invalid-header-private-sentinel"));
+    assert!(!log.contains("127.0.0.1"));
+    let replacement = profile(proxy.port, SECOND);
+    #[cfg(unix)]
+    let replacement = format!(
+        "{replacement}- path: '{}'\n  protocol:\n    type: vless\n    user_id: '{SECOND}'\n",
+        proxy._directory.path().join("errors.sock").display()
+    );
+    proxy.replace(&replacement, true, true).await;
+    let mut invalid = TcpStream::connect(("127.0.0.1", proxy.port)).await.unwrap();
+    invalid.shutdown().await.unwrap();
+    let mut reply = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), invalid.read_to_end(&mut reply))
+        .await
+        .unwrap();
+    #[cfg(unix)]
+    {
+        let mut invalid =
+            tokio::net::UnixStream::connect(proxy._directory.path().join("errors.sock"))
+                .await
+                .unwrap();
+        invalid.shutdown().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), invalid.read_to_end(&mut reply))
+            .await
+            .unwrap();
+    }
+    assert!(
+        !std::fs::read_to_string(&proxy.log)
+            .unwrap()
+            .contains("Connection close error counts")
+    );
+    let (port, echo_task) = echo().await;
+    exchange(&mut proxy.connect(port, SECOND).await).await;
+    echo_task.abort();
+}
+
+#[tokio::test]
+async fn connection_error_debug_details_are_kind_only() {
+    // Release builds statically omit debug macros by the existing log feature.
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let proxy = Proxy::start_with_logging(false, "shoes::tcp::connection_errors=debug").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let log = std::fs::read_to_string(&proxy.log).unwrap();
+            if log.contains("Connection closed with error kind=") {
+                assert!(!log.contains("127.0.0.1"));
+                assert!(!log.contains("failed to setup server stream"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[cfg(unix)]

@@ -2,19 +2,32 @@
 
 ## Günlükte sık görülen bağlantı hataları
 
-Aşağıdakiler tarama veya yarıda kesilen bağlantılardan gelebilir.
-Tek başına servis arızasını kanıtlamaz; gerçek istemcide de görülüyorsa uyumluluk ve bağlantı yolunu inceleyin:
+Bağlantı kapanış hataları tarama veya yarıda kesilen gerçek istemci bağlantılarından gelebilir.
+Tek başına servis arızasını veya tarayıcı kaynağını kanıtlamaz.
+Yeni kaynak sürümü, her bağlantı için adres ve ham hata yazmak yerine sabit kategorili özet üretir:
 
 ```
-ERROR shoes::tcp::tcp_server] <ip>:<port> finished with error:
-  failed to setup server stream: expected client handshake
-ERROR shoes::tcp::tcp_server] <ip>:<port> finished with error:
-  failed to setup server stream: EOF while reading
+ERROR shoes::connection_errors] Connection close error counts (not service failures): InvalidData=1 UnexpectedEof=0 ConnectionReset=0 ConnectionAborted=0 TimedOut=0 ConnectionRefused=0 BrokenPipe=0 Other=0
 ```
 
-- `expected client handshake`: TLS/REALITY el sıkışması olmayan bağlantı.
-- `EOF while reading`: yarıda kesilen bağlantı (tarayıcı/port taraması).
-- Kaynağı ve hata oranını gerçek bağlantı başarısıyla karşılaştırın; sürekli hatayı otomatik olarak zararsız saymayın.
+- İlk hata hemen raporlanır; sonraki özetler arasında en az 30 saniye vardır.
+- Sayaçlar süreç genelinde TCP/Unix dinleyicileri ve reload nesilleri arasında paylaşılır.
+- Özet, önceki özette sıfırlanan sayaçlardan sonra biriken kapanış hatalarını içerir; boş özet üretilmez.
+- Zamanlayıcı yoktur: bekleyen sayılar sonraki hatada, süre dolmuşsa raporlanır. Sessizlikte yazılmaz.
+- Reload kapıyı veya bekleyen sayıları sıfırlamaz. Süreç çıkışında bekleyen sayılar kaybolabilir.
+- ERROR düzeyi, mevcut varsayılan filtrede özeti görünür tutar; her sayı servis arızası değildir.
+- DEBUG ayrıntısı yalnız hata kategorisidir; adres, ham hata metni veya paket verisi içermez.
+- Bu sınırlama yalnız dış TCP/Unix kapanış kayıtlarını kapsar; bütün loglar için küresel kota değildir.
+- Gerçek istemci başarısıyla karşılaştırın; sürekli hatayı otomatik olarak zararsız saymayın.
+
+Linux stderr tanımlayıcısı `JOURNAL_STREAM` aygıt/inode kimliğiyle eşleşirse her kayda
+systemd seviye öneki eklenir: ERROR `<3>`, WARN `<4>`, INFO `<6>`, DEBUG/TRACE `<7>`.
+`SyslogLevelPrefix=yes` gereklidir (systemd varsayılanı); canlı ayar bu değişiklikte doğrulanmadı.
+Terminal/normal dosyaya yönlendirilmiş stderr ve dosya log formatları değişmez.
+`journalctl -p err` yalnız ERROR ve daha yüksek önemleri seçer; WARN kayıtlarını seçmez.
+Bu eşleme yalnız logger kayıtlarını kapsar; doğrudan `eprintln!`, CLI yardım/hata çıktısı
+ve panic çıktıları journal'ın varsayılan önceliğinde kalabilir. Servis durumunu da izleyin.
+Dağıtılmamış kaynak değişikliği, canlı journal düzelmesi kanıtı değildir.
 
 ## Temel teşhis komutları
 
