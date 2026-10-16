@@ -589,3 +589,324 @@ garantisi** olmadan hiçbir değişiklik tutulmaz.
 - **E24:** Doğrulama/dönüşümden sonra kurulan zincir, sunucu ve soket yollarındaki invariant yorumları netleştirildi. Public yardımcıların doğrulamasız çağrılması için güvenlik garantisi verilmez; panic davranışı değişmedi.
 - **E27:** `StreamReader` async I/O okuyucusu, `SlideBuffer` saf tampondur. Rolleri farklı olduğundan birleştirme reddedildi; ayrı kalırlar.
 - **E32:** `TimeoutResolver::new` ve `DEFAULT_TIMEOUT` public API olarak korunur; harici tüketici olabilir. Depo içi kurulum `with_timeout` kullanır; dış kullanım doğrulanmış değildir.
+
+---
+
+# Kalan Değerlendirme Bulguları (2026-10-16)
+
+**Durum güncellemesi:** Bu bölüm, düzeltme öncesi `85c1161` incelemesini kaydeder.
+B1–B3 ve mobil header kontrolü sonraki sahip isteğiyle yerelde düzeltildi.
+Güncel sonuç ve doğrulama en sondaki uygulama bölümündedir; eski satır numaraları başlangıç sürümüne aittir.
+
+> Yöntem: 2026-10-16 kod tabanı değerlendirmesinden (puan 81/100) kalan, öneme göre seçilmiş üç bulgu.
+> `report.md`'nin önceki bölümlerinde zaten kayıtlı borçlar (Ö1…Ö9, LH-8…LH-11, TF01, Ö2/Ö5, E16/E17/E22)
+> burada tekrarlanmaz. Statik okumadır; test, derleme veya canlı bağlantı kullanılmadı.
+> Satır numaraları HEAD `85c1161` üzerinde birebir doğrulandı (Unreleased fork turu: `76255a8`,
+> `ff0d908`, `5028506`, `85c1161`). HEAD ilerlerse her bulgudaki tek satırlık komutla yeniden
+> doğrulanmalıdır. Bu bölüm hiçbir uygulama, dağıtım, bakım veya ayar değişikliği izni vermez.
+
+## B1 — Sunucu yapılandırma struct'larında `deny_unknown_fields` eksik (yazım hatası yutan yüzey)
+
+### Neden önemli
+
+Serde varsayılanı "bilinmeyen alanı sessizce yut"dur. `reality_targets`/TLS sunucu bloklarında
+bir alanın adı yanlış yazıldığında paket kabul edilir ve o politikanın uygulanan değeri sessizce
+varsayılana döner. Somut örnek: `RealityServerConfig.max_time_diff: 300` yerine
+`max_time_dif: 300` yazılırsa saat-kayması penceresi **varsayılana döner** ve hiçbir uyarı çıkmaz.
+Aynı risk isteğe bağlı alanların tamamında geçerlidir (bkz. satır listesi). Güvenlik-kritik
+politikanın tip-yutan yüzeyidir; doğrulama (`validate.rs`) yalnız duyurulan alanları görür,
+sessizce düşen alanı hiç görmez.
+
+### Kanıt (kopyala-koştur)
+
+```bash
+git show 85c1161:src/config/types/server.rs | grep -n 'deny_unknown_fields'   # başlangıçta yalnız 190
+git show 85c1161:src/config/types/client.rs | grep -n 'deny_unknown_fields'   # başlangıçta 19, 52, 136
+git show 85c1161:src/config/types/global.rs | grep -n 'deny_unknown_fields'   # başlangıçta 8
+```
+
+Doğrulanmış konumlar:
+
+| Öge | Konum | Durum |
+|---|---|---|
+| `FallbackRateLimit` | `src/config/types/server.rs:190` | deny var |
+| `RealityServerConfig` | `src/config/types/server.rs:202` | **deny yok** |
+| `TlsServerConfig` | `src/config/types/server.rs:256` | **deny yok** |
+| `ServerProxyConfig` (enum + varyant struct'ları) | `src/config/types/server.rs:298+` | **deny yok** |
+| `RealityServerConfig` isteğe bağlı alanları (typo adayları) | `…:203, 205, 218, 222, 226, 232, 247, 251` | yazım hatası sessizce yutulur |
+
+### Uygulanmadan önce okunması zorunlu notlar
+
+1. **Declared-but-inert alanlar silinmez.** `GlobalLimits` zaten deny'li (`global.rs:8`) ve
+   `quic_*` alanları `src/config/types/global.rs:15-21`'de *declared*-inert'tir
+   (`docs/konfigurasyon.md:52-61`). İstemci tarafı h2mux havuz alanları
+   (`max_connections`/`min_streams`/`max_streams`) CONFIG.md:254-268'de "kabul edilir ama
+   uygulanmamıştır" yüzeyidir; kod tarafı `src/h2mux/mod.rs:66-83` (`#[allow(dead_code)]`).
+   Alanlar *declared* olduğu için deny **ekleme** bunları etkilemez; **silme** ise belgelenmiş
+   mevcut profilleri reddettiği için kapsam dışıdır ve ayrı sahip kararıdır.
+2. Deny eklemeden önce, etkilenen üç struct'ın altında YAML'de kullanılan tüm anahtar
+   envanterini belirle: `examples/*.yaml`, `CONFIG.md` snippet'leri, `tests/` içindeki
+   config yaml'ları. Örnekler şablondur: iki REALITY örneği placeholder anahtar,
+   TLS örneği harici PEM dosyaları ister. Yerel test malzemesiyle hazırlanan geçici
+   kopyalarda `shoes --dry-run` koştur; örneklerin takip edilen asıllarını değiştirme.
+3. İstemci tarafı deserializer (E03'ün tekil deserializer birleştirmesi) zaten deny'li;
+   eklemeleri aynı deserializer katmanı disiplinine göre yap.
+
+### Önerilen sıra
+
+1. `RealityServerConfig`, `TlsServerConfig` struct'larına ve `ServerProxyConfig` enum container'ına
+   `#[serde(deny_unknown_fields)]` ekle (serde hata mesajı beklenen alan listesini verir; ekstra metin gerekmez).
+2. Yeni unit test: bilinen alanın typo'su reddedilir ve `expect_err` hata mesajında alan adı geçer
+   (şablon: `src/config/types/server.rs:702-713`'teki `quic_settings` ret testi).
+3. Kapılar: fmt + clippy `-D warnings` + birim + tüm `examples/*.yaml` üzerinde `--dry-run`.
+4. `CONFIG.md`'ye "bu bloklarda bilinmeyen anahtar hata verir" cümlesini ekleyin.
+   Sahibin onayı ister: davranış görünürlüğü değişir (sunucu proto bloklarında bilinmeyen
+   alan artık `--dry-run`/reload'da reddedilir; mevcut profillerin ret yiyip yiyimediği
+   dry-run ile **test edilir**; canlı dağıtım ayrı sahibin onayı ister).
+
+## B2 — Test destek yüzeyinde kaldırılmış protokol kalıntısı
+
+### Neden önemli
+
+Kaldırılan protokollerin (VMess, Trojan, Shadowsocks/ShadowTLS, HTTP/SOCKS) test yardımcı
+   yüzeyinde duruyor: 67 varyantlı `ProxyType`'ın 44 varyantı
+kaldırılmış protokol adı taşıyor (Vmess/Trojan/Socks/Http/Shadow/Snell/AnyTls/Naive/Hysteria/Tuic).
+Şu an çağrı yok; ama bu, sahibin karar kaydının (`SERVER-FEATURE-DECISIONS.md`: kaldırılanlar
+geri gelmez) test yüzeyindeki tek istisnasıdır. Support crate **public API** olduğundan derleyici
+ve clippy bunları işaretlemez; yanlışlıkla devreye alma ve upstream merge çatışma gürültüsü
+kalıcıdır.
+
+### Kanıt (kopyala-koştur)
+
+```bash
+git show 85c1161:tests/support/src/test_fixture.rs | wc -l              # başlangıçta 6.222 satır
+git show 85c1161:tests/support/src/test_fixture.rs | grep -n 'pub enum ProxyType'   # 440
+git show 85c1161:tests/support/src/test_fixture.rs \
+  | awk 'NR>=440 && NR<=755 && /^    [A-Z]/' | wc -l                    # 67 varyant
+git show 85c1161:tests/support/src/test_fixture.rs \
+  | awk 'NR>=440 && NR<=755 && /^    [A-Z]/' \
+  | grep -cE 'Vmess|Trojan|Socks|Http|Shadow|Snell|AnyTls|Naive|Hysteria|Tuic'   # 44 kaldırılmış-protokol
+grep -rn 'start_naive\|find_naive\|VmessCipher\|ShadowsocksCipher' tests \
+  --include='*.rs' | grep -v 'test_fixture.rs' | wc -l                   # 0 dış çağrı
+```
+
+Doğrulanmış konumlar: `tests/support/src/test_fixture.rs` (6.222 satır);
+`VmessCipher:354`, `ShadowsocksCipher:370`; `find_naive_binary:174`,
+`find_naive_caddy_binary:207`; re-export listesi `tests/support/src/test_fixture.rs:12`
+(benzer adlı `find_singbox_naive_binary` ayrı bir yardımcıdır; envanter çıkarken
+karıştırılmamalıdır). Stale doc-comment:
+`tests/cases/external_network/reality_integration.rs:16` ve `:44`
+("Trojan inner protocols"); boş bölüm başlıkları
+`tests/cases/integration/h2mux_integration.rs:929, 931` ("H2MUX Shadowsocks Tests" /
+"H2MUX Trojan Tests").
+
+### Önerilen sıra
+
+1. Dışa aktarım envanterini tazeleyin (yukarıdaki 0-çağrı komutu; `lib.rs` re-export satırları dahil).
+2. **Çağrısız** kaldırılan-protokol varyant/enum/helper'larını sil.
+   Her silmeden sonra `cargo test --workspace --locked --offline --lib --bins`
+   (dev-dep derlemesini kontrol eder) + isteğe bağlı doğrudan derleme:
+   `cargo build --locked --offline -p shoes-test-support`.
+3. Stale yorumlar: `…/reality_integration.rs` çalışma testlerine **dokunmadan** yalnız
+   doc-comment/bölüm başlıklarını düzelt; `h2mux_integration.rs:929,931` boş başlık bloklarını sil.
+4. Kapılar: aşağıdaki ortak liste. `reality_client_config_test.rs`'in "kaldırılmış front yok"
+   iddiası aynen korunmalı.
+
+## B3 — Bağımlılık sürümlerindeki wildcard gereksinimleri (başlangıç durumu)
+
+### Neden önemli
+
+`Cargo.lock` + evrensel `--locked` kapısı gündelik derlemelerdeki rutin riski nötrleştirir;
+gerçek risk **bir güncelleme turunda** patlar: minimum sürüm alt sınırı olmadan
+(`cargo update`, yeni dep ekleme, izinli lock yenileme) majör atlama sessizce geçer;
+ana/native derleme gereksinimi getiren yeni sürümler (`tikv-jemallocator`, `aws-lc-rs`)
+offline runner provisioning'i geç-keşfedilen bir hataya dönüştürür; ve tokio/h2/quinn/rustls
+stack major atlamaları, wire'tan bağımsız olarak davranışı ve panik yüzeyini sessizce
+değiştirebilir. AGENTS.md, Cargo.lock düzenlemesini sahibin onayına bağlar; manifest pimlemesi
+de derlemeyi etkileyen bir değişikliktir ve ayrı sahibin onayı ister.
+
+### Kanıt (kopyala-koştur)
+
+```bash
+git show 85c1161:Cargo.toml | grep -c '"\*"'                 # başlangıçta 45
+git show 85c1161:tests/support/Cargo.toml | grep -c '"\*"'   # başlangıçta 15
+git show 85c1161:Cargo.toml | grep -nE '^[a-z0-9-]+ = "[0-9.]'   # başlangıçta yalnız jni = "0.22"
+```
+
+Öncelikli alt küme (kapatılacak): `tokio` (88), `tokio-util` (97), `tokio-rustls` (110),
+`quinn` (78), `h2`, `h3`, `h3-quinn`, `rustls`, `aws-lc-rs`, `hickory-resolver`,
+`serde_yaml`, `socket2`, `subtle`, `rand`, `tikv-jemallocator`.
+
+### Önerilen sıra
+
+1. Lock'taki mevcut sürümlere tam pimleme (`=MAJOR.MINOR.PATCH`) yapın.
+   **Kilit değişmez**: önce/sonra SHA-256 aynı olmalı ve `git diff --exit-code -- Cargo.lock` geçmeli.
+   `cargo metadata --locked --offline` ve test kapıları mevcut çözümün kullanılabildiğini doğrular.
+   `cargo update --locked --offline --dry-run` ek kontrol olabilir; wildcard'larla da no-op
+   dönebildiğinden, tek başına pimleme kanıtı değildir.
+2. Kapılar: aşağıdaki ortak liste. Pimleme davranışsal nötrdür (yalnız manifest değişir);
+   yine de ayrı bir commit yapın ve politikayı tek cümleyle `docs/test-ve-ci.md`/`CONTRIBUTING.md`
+   içine yazın.
+
+## İlişkili düşük öncelikli not
+
+- **Mobil header diff kapısı eksikti**: Eski betik cbindgen yoksa mesaj vererek mevcut header'la devam ediyordu.
+  Ancak workflow'un araç kontrolü eksik cbindgen durumunda zaten işi durduruyordu; CI'ın bu nedenle
+  yeşil geçtiği iddiası yanlıştı. Yerel düzeltme, cbindgen'i betikte de zorunlu tutar.
+  Üretilen geçici header, takip edilen header'la karşılaştırılır; drift veya HEAD farkı işi durdurur.
+  Mevcut header üzerine yazılmaz. Gerçek iOS derlemesi hâlâ ayrıca doğrulanmalıdır.
+
+## Ortak doğrulama kapıları (üç bulgu için geçerli)
+
+```bash
+env CARGO_HOME=/home/demir/.local/share/shoes-toolchain/cargo \
+RUSTUP_HOME=/home/demir/.local/share/shoes-toolchain/rustup \
+PATH=/home/demir/.local/share/shoes-toolchain/cargo/bin:$PATH \
+CARGO_TARGET_DIR=/home/demir/.cache/shoes-target \
+SHOES_TEST_SING_BOX_BIN=/usr/local/bin/sing-box \
+bash -c '
+  set -e
+  cargo fmt --all -- --check
+  cargo clippy --workspace --locked --offline --all-targets --all-features -- -D warnings
+  cargo test --workspace --locked --offline --lib --bins
+  cargo test -p shoes --locked --offline --lib --features ffi -- --test-threads=1
+  cargo test -p shoes --locked --offline --features integration-tests --test integration -- --test-threads=1
+'
+```
+
+Entegrasyon paketinde bazı testler `SHOES_TEST_SING_BOX_BIN` ister (yoksa test atlanmaz,
+**hata** verir).
+Referans sürümler (2026-10-16 turlarında kayıt): sing-box 1.14.2, Rust 1.99.0 (CONTRIBUTING.md).
+
+## Öncelik sırası ve uygulama durumu
+
+| Bulgu | Önerilen sıra | Sahip onayı gereksinimi |
+|---|---|---|
+| B1 — `deny_unknown_fields` eklenmesi | 1 | ✓ (davranış görünürlüğü) |
+| B2 — test yüzeyi temizliği | 2 | — (yalnız test yüzeyi; prod etkisi yok) |
+| B3 — bağımlılık pimlemesi | 3 | ✓ (manifest, derlemeyi etkiler) |
+
+Bu tablo başlangıçtaki onay kapsamını kaydeder. Sonraki “bulguları düzelt” isteğiyle B1–B3
+yerelde uygulandı. Dağıtım, canlı bakım, staging, commit veya push bu turun kapsamında değildir.
+
+---
+
+## B1–B3 düzeltme ve doğrulama sonucu (2026-10-16)
+
+Sahibin “bulguları düzelt” isteğiyle aşağıdaki değişiklikler yerelde uygulandı.
+Başlangıç commit'i `85c1161`; raporun önceden değiştirilmiş bölümleri korunarak teknik yanlışları düzeltildi.
+Bu turda SSH bağlantısı, canlı bakım, dağıtım, staging, commit veya push yapılmadı.
+
+### Kapanan bulgular
+
+| Bulgu | Yerel sonuç |
+|---|---|
+| B1 | `RealityServerConfig`, `TlsServerConfig` ve `ServerProxyConfig` bilinmeyen alanları reddediyor. |
+| B2 | Çağrısız eski protokol varyantları, builder'ları, render yolları ve Naive araç araması kaldırıldı. |
+| B3 | Her iki manifestin registry gereksinimleri, mevcut kilitteki tam sürümlere sabitlendi. |
+| Mobil header | Betik cbindgen/Xcode ister; geçici üretilen header farkı veya takip edilen header'ın HEAD farkı işi durdurur. |
+
+**B1 kapsamı:** Yeni testler REALITY zaman penceresi, TLS ALPN ve VLESS UDP yazım hatalarını kapsar.
+TLS enum alanındaki yazım hatası ve custom nested deserializer yolu da reddedilir.
+Mevcut alias ve varsayılanlar korunur.
+Client h2mux havuz alanları ve global QUIC uyumluluk alanları silinmedi; kabul testleri eklendi.
+Testler dışındaki sunucu tiplerinde üç serde attribute değişikliği dışında alan değişikliği yoktur.
+
+Reload regresyonuna bilinmeyen protokol alanı eklendi.
+Reddedilen reload, mevcut dinleyici ve aktif aktarımı koruyor.
+Dört örnek, sentetik anahtar ve yerel test PEM'leriyle geçici kopyalarda dry-run'dan geçti.
+Asıl örnek dosyaları değiştirilmedi; dinleyici veya TUN açılmadı.
+
+Release CLI ile ayrıca üretim profili sınandı:
+doğru profil `0`, `max_time_dif`, `udp_enabld` ve `tls_buffer_siz` hataları `1` koduyla çıktı.
+Her ret, bilinmeyen alanın adını belirtiyor.
+Canlı yapılandırma okunmadı veya bu teste verilmedi.
+
+**B2 kapsamı:** `ProxyType` varyantları 67'den 23'e indi; kaldırılan sayı Trojan dahil 44'tür.
+`test_fixture.rs` 6.222 satırdan 3.002 satıra indi.
+VLESS, REALITY, Vision, h2mux, TUN ve stok sing-box test girişleri korundu.
+Kalan 38 public yardımcı/builder gövdesi, başlangıç sürümüyle beyaz boşluk hariç aynı bulundu.
+Silinen builder/helper'lar için dış çağrı envanteri kontrol edildi.
+İki integration dosyasındaki eski protokol yorumlarının düzeltildiği, test kodunun değişmediği ayrıca doğrulandı.
+Test destek paketindeki API temizliği, production protokollerini geri eklemez veya wire formatını değiştirmez.
+
+**B3 kapsamı:** Başlangıçtaki wildcard satır sayıları ana manifestte 45, destek paketinde 15 idi.
+Şimdi wildcard yoktur; mevcut `jni` gereksinimi de kilitteki tam sürüme sabitlendi.
+Registry gereksinimi kayıtları 46 + 15'tir; bunlar benzersiz paket sayıları değildir.
+Yeni bağımlılık, feature veya sürüm eklenmedi.
+Sürüm metadata ekleri pinlere dahil edilmedi; kilitteki sürümler değişmedi.
+Tam sürüm politikası `CONTRIBUTING.md` içine yazıldı.
+
+`Cargo.lock` önce/sonra SHA-256:
+
+```text
+46bbbd64f4b0f7fb85dc4ff553bc65b47be8464e0bd2a542170a5e68bfdd7564
+```
+
+**Header kontrolü:** cbindgen çevrimdışı ortamla geçici dosyaya yazar.
+Takip edilen `include/shoes.h` üzerine yazılmaz.
+Beş sahte-araç senaryosu geçti: eksik cbindgen, eksik Xcode, üretilen header farkı,
+HEAD'den farklı takip edilen header ve eşleşen header ile sonraki önkoşula geçiş.
+İlk dört senaryo çıktı temizliği başlamadan durdu; tümünde mevcut header korundu.
+Bu kontrol gerçek cbindgen üretimi veya iOS derlemesi değildir.
+
+### Son doğrulama
+
+Rust 1.99.0, sing-box 1.14.2 ve izole toolchain kullanıldı.
+Cargo test/lint/release komutlarında `--locked --offline` verildi.
+Hedef dizini `/home/demir/.cache/shoes-test-target`; geçici dosyalar `/tmp/opencode` altında tutuldu.
+
+| Kontrol | Sonuç |
+|---|---|
+| Workspace lib | 1.022 geçti; 0 başarısız; 36 ignored. |
+| Workspace bin | 1.025 geçti; 0 başarısız; 37 ignored. |
+| Test destek paketi | 37 geçti; 0 başarısız. |
+| Host FFI | 1.027 geçti; 0 başarısız; 36 ignored. |
+| Yerel integration paketi | 104 geçti; 0 başarısız; 0 ignored. |
+| Clippy, tüm hedefler/özellikler, `-D warnings` | Geçti. |
+| Format kontrolü | Geçti. |
+| Release build | Geçti; yalnız yerel eser üretildi. |
+| `cargo metadata --locked --offline --no-deps` | Geçti; manifestlerin tam sürüm gereksinimleri doğrulandı. |
+| Kilit dosyası hash ve diff kontrolü | Değişmedi. |
+| Shell sözdizimi ve beş header guard senaryosu | Geçti. |
+| Report içindeki shell blokları | Sözdizimi kontrolü geçti. |
+| `git diff --check` | Geçti. |
+
+Ignored testler çalıştırılmış sayılmadı.
+Ortak kodu çalıştıran lib/bin/FFI sayıları benzersiz test toplamı olarak toplanmamalıdır.
+Ham yapılandırma, kimlik bilgisi veya paket içeriği bu rapora eklenmedi.
+
+Yerel release eseri: `/home/demir/.cache/shoes-test-target/release/shoes`.
+SHA-256:
+
+```text
+a7474bfe8d76a180d0a01887348a06fb04e928664b90bee6f4d3e3bbaf7fc970
+```
+
+Bu yeni eser dağıtılmadı.
+Önceki kontrolde canlı ikili `9efc9955ed01…` idi; o kontrol yeni düzeltmelerin dağıtımı değildir.
+
+### Değişen dosyalar
+
+- `src/config/types/server.rs`
+- `tests/support/src/test_fixture.rs`
+- `tests/support/src/process.rs`
+- `tests/cases/integration/server_lifecycle.rs`
+- `tests/cases/integration/h2mux_integration.rs` — yalnız eski bölüm başlıkları.
+- `tests/cases/external_network/reality_integration.rs` — yalnız eski protokol yorumları.
+- `Cargo.toml`
+- `tests/support/Cargo.toml`
+- `scripts/build-ios.sh`
+- `CONFIG.md`
+- `CONTRIBUTING.md`
+- `CHANGELOG.md`
+- `report.md`
+
+`AGENTS.md`, `Cargo.lock`, `include/shoes.h`, istemci yönlendirmesi ve canlı servis ayarları değiştirilmedi.
+
+### Kalan sınırlar
+
+Gerçek iOS/Android derlemesi, offline runner işletimi ve Hiddify platform matrisi sınanmadı.
+Canlı tünel, tünel arızası sonrası sızıntı ve no-bypass uyumluluğu yeniden doğrulanmadı.
+Karşılaştırmalı hız, CPU veya tahsis ölçümü yapılmadı.
+Bu sonuçlar performans kazancı veya tam güvenlik kanıtı değildir.

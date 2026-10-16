@@ -5,7 +5,7 @@
 # Output: output/ios/Shoes.xcframework
 #
 # Requirements:
-#   - macOS with Xcode installed (xcodebuild)
+#   - macOS with Xcode and cbindgen installed
 #   - Rust with preinstalled iOS targets and cached locked dependencies
 #
 set -euo pipefail
@@ -18,12 +18,25 @@ LIB_NAME="libshoes.a"
 
 cd "$ROOT_DIR"
 
-echo "==> Generating C header via cbindgen"
-if command -v cbindgen &>/dev/null; then
-    cbindgen --config "$ROOT_DIR/cbindgen.toml" --output "$ROOT_DIR/include/shoes.h"
-else
-    echo "  cbindgen not found, using existing include/shoes.h"
+# Fail before changing tracked headers or cleaning build output.
+command -v cbindgen >/dev/null || {
+    echo "Error: preinstall cbindgen before the offline build" >&2
+    exit 1
+}
+command -v xcodebuild >/dev/null || {
+    echo "Error: preinstall Xcode before the offline build" >&2
+    exit 1
+}
+echo "==> Generating and checking C header via cbindgen"
+# Compare a temporary header so a failed check cannot overwrite local work.
+GENERATED_HEADER="$(mktemp)"
+trap 'rm -f -- "$GENERATED_HEADER"' EXIT
+CARGO_NET_OFFLINE=true cbindgen --config "$ROOT_DIR/cbindgen.toml" --output "$GENERATED_HEADER"
+if ! cmp -s "$GENERATED_HEADER" "$ROOT_DIR/include/shoes.h"; then
+    echo "Error: include/shoes.h differs from cbindgen output; regenerate and review it separately" >&2
+    exit 1
 fi
+git diff --exit-code HEAD -- include/shoes.h
 
 echo "==> Cleaning output directory"
 rm -rf "$OUTPUT_DIR"

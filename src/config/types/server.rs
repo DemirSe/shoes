@@ -199,6 +199,7 @@ pub struct FallbackRateLimit {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RealityServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_fallback_upload: Option<FallbackRateLimit>,
@@ -253,6 +254,7 @@ pub struct RealityServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsServerConfig {
     pub cert: String,
     pub key: String,
@@ -296,7 +298,7 @@ pub struct TlsServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ServerProxyConfig {
     Vless {
         #[serde(alias = "user_ids")]
@@ -365,6 +367,133 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     const TEST_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn server_protocol_blocks_reject_unknown_fields_instead_of_using_defaults() {
+        let reality = format!(
+            "private_key: synthetic\ndest: whatsapp.net:443\nprotocol:\n  type: vless\n  user_id: {TEST_UUID}\n"
+        );
+        let correct: RealityServerConfig =
+            serde_yaml::from_str(&format!("{reality}max_time_diff: 300\n")).unwrap();
+        assert_eq!(correct.max_time_diff, Some(300));
+        let error =
+            serde_yaml::from_str::<RealityServerConfig>(&format!("{reality}max_time_dif: 300\n"))
+                .unwrap_err();
+        assert!(error.to_string().contains("max_time_dif"));
+
+        let tls = format!(
+            "cert: synthetic\nkey: synthetic\nprotocol:\n  type: vless\n  user_id: {TEST_UUID}\n"
+        );
+        let error = serde_yaml::from_str::<TlsServerConfig>(&format!("{tls}alpn_protoco: [h2]\n"))
+            .unwrap_err();
+        assert!(error.to_string().contains("alpn_protoco"));
+
+        for (protocol, unknown) in [
+            (
+                format!("type: vless\nuser_id: {TEST_UUID}\nudp_enabld: false\n"),
+                "udp_enabld",
+            ),
+            (
+                "type: tls\ntls_buffer_siz: 8192\n".to_string(),
+                "tls_buffer_siz",
+            ),
+        ] {
+            let error = serde_yaml::from_str::<ServerProxyConfig>(&protocol).unwrap_err();
+            assert!(error.to_string().contains(unknown), "{error}");
+        }
+
+        // Exercise custom nested deserializers, not only direct struct parsing.
+        for (target, body, unknown) in [
+            (
+                "reality_targets",
+                format!("{reality}max_time_dif: 300\n"),
+                "max_time_dif",
+            ),
+            (
+                "tls_targets",
+                format!("{tls}alpn_protoco: [h2]\n"),
+                "alpn_protoco",
+            ),
+        ] {
+            let body = body
+                .lines()
+                .map(|line| format!("      {line}\n"))
+                .collect::<String>();
+            let yaml = format!(
+                "address: 127.0.0.1:0\nprotocol:\n  type: tls\n  {target}:\n    whatsapp.net:\n{body}"
+            );
+            let error = serde_yaml::from_str::<ServerConfig>(&yaml).unwrap_err();
+            assert!(error.to_string().contains(unknown), "{error}");
+        }
+    }
+
+    #[test]
+    fn server_protocol_aliases_and_defaults_remain_supported() {
+        let protocol: ServerProxyConfig =
+            serde_yaml::from_str(&format!("type: vless\nuser_ids: [{TEST_UUID}]\n")).unwrap();
+        assert!(matches!(
+            protocol,
+            ServerProxyConfig::Vless {
+                udp_enabled: true,
+                fallback: None,
+                ..
+            }
+        ));
+
+        let tls = format!(
+            "cert: synthetic\nkey: synthetic\nalpn_protocol: [h2]\nclient_ca_cert: [ca]\nclient_fingerprint: [fingerprint]\noverride_rule: []\nprotocol:\n  type: vless\n  user_ids: [{TEST_UUID}]\n"
+        );
+        let decoded: TlsServerConfig = serde_yaml::from_str(&tls).unwrap();
+        assert_eq!(decoded.alpn_protocols.iter().count(), 1);
+        for alias in ["tls_targets", "sni_targets", "targets"] {
+            let body = tls
+                .lines()
+                .map(|line| format!("    {line}\n"))
+                .collect::<String>();
+            let decoded: ServerProxyConfig =
+                serde_yaml::from_str(&format!("type: tls\n{alias}:\n  whatsapp.net:\n{body}"))
+                    .unwrap();
+            assert!(
+                matches!(decoded, ServerProxyConfig::Tls { tls_targets, .. } if tls_targets.len() == 1)
+            );
+        }
+        for alias in ["default_tls_target", "default_target"] {
+            let body = tls
+                .lines()
+                .map(|line| format!("  {line}\n"))
+                .collect::<String>();
+            let decoded: ServerProxyConfig =
+                serde_yaml::from_str(&format!("type: tls\n{alias}:\n{body}")).unwrap();
+            assert!(matches!(
+                decoded,
+                ServerProxyConfig::Tls {
+                    default_tls_target: Some(_),
+                    ..
+                }
+            ));
+        }
+        let reality: RealityServerConfig = serde_yaml::from_str(&format!(
+            "private_key: synthetic\ndest: whatsapp.net:443\nshort_id: ['01']\ncipher_suite: []\noverride_rule: []\nprotocol:\n  type: vless\n  user_id: {TEST_UUID}\n"
+        )).unwrap();
+        assert_eq!(reality.max_time_diff, Some(60000));
+        assert_eq!(reality.short_ids.iter().count(), 1);
+
+        // These compatibility fields are declared in separate types. Strict
+        // server protocol parsing must not remove their accepted surface.
+        let h2mux: crate::config::H2MuxConfig = serde_yaml::from_str(
+            "max_connections: 4\nmin_streams: 4\nmax_streams: 0\npadding: false\n",
+        )
+        .unwrap();
+        assert_eq!(h2mux.max_connections, Some(4));
+        assert_eq!(h2mux.min_streams, Some(4));
+        assert_eq!(h2mux.max_streams, Some(0));
+        let global: crate::config::GlobalLimits = serde_yaml::from_str(
+            "quic_memory_bytes: 1000000\nquic_receive_window: 1000\nquic_send_window: 1000\nquic_stream_window: 1000\nquic_dns_memory_bytes: 1000000\nquic_socket_buffer: 1000\n",
+        )
+        .unwrap();
+        assert_eq!(global.quic_memory_bytes, Some(1000000));
+        assert_eq!(global.quic_socket_buffer, 1000);
+    }
 
     fn vless_protocol() -> ServerProxyConfig {
         ServerProxyConfig::Vless {

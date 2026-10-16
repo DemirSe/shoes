@@ -926,10 +926,6 @@ async fn test_h2mux_vless_udp_disabled() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-// H2MUX Shadowsocks Tests
-
-// H2MUX Trojan Tests
-
 // H2MUX with Padding Tests
 
 /// Test h2mux with padding enabled (Version 1 protocol)

@@ -4,6 +4,14 @@
 
 These are local source changes, not a published release or proof of live deployment.
 
+- Reject unknown keys in server VLESS/TLS, TLS-target and REALITY-target blocks
+  instead of silently ignoring misspelled policy fields. Keep documented aliases
+  and defaults; add parser, reload and prepared-example dry-run regressions.
+- Remove unused retired-protocol test fixture variants, builders and renderers;
+  retain VLESS/REALITY/Vision/h2mux/TUN fixtures and stock test adapters.
+- Pin both workspace manifests to the existing locked registry versions without
+  updating `Cargo.lock`. Require cbindgen and reject generated iOS header drift.
+
 - Keep XUDP DNS failures and timeouts local to the affected datagram instead of
   ending the shared connection. Preserve existing routes, reserve new routes only
   after successful resolution, and yield during bursts of failed lookups.

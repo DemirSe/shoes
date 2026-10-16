@@ -35,6 +35,10 @@ Missing tools, Rust targets or caches are a preparation blocker: do not solve
 them by downloading during verification. Provisioning is a separate approved task.
 
 Always pass `--locked --offline`. Never download crates or test peers.
+Both workspace manifests pin registry dependencies to the exact versions in
+`Cargo.lock`. Change version requirements only in an approved dependency-update
+task; compare the lockfile hash and resolved graph, then rerun the verification gates.
+Version pins do not replace `--locked --offline` or provisioning trusted caches.
 Point `CARGO_TARGET_DIR` outside the repository. `/tmp` is often a small
 tmpfs that large builds can exhaust; prefer a directory under your home
 directory or cache.

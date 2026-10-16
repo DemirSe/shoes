@@ -13,7 +13,7 @@
 ///
 /// 1. **shoes REALITY SERVER** (with sing-box client):
 ///    HTTP Client (curl) -> sing-box HTTP Proxy -> shoes REALITY+Protocol Server -> Internet
-///    - Tests: VLESS, Trojan inner protocols
+///    - Tests: VLESS inner protocol
 ///    - Data sizes: 1 byte (small), 200KB (large)
 ///    - Endpoints: HTTP and HTTPS/TLS 1.3
 ///    - Operations: GET and POST
@@ -41,7 +41,7 @@
 /// - Large data transfers (to test buffering)
 /// - POST uploads (to test write path)
 /// - Both HTTP and HTTPS final destinations
-/// - Multiple inner protocols (VLESS, Trojan)
+/// - VLESS with and without Vision
 /// - shoes-to-shoes compatibility
 use shoes_test_support as common;
 

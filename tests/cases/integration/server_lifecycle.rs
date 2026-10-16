@@ -56,6 +56,7 @@ fn dry_run_invalid_uuid_and_udp_transport_fail_without_panic() {
     for config in [
         profile(18443, "invalid"),
         profile(18443, ID).replace("  protocol:", "  transport: udp\n  protocol:"),
+        format!("{}    udp_enabld: false\n", profile(18443, ID)),
     ] {
         for dry_run in [false, true] {
             let (status, log) = exits(&config, true, dry_run);
@@ -64,6 +65,38 @@ fn dry_run_invalid_uuid_and_udp_transport_fail_without_panic() {
         }
     }
     assert!(exits(&profile(18443, ID), false, true).0.success());
+}
+
+#[test]
+fn supported_examples_pass_dry_run_with_local_test_material() {
+    use base64::Engine;
+
+    let (cert, key) = shoes_test_support::certs::generate_test_cert_files().unwrap();
+    let private_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1; 32]);
+    for (name, template) in [
+        (
+            "reality_basic",
+            include_str!("../../../examples/reality_basic.yaml"),
+        ),
+        (
+            "reality_vision",
+            include_str!("../../../examples/reality_vision.yaml"),
+        ),
+        (
+            "vless_over_tls",
+            include_str!("../../../examples/vless_over_tls.yaml"),
+        ),
+        ("tun_vpn", include_str!("../../../examples/tun_vpn.yaml")),
+    ] {
+        // Examples are templates. Supply only local synthetic material, without
+        // touching their tracked contents, opening listeners or creating a TUN.
+        let config = template
+            .replace("YOUR_PRIVATE_KEY_HERE", &private_key)
+            .replace("cert.cer", &cert.display().to_string())
+            .replace("key.key", &key.display().to_string());
+        let (status, _) = exits(&config, true, true);
+        assert!(status.success(), "prepared example {name} must validate");
+    }
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -324,6 +357,7 @@ async fn rejected_reload_retains_listener_and_active_session_then_recovers() {
     let occupied_port = occupied.local_addr().unwrap().port();
     for invalid in [
         profile(proxy.port, "invalid"),
+        format!("{}    udp_enabld: false\n", profile(proxy.port, SECOND)),
         "not: [valid".into(),
         format!(
             "{}{}",

@@ -461,26 +461,19 @@ fn wait_for_process_group_exit(process_group_id: i32, use_sudo: bool, timeout: D
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SingBoxCapability {
     Standard,
-    NaiveOutbound,
 }
 
 pub fn find_singbox_binary() -> io::Result<PathBuf> {
     find_singbox_binary_with(SingBoxCapability::Standard)
 }
 
-pub fn find_singbox_naive_binary() -> io::Result<PathBuf> {
-    find_singbox_binary_with(SingBoxCapability::NaiveOutbound)
-}
-
 pub fn find_singbox_binary_with(capability: SingBoxCapability) -> io::Result<PathBuf> {
-    let override_name = match capability {
-        SingBoxCapability::Standard => "SHOES_TEST_SING_BOX_BIN",
-        SingBoxCapability::NaiveOutbound => "SHOES_TEST_SING_BOX_NAIVE_BIN",
-    };
+    let SingBoxCapability::Standard = capability;
+    let override_name = "SHOES_TEST_SING_BOX_BIN";
 
     if let Some(path) = std::env::var_os(override_name) {
         let path = PathBuf::from(path);
-        validate_singbox_binary(&path, capability).map_err(|error| {
+        validate_singbox_binary(&path).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("invalid {override_name} value {}: {error}", path.display()),
@@ -489,27 +482,8 @@ pub fn find_singbox_binary_with(capability: SingBoxCapability) -> io::Result<Pat
         return Ok(path);
     }
 
-    if capability == SingBoxCapability::NaiveOutbound
-        && let Some(path) = std::env::var_os("SHOES_TEST_SING_BOX_BIN")
-    {
-        let path = PathBuf::from(path);
-        validate_singbox_binary(&path, capability).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "invalid SHOES_TEST_SING_BOX_BIN value {}: {error}",
-                    path.display()
-                ),
-            )
-        })?;
-        return Ok(path);
-    }
-
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut candidates = Vec::new();
-    if capability == SingBoxCapability::NaiveOutbound {
-        candidates.push(PathBuf::from("/sing-box/sing-box-naive"));
-    }
     candidates.extend([
         PathBuf::from("/sing-box/sing-box"),
         PathBuf::from("sing-box"),
@@ -525,7 +499,7 @@ pub fn find_singbox_binary_with(capability: SingBoxCapability) -> io::Result<Pat
 
     let mut failures = Vec::new();
     for path in candidates {
-        match validate_singbox_binary(&path, capability) {
+        match validate_singbox_binary(&path) {
             Ok(version) => {
                 eprintln!(
                     "[SING_BOX] Using {} ({})",
@@ -539,10 +513,7 @@ pub fn find_singbox_binary_with(capability: SingBoxCapability) -> io::Result<Pat
         }
     }
 
-    let requirement = match capability {
-        SingBoxCapability::Standard => "a working sing-box executable",
-        SingBoxCapability::NaiveOutbound => "sing-box built with with_naive_outbound",
-    };
+    let requirement = "a working sing-box executable";
     let details = if failures.is_empty() {
         String::new()
     } else {
@@ -556,7 +527,7 @@ pub fn find_singbox_binary_with(capability: SingBoxCapability) -> io::Result<Pat
     ))
 }
 
-fn validate_singbox_binary(path: &Path, capability: SingBoxCapability) -> io::Result<String> {
+fn validate_singbox_binary(path: &Path) -> io::Result<String> {
     let output = Command::new(path).arg("version").output()?;
     if !output.status.success() {
         return Err(io::Error::new(
@@ -574,12 +545,6 @@ fn validate_singbox_binary(path: &Path, capability: SingBoxCapability) -> io::Re
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    if capability == SingBoxCapability::NaiveOutbound && !version.contains("with_naive_outbound") {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "missing with_naive_outbound build tag",
-        ));
-    }
     Ok(version)
 }
 

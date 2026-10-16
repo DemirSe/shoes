@@ -557,6 +557,11 @@ client_chain:
 
 Configuration changes are automatically detected and applied without restarting. Disable with `--no-reload` flag.
 
+Unknown keys in server protocol blocks (VLESS/TLS, TLS targets and REALITY targets)
+are errors, including during `--dry-run` and reload. Documented aliases and declared
+compatibility fields remain accepted; a misspelled optional setting never silently
+selects its default. A rejected reload keeps the current generation running.
+
 TCP reloads prepare and bind the complete replacement before stopping existing
 accept loops. Unchanged addresses retain their listening sockets. Invalid YAML,
 protocol settings, duplicate addresses or failed new binds retain the current
