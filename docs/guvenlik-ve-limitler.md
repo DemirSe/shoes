@@ -9,11 +9,20 @@ Hiçbir kısa test, hız kazancı veya tam güvenlik kanıtı yerine geçmez.
   (`whatsapp.net`) iletilir; kapak başarısızsa bağlantı durur.
 - **Kimlik doğrulama:** UUID yalnız bağlantı kurulumunda doğrulanır; veri
   yolunda kullanıcı araması yoktur.
-- **Kaynak tavanları:** bağlantı/akış/QUIC bütçeleri ve güvenlik tavanları
-  (H2MUX 4096, UDP 2048, XUDP 16 384) sınırsız tüketimi engeller.
+- **Kaynak tavanları:** genel bağlantı/akış/QUIC bütçeleri isteğe bağlıdır;
+  varsayılanları sınırsızdır. H2MUX 4096, UDP 2048 ve XUDP 16 384 tavanları
+  ilgili bağlantı/akış başınadır; toplam süreç belleğini sınırlamaz.
 - **Kabul reddi freni:** bütçe doluyken accept+close döngüsü engellenir.
 - **Kapak hız sınırı (opsiyonel, varsayılan kapalı):** yalnız yetkisiz fallback
   trafiğini sınırlar; doğrulanmış kullanıcı aktarımı etkilenmez.
+- **Dosya günlüğü satır bütünlüğü:** kontrol karakterleri ve Unicode satır
+  ayırıcıları etkisizleştirilir; mesaj yeni günlük satırı veya terminal kontrolü ekleyemez.
+  Bu koruma gizli bilgileri otomatik olarak ayıklamaz.
+- **Vision durum günlüğü:** unpadder'ın debug gösterimi UUID veya biriktirilmiş
+  paket baytları yerine durum adı ve tampon uzunluğu gösterir.
+- **El sıkışma günlüğü:** tespit edilen REALITY/VLESS/XUDP ham bayt ve
+  doğrulama etiketi dökümleri kaldırıldı; aşama ve uzunluk bilgileri korunur.
+  Hedef adresleri gibi trafik metaverileri hâlâ loglanabilir; günlükleri gizli tutun.
 
 ## Kanıtlanmayan / sınırlı olan
 
@@ -31,8 +40,11 @@ Hiçbir kısa test, hız kazancı veya tam güvenlik kanıtı yerine geçmez.
   iddiaları için karşılaştırmalı, uzun süreli ölçüm gerekir.
 - **Kapak hız sınırı etkisi ölçülmedi**; bu yüzden varsayılan kapalıdır.
 - **AES/ChaCha seçimi ölçülmedi**; mevcut şifreleme ayarı değiştirilmedi.
-- **Sinyal yönetimi yok:** süreç SIGTERM/SIGINT'te düzgün kapanış garantisi
-  vermez (ertelenmiş iş; bkz. [kararlar.md](kararlar.md)).
+- **Kapanış süresi sınırlı:** Unix CLI, SIGTERM/SIGINT sonrası dinleyicileri durdurur
+  ve bağlantıları en fazla `min(reload_grace_secs, 30)` saniye boşaltır.
+  Süre aşımında kalan bağlantılar iptal edilir. SIGKILL ve çökmeler bu yolu çalıştırmaz.
+- **Rust uygulama, yerel bağımlılıklar:** kripto için AWS-LC ve Linux CLI allocator'ı
+  jemalloc yerel/C kod içerir. Mevcut sürüm, tamamen Rust bağımlılık zinciri iddiası taşımaz.
 
 ## Kimlik bilgisi politikası
 
@@ -51,7 +63,8 @@ Hiçbir kısa test, hız kazancı veya tam güvenlik kanıtı yerine geçmez.
 
 ## CI ve tedarik zinciri
 
-- CI çevrimdışıdır; runner'lar ağ çıkışı engelli, ayrılmış ve geçicidir.
+- CI politikası, ağ çıkışı engelli, ayrılmış ve geçici runner gerektirir.
+  Workflow dosyaları tek başına gerçek ağ izolasyonunu kanıtlamaz.
 - Runner'da SSH anahtarı veya üretim kimlik bilgisi tutulmaz.
 - `--offline` bir bağımlılık politikasıdır; tek başına tam ağ sandbox'ı değildir.
 - Eksik araç/önbellek işi başarısız kılar; indirme tetiklemez.

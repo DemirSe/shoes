@@ -23,6 +23,7 @@ Canlı birim bu bayrakla çalışır. Doğrulayıcı (`src/config/production.rs`
 | Dinleme adresi | Yalnız **açık genel IPv4 TCP 443**. |
 | Taşıyıcı | `transport: udp` reddedilir; UDP/XUDP TCP tüneli içinde kalır. |
 | REALITY hedefi/SNI | Tam olarak `whatsapp.net`; başka kapak veya alt alan adı yok. |
+| Tek sunucu / iç protokol | Tam bir REALITY sunucusu; `vision: true`, VLESS ve `udp_enabled: true`. Ek TLS hedefi yok. |
 | VLESS fallback | Opsiyonel fallback yapılandırılmaz. |
 | Kapak davranışı | Kapak başarısızsa bağlantı durur (fail-closed). |
 
@@ -60,7 +61,7 @@ için korunur; bu fork'ta üretim davranışına bağlı değildir:
 Alanları silmek (`deny_unknown_fields`) mevcut profilleri reddettirebilir;
 etkinleştirmek davranış değişikliğidir ve sahip kararı + ölçüm gerektirir.
 
-## Örnek iskelet (yer tutucular)
+## Üretim profili iskeleti (yer tutucular)
 
 Gerçek değerler (adres, UUID, anahtar, short_id) burada **yer tutucudur** ve
 asla depoya yazılmaz:
@@ -74,11 +75,16 @@ asla depoya yazılmaz:
         private_key: "<REALITY_PRIVATE_KEY>"
         short_ids: ["<SHORT_ID>", ""]
         dest: "whatsapp.net:443"
+        vision: true
         protocol:
           type: vless
           user_id: "<UUID>"              # veya user_ids: ["<UUID1>", "<UUID2>"]
           udp_enabled: true
 ```
+
+Bu metin yer tutucular değiştirilmeden çalışmaz; genel `examples/` dosyaları üretim şablonu değildir.
+Yalnız yerel, sentetik değerli bir kopyayı `shoes --dry-run --production-profile <LOCAL_FIXTURE>` ile doğrulayın.
+Canlı config'i kopyalamayın veya bu kontrol için okumayın; dağıtımda yalnız hash'i kaydedilir.
 
 ## TUN (istemci tarafı)
 

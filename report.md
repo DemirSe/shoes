@@ -1,3 +1,10 @@
+> **Tarihsel inceleme kaydı:** Aşağıdaki öneri ve sonuçlar kendi turlarının durumunu anlatır.
+> Güncel davranış için [mimari](docs/mimari.md), güncel kapsam için [kararlar](docs/kararlar.md),
+> dağıtım için [operasyon rehberi](docs/operasyon.md) esas alınır.
+> Örneğin önceki sinyal ertelemesi, bugün Unix CLI'da bulunan `sigwait` uygulamasını geçersiz kılmaz.
+> Eski glibc ölçümleri, jemalloc kullanan CLI'ın Rust tamponlarının temizlendiğini kanıtlamaz.
+> Bu kayıt canlı sunucunun güncel sürümünü veya yeni dağıtım iznini belirtmez.
+
 # Öneriler
 
 Tarih: 2026-10-12

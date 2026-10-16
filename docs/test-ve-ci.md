@@ -1,41 +1,37 @@
 # Test ve CI
 
-## Yerel toolchain
+## Yerel doğrulama
 
-İzole Rust toolchain: `/home/demir/.local/share/shoes-toolchain`.
-Ortam değişkenleri **komut bazında** verilir; shell profilleri değiştirilmez:
+Toolchain, ortam değişkenleri, önceden sağlanmış sing-box eşi ve esas komut listesi
+[CONTRIBUTING.md](../CONTRIBUTING.md) içindedir. Komutları oradan kullanın;
+bu belge test kapsamı ve CI sınırlarını açıklar.
+
+| Değişiklik | Kabul kapsamı |
+|---|---|
+| Rust kodu / protokol davranışı | Birim, FFI, entegrasyon, Clippy, biçim ve gerekiyorsa release |
+| Yalnız dokümantasyon | Bağlantı, örnek/kod tutarlılığı ve whitespace kontrolü |
+| Allocator / sıcak yol | İlgili regresyonlar; performans iddiası varsa ayrıca eşleşen release ölçümü |
+
+Her Cargo build/test/lint komutu `--locked --offline` kullanır. Hedef dizini repo dışında tutulur.
+`cargo test --all-features` kullanılmaz; dış ağ, root/TUN ve stres testlerini de açar.
+Entegrasyon eşi eksikse ilgili testler başarısız olur; atlanmış sayılmaz.
+Fixture çıktıları sentetik yapılandırmalar içerebilir; raporlara ham çıktıyı değil sonuç özetini ekleyin.
+Ortak kod ayrı hedeflerde tekrar sınanır; sayılar benzersiz test toplamı değildir.
+
+## İsteğe bağlı allocator bellek regresyonu
+
+Bu test varsayılan pakette `ignored` kalır. GNU/Linux CLI'da yaklaşık 256 MiB geçici bellek kullanır;
+derleme dışında 180 saniyeye kadar bekleyebilir. Normal CI veya üretim sağlık kontrolü değildir.
+Geliştirme rehberindeki komut-yerel ortamla yalnız bu testi seçin:
 
 ```bash
-CARGO_HOME=/home/demir/.local/share/shoes-toolchain/cargo \
-RUSTUP_HOME=/home/demir/.local/share/shoes-toolchain/rustup \
-PATH=/home/demir/.local/share/shoes-toolchain/cargo/bin:$PATH \
-cargo test --locked --offline
+cargo test -p shoes --release --locked --offline --bin shoes \
+  allocator::tests::background_reclaims_unused_buffers_with_workers_alive \
+  -- --ignored --exact --nocapture --test-threads=1
 ```
 
-- Her komuta `--locked --offline`: asla crate veya test eşi indirilmez.
-- Derleme hedefi (`CARGO_TARGET_DIR`) repo dışında tutulur. `/tmp` küçük bir
-  tmpfs'tir; büyük derlemeler için `/home` veya `~/.cache` kullanılır.
-
-## Komutlar
-
-| Amaç | Komut |
-|---|---|
-| Birim testleri | `cargo test --workspace --locked --offline --lib --bins` |
-| Entegrasyon | `cargo test -p shoes --locked --offline --features integration-tests --test integration -- --test-threads=1` |
-| FFI | `cargo test -p shoes --locked --offline --lib --features ffi -- --test-threads=1` |
-| Lint | `cargo clippy --workspace --locked --offline --all-targets --all-features -- -D warnings` |
-| Biçim | `cargo fmt --all -- --check` |
-| Dağıtım derlemesi | `cargo build -p shoes --bin shoes --release --locked --offline` |
-
-### Önemli notlar
-
-- Bazı entegrasyon testleri gerçek bir sing-box eşi ister
-  (`SHOES_TEST_SING_BOX_BIN`). Eş yoksa **atlanmaz, başarısız olur**.
-- `cargo test`'e `--all-features` **verilmez**: `external-network-tests`,
-  `privileged-tests` ve `stress-tests` özelliklerini de açar (dış servisler,
-  root/TUN, benchmark'lar) — bunlar çevrimdışı CI setinin dışındadır.
-- Test hedefleri ortak kod sınayan paketler içerir; toplamları benzersiz test
-  sayısı olarak toplanmamalıdır.
+Tüm ignored/stres testlerini topluca açmayın. Ölçümün sınırları:
+[performans-bellek.md](performans-bellek.md).
 
 ## Çevrimdışı CI
 

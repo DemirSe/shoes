@@ -7,7 +7,8 @@ Tek bir sansür dirençli profil sunar:
 
 - **VLESS + REALITY + Vision**, açık genel IPv4 TCP 443 üzerinde.
 - UDP trafiği (XUDP) aynı TCP tünelinin içinde taşınır; ayrı UDP dinleyicisi yoktur.
-- İstemciler stok Xray/Hiddify uyumludur (Android, Windows, Linux).
+- Stok Xray/Hiddify uyumluluğu gereksinimdir (Android, Windows, Linux);
+  tamamlanmış platform doğrulaması değildir.
 
 Fork'un amacı yeni protokol eklemek değil; mevcut profili **ölçülmüş biçimde
 sağlamlaştırmak, kaynak tüketimini sınırlamak ve uzun ömürlü çalışmayı
@@ -66,8 +67,8 @@ Tam liste [kararlar.md](kararlar.md) içinde. Özet:
 ### Yönetim yolu
 
 - Laptop → SSH → VPS. SSH, WiFi arayüzüne bağlanır
-  (`BindInterface` benzeri bir seçenek); böylece servis yeniden başlatması veya
-  TUN değişimi oturumu kesmez.
+  (`-o BindInterface=wlp0s20f3`); yönetim yolu tünelden ayrılır.
+  Bu, hotspot veya SSH kesintilerine karşı garanti sağlamaz.
 - Uzun oturumlarda `ServerAliveInterval` kullanılır (hotspot kopmalarında asılı kalmayı önler).
 - Ayrıntılı prosedürler: [operasyon.md](operasyon.md).
 

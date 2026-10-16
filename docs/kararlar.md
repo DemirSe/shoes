@@ -46,14 +46,24 @@ Tam kayıtlar: [SERVER-FEATURE-DECISIONS.md](../SERVER-FEATURE-DECISIONS.md),
   onay ister. Geri dönüş yedeği: `unit-profile-*` dizinindeki `shoes.service.before`.
 - **CI çevrimdışı ve elle**; VPS'e asla bağlanmaz.
 - **APT elle**, otomatik yeniden başlatma kapalı.
-- Deploy = release derleme → sahneleme (`rollback.bin` korunur) → atomik
-  `install` + `mv` → restart → sağlık kontrolü.
+- Elle deploy = release derleme → sahneleme (`rollback.bin` korunur) → atomik
+  `install` + `mv` → restart → sınırlı sağlık gözlemi; hata durumunda elle geri dönüş.
+- 2026-10-15: Yerel deploy script'i hazırlandı; varsayılanı ağsız plandı.
+- 2026-10-16: Gereksiz bakım yükü nedeniyle yerel deploy script'i ve ona özel çevrimdışı
+  testleri sahip kararıyla kaldırıldı. Otomatik rollback iddiası yoktur; canlı çalıştırma
+  ayrıca onay ister.
+- Dağıtım bakım yedeklerini otomatik silmez. Temizlik ayrı onaylı işlemdir;
+  çalışan sürüm kaydı, kullanılabilir rollback binary'si ve gerekli unit yedeği korunur.
+- Sinyal yönetimi (SIGTERM/SIGINT), Unix CLI'da libc `sigwait` ile uygulandı;
+  yeni bağımlılık yok. Bağlantı boşaltma süresi en fazla `min(reload_grace_secs, 30)` saniyedir.
+
+Güncel prosedürün esas kaynağı [operasyon.md](operasyon.md) dosyasıdır.
+Tarihsel raporlar ve yerel test sonuçları, yeni kodun canlıya dağıtıldığını göstermez.
 
 ## Ertelenen ve reddedilen işler
 
 | Konu | Durum / gerekçe |
 |---|---|
-| Sinyal yönetimi (SIGTERM/SIGINT) | Ertelendi. tokio `signal` özelliği `signal-hook-registry` ister; kilitte yok; kilit değişikliği onay ister. |
 | Otomatik artık Unix soket temizliği | Atlandı. Sahiplik kanıtı yetersiz; yarış riski var. |
 | İçerik değişmediğinde reload atlama | Atlandı; dış PEM ve yan etkiler ek durum takibi ister; ölçülmüş ihtiyaç yok. |
 | ClientHello 64 KB tampon | Atlanmış (parser sözleşmesi/test değişikliği; belirsiz kazanç). |

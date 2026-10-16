@@ -7,7 +7,8 @@
 1. **`src/main.rs`** — CLI ayrıştırma:
    - `--threads`, `--dry-run`, `--no-reload`, `--production-profile`
    - Alt komutlar: `generate-reality-keypair`, `generate-vless-user-id`
-   - Logging kurulumu; çok iş parçacıklı tokio runtime; `server_runtime::run` çağrısı.
+   - Logging, kapatma sinyali ve GNU/Linux allocator kurulumu; sonra tokio runtime ve `server_runtime::run`.
+   - `--threads 1` current-thread runtime kullanır; daha yüksek değerler çok iş parçacıklıdır.
 2. **`src/server_runtime.rs`** — sıralı hazırlık:
    1. Yapılandırmayı yükle (`config::load`).
    2. Genel doğrulama + (bayrakla) üretim profili doğrulaması.
@@ -17,7 +18,8 @@
    5. `resources::configure` — genel limitler uygulanır.
    6. `ResourceReporter::start` + `memory::spawn_heap_trim_task`.
    7. `prepared.start()` — kabul döngüleri başlar.
-   8. Ana `select!` döngüsü: dinleyici görevleri ve reload bildirimi.
+   8. Ana `select!` döngüsü (`biased`): kapatma sinyali, dinleyici görevleri ve
+      reload bildirimi.
 
 ### Reload (sıcak yenileme)
 
@@ -32,11 +34,26 @@
 
 ### Kapanış
 
-- `--no-reload` canlıda etkin. Sinyal yönetimi (SIGTERM/SIGINT) **ertelendi**:
-  tokio `signal` özelliği `signal-hook-registry` bağımlılığını gerektirir ve bu
-  bağımlılık `Cargo.lock` içinde yoktur (kilit değişikliği sahip onayı ister).
-- Kabul edilmiş bağlantıların boşaltılması `ListenerTasks` bırakma (Drop)
-  mekanizmasına bağlıdır.
+- Sinyal bekleme CLI'ye özeldir ve eşzamanlıdır (`src/shutdown_signal.rs`):
+  `main` içinde runtime ve yapılandırma izleyicisinden **önce** kurulur, böylece
+  sonradan açılan iş parçacıkları engellenmiş maskeyi devralır. SIGTERM/SIGINT
+  `pthread_sigmask` ile engellenir; ayrık `shutdown-sigwait` iş parçacığı
+  `sigwait` ile bekler ve sonucu oneshot kanalıyla teslim eder. Unix dışı
+  hedeflerde bekleme askıda kalır.
+- tokio `signal` özelliği hâlâ kullanılmaz: `signal-hook-registry`
+  bağımlılığını gerektirir ve bu bağımlılık `Cargo.lock` içinde yoktur (kilit
+  değişikliği sahip onayı ister). Yeni bağımlılık eklenmedi.
+- Kapatma akışı (`src/server_runtime.rs`, `biased select!`): sinyal alınca kabul
+  görevleri durdurulur, kayıt (registry) bırakılarak dinleme soketleri kapatılır
+  ve sahipli Unix soket yolları kaldırılır; ardından kabul edilmiş bağlantılar
+  için `listener_tasks::wait_for_shutdown(grace)` beklenir.
+- Sınır: `grace = min(reload_grace_secs, 30)` saniye; süre dolarsa kalan
+  bağlantılar iptal edilir (`abort`). CLI çıkarken
+  `runtime.shutdown_timeout(1 sn)` uygulanır.
+- `enable_shutdown_drain` yalnız CLI çalışma zamanında çağrılır; FFI
+  dinleyicileri mevcut davranışını korur. `ListenerTasks` bırakıldığında
+  (reload yolu) boşaltma görevi `reload_grace_secs` son tarihli olarak
+  üretilir; kapatma yolundaki bekleme yukarıdaki sınırlı `grace` ile toplanır.
 
 ## Modül haritası
 
@@ -44,7 +61,7 @@
 |---|---|
 | `src/main.rs` | CLI, logging, runtime kurulumu |
 | `src/server_runtime.rs` | Nesil hazırlama/başlatma, reload döngüsü |
-| `src/config/` | Yapılandırma tipleri, PEM, doğrulama, `production.rs`, sing-box dönüşümü |
+| `src/config/` | Yapılandırma tipleri, PEM, doğrulama ve `production.rs` |
 | `src/tcp/` | TCP/Unix dinleyiciler, kabul, zincir kurucu, soket bağlayıcıları |
 | `src/reality/` | REALITY sunucu/istemci, AEAD, kimlik doğrulama, sertifika, TLS 1.3 anahtarları, kapak hız sınırı |
 | `src/vless/` | VLESS sunucu/istemci, Vision dolgu/çözme, akış çerçeveleme |
@@ -60,13 +77,16 @@
 | `src/client_proxy_chain.rs` | Çok atlamalı istemci zincirleri, havuz/round-robin |
 | `src/resources.rs` | Bağlantı/akış/QUIC bütçeleri, limitler, per-IP ret sayaçları |
 | `src/memory.rs` | Periyodik, koşullu glibc heap trim |
+| `src/allocator.rs` | GNU/Linux CLI için başlangıçta jemalloc geri kazanım politikası |
+| `src/shutdown_signal.rs` | CLI'ye özel Unix sigwait / kapatma bildirimi |
 | `src/ffi/` | Android/iOS için FFI katmanı |
 | `src/logging.rs` | Günlük seviyeleri ve hedefler |
 
 ## Kaynak bütçeleri ve güvenlik tavanları
 
 - **Genel limitler** (`resources.rs`): eşzamanlı bağlantı, akış ve QUIC tampon
-  baytı bütçeleri; aşılırsa bağlantı reddedilir (per-IP ret sayaçları izlenir).
+  baytı bütçeleri isteğe bağlıdır; varsayılanları sınırsızdır.
+  Yapılandırılmış bütçe aşılırsa kabul reddedilir (per-IP ret sayaçları izlenir).
 - **Kabul reddinde 100 ms fren** (`tcp_server.rs`): bütçe doluyken accept+close
   döngüsü CPU yakmaz.
 - **Güvenlik tavanları** — yapılandırma sınır vermezse kod varsayılanı uygular;
@@ -80,16 +100,28 @@
 
 ## Bellek yönetimi
 
-- Bağlantı patlaması sonrası glibc serbest sayfaları tutabilir (RSS yüksek kalır).
+- Linux CLI, Rust tahsisleri için jemalloc kullanır; yerel bağımlılıklar glibc kullanabilir.
 - `src/memory.rs`: her **5 dakikada** bir kontrol; yalnızca
   **RSS > 64 MB** ve **aktif bağlantı < 128** iken, `spawn_blocking` içinde
   `libc::malloc_trim(0)` çağrılır (Linux + glibc koşulu).
-- Sıcak yola etkisi yoktur; trim yalnız boşta çalışır. Ölçümler:
+- Çağrı yalnız glibc serbest sayfalarını hedefler, jemalloc belleğini temizlemez.
+  Düşük bağlantı sayısı düşük yük garantisi değildir. Ölçüm sınırları:
   [performans-bellek.md](performans-bellek.md).
+- CLI politikası (`src/allocator.rs`, yalnız GNU/Linux CLI):
+  arka plan temizliği açık, `dirty_decay_ms=60000`, `muzzy_decay_ms=0`.
+  Başlatma CLI açılışında yapılır; kapatma sinyalleri maskelendikten sonra,
+  Tokio çalışma zamanı ve işçi iş parçacıkları kurulmadan önce.
+  Dolu `_RJEM_MALLOC_CONF` verilirse yerleşik varsayılanlar atlanır.
+  Uyarlanabilir RSS eşiğiyle açma/kapama yoktur.
+  Arka plan bozunumu 60. saniyede kesin bırakma veya RSS üst sınırı değildir.
+  Mevcut ve yeni arena varsayılanları birlikte ayarlanır. Kurulum hatası,
+  dinleyiciler açılmadan başlangıcı durdurur. `--dry-run` bu kurulumu çalıştırmaz.
+  Kütüphane/FFI ve diğer platformların allocator davranışı değiştirilmez.
 
 ## İş parçacığı ve görev yapısı
 
-- Çok iş parçacıklı tokio runtime; dinleyici başına kabul döngüsü ayrı görev.
+- CLI thread sayısına göre current-thread veya çok iş parçacıklı tokio runtime;
+  dinleyici başına kabul döngüsü ayrı görev.
 - Bağlantı başına görev: el sıkışma → protokol → aktarım.
 - `ResourceReporter`: 60 sn aralıkla kaynak özeti loglar.
 - Heap trim görevi: 5 dk aralık, koşullu; işi blocking havuza devreder.

@@ -42,6 +42,8 @@ Ayrıntılı inceleme kayıtları: [report.md](../report.md) ve
   oturum kurulumu başına).
 - Heap trim (release bench): `malloc_trim(0)` **0,018 ms**; RSS **261 → 5 MB**.
   C mikrobench (300 MB heap): 15 ms; trim sonrası yeniden dokunma cezası ölçülemedi.
+  Bu tarihsel sonuç, güncel jemalloc kullanan CLI'ın Rust tamponlarının temizlendiğini kanıtlamaz.
+  Kütüphane ve CLI test hedefleri farklı global allocator kullanır.
 
 ## Canlı ölçümler (2026-10-13)
 
@@ -58,12 +60,38 @@ Ayrıntılı inceleme kayıtları: [report.md](../report.md) ve
 ## Bellek olayı (özet)
 
 - 615 eşzamanlı bağlantılık stres sonrası RSS ~272 MB'ta kaldı.
-- İkinci aynı stres RSS'i artırmadı → **sızıntı değil, glibc arena rezervi**.
-- Çözüm: `src/memory.rs` — 5 dk aralık; RSS > 64 MB **ve** bağlantı < 128 iken
+- İkinci aynı stres RSS'i artırmadı. Bu gözlem tek başına sızıntıyı dışlamaz
+  veya yüksek RSS'in glibc'den kaynaklandığını kanıtlamaz.
+- Mevcut mekanizma: `src/memory.rs` — 5 dk aralık; RSS > 64 MB **ve** bağlantı < 128 iken
   `spawn_blocking` içinde `libc::malloc_trim(0)`.
-- Sıcak yol etkisi yok; wire/stok istemci etkisi yok.
+- Çağrı yalnız glibc'nin yönettiği serbest sayfaları hedefler; Linux CLI'ın
+  jemalloc ile ayırdığı Rust belleğini temizlemez. Yerel bağımlılıklar glibc kullanabilir.
+- Bağlantı sayısı düşük yük garantisi değildir; ölçülen maliyet her iş yüküne genellenemez.
 - Canlı doğrulama: görev paniksiz çalıştı; eşik altında trim yapmadı (doğru);
   geçici demo eşiğiyle trim'in çalıştığı syscall düzeyinde kanıtlandı.
+  `madvise` gözlemi tek başına hangi allocator'ın veya tamponların temizlendiğini göstermez.
+
+## Güncel politika ve yerel ölçüm sınırları (2026-10-15)
+
+- Politika (yerel, devreye alma dışı): GNU/Linux CLI jemalloc arka plan geri
+  kazanımı; `dirty_decay_ms=60000`, `muzzy_decay_ms=0`, arka plan temizliği açık.
+  Modül: `src/allocator.rs` (yalnız CLI).
+  Dolu `_RJEM_MALLOC_CONF` verilirse yerleşik varsayılanlar atlanır.
+  Uyarlanabilir RSS eşiğiyle açma/kapama uygulanmaz.
+- Arka plan bozunumu kesin 60 sn bırakma süresi veya RSS üst sınırı değildir.
+- Yerel ölçüm: 16 KiB, 4 işçi, 256 MiB patlama, 8 MiB tutulan.
+  60 sn bozunum 3 ayrı işlemde 99–106 sn içinde RSS < 64 MiB verdi.
+  30 sn: 51–54 sn (n=3); 300 sn: 523 sn (n=1); bozunumsuz: 600 sn sonunda 325 MiB.
+- 60 yeni yerel çalıştırma geçti; 25 kısa yeniden kullanım ve 25 TLS geri döngü içerdi.
+- Aralıklar geniştir; sıfır gerileme veya hız kazancı garantisi yoktur.
+  VPS/Hiddify platform matrisi kanıtı yoktur.
+- `src/memory.rs` 5 dk/RSS 64 MiB/bağlantı < 128 bakımı glibc'ye özeldir.
+  Bu çağrı jemalloc belleğini temizlemez; tamamlayıcı bakım olarak kalır.
+- Yerel uygulama doğrulaması: gerçek `src/allocator.rs` kurulumu, işçiler açıkken
+  256 MiB tampon deneyinde RSS'i 329,7 → 56,9 MiB'a 105,4 sn içinde indirdi;
+  elde tutulan 8 MiB verinin bütünlüğü korundu. Bu testin 180 sn bütçesi genel bir süre garantisi değildir.
+- Eski ve yeni release ikilileriyle beşer yerel TLS/VLESS koşusunda aktarım
+  aralıkları örtüştü; hız kazancı veya sıfır gerileme kanıtı olarak yorumlanmadı.
 
 ## Ölçüm dersleri
 

@@ -13,8 +13,8 @@ Kalan örnekler:
 - `tun_vpn.yaml` — TUN + direct istemci
 
 Örneklerdeki sertifika/anahtar yolları ile REALITY `private_key` değerleri
-tutucudur; gerçek değerlerle değiştirilmelidir. REALITY örnekleri genel kaps
-alan adları kullanır; üretim profilinde kapak/SNI tam olarak `whatsapp.net`
-olmalıdır. Üretim profili için
+tutucudur; gerçek değerlerle değiştirilmelidir. REALITY örnekleri sabit
+`whatsapp.net` kapak/SNI kullanır. Wildcard dinleyiciler genel örnektir;
+üretim profili açık genel IPv4 TCP 443 ve Vision gerektirir. Üretim profili için
 [CONFIG.md](../CONFIG.md) ve [üretim profili özeti](../docs/konfigurasyon.md)
 esas alınmalıdır.

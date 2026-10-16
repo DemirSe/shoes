@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased (fork)
+
+These are local source changes, not a published release or proof of live deployment.
+
+- Keep XUDP DNS failures and timeouts local to the affected datagram instead of
+  ending the shared connection. Preserve existing routes, reserve new routes only
+  after successful resolution, and yield during bursts of failed lookups.
+  Add unit and real sing-box regressions for plain VLESS and TLS+Vision XUDP;
+  malformed frames and transport failures retain their existing error handling.
+- Add GNU/Linux CLI jemalloc background reclamation with 60-second dirty decay;
+  preserve explicit allocator configuration. Decay is not an RSS cap or exact release deadline.
+- Escape control characters in file logs, redact Vision debug state, and remove
+  identified REALITY/VLESS/XUDP raw-byte and authentication-tag log dumps.
+- Keep deployment manual: the local binary deployment script and its offline
+  fake-service tests were removed (owner decision, 2026-10-16) as unnecessary
+  maintenance burden. The operations runbook retains hash verification, staging
+  with `rollback.bin`, atomic `install` + `mv`, restart, bounded health
+  observation and manual rollback. Backup cleanup stays separate and
+  owner-approved; no deployment workflow is added.
+- Consolidate development, configuration and deployment documentation; separate
+  current behavior from historical notes and local verification from live deployment.
+
+### Historical release notes
+
+The versioned entries below preserve prior release history. They may describe
+protocols removed from this fork; they are not current support or configuration guidance.
+Use [README.md](README.md), [CONFIG.md](CONFIG.md) and [scope decisions](docs/kararlar.md) instead.
+
 ## v0.3.2
 
 ### Fixes

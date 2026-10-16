@@ -54,6 +54,14 @@ istemci                sunucu (shoes)                 hedef
   - `DelayQueue` ile oturum sonlanması O(1).
   - Akış başına hedef tavanı: yapılandırma yoksa **2048**.
 - XUDP tel oturumu tavanı **16 384**; nesil-damgalı O(1) amortize tahliye.
+- XUDP hedef çözümlemesi başarısızsa veya zaman aşımına uğrarsa yalnız ilgili
+  datagram düşürülür; paylaşılan bağlantı ve mevcut route'lar kapatılmaz.
+  Çözülemeyen hedef yeni route bütçesi tüketmez; sonraki datagram aynı oturumda yeniden deneyebilir.
+- DNS beklemesi hâlâ sıralıdır; bekleme sırasında diğer paketler gecikebilir.
+  Bu değişiklik paralel DNS veya yeni negatif cache politikası eklemez.
+  Çok sayıda anlık çözümleme hatasında görev çalışma zamanına sıra bırakır.
+- `End|ERROR` yalnız ilgili tel oturumunu kapatır. Diğer ERROR çerçeveleri,
+  bozuk metadata ve taşıma hataları için önceki hata davranışı korunur.
 
 ## UDP-over-TCP (UoT) ve h2mux `packet_addr`
 

@@ -1,9 +1,9 @@
 # Sorun Giderme
 
-## Günlükte sık görülen (ve zararsız) hatalar
+## Günlükte sık görülen bağlantı hataları
 
-Aşağıdakiler internet tarayıcılarından gelen rastgele bağlantı denemeleridir;
-servis hatası değildir:
+Aşağıdakiler tarama veya yarıda kesilen bağlantılardan gelebilir.
+Tek başına servis arızasını kanıtlamaz; gerçek istemcide de görülüyorsa uyumluluk ve bağlantı yolunu inceleyin:
 
 ```
 ERROR shoes::tcp::tcp_server] <ip>:<port> finished with error:
@@ -14,7 +14,7 @@ ERROR shoes::tcp::tcp_server] <ip>:<port> finished with error:
 
 - `expected client handshake`: TLS/REALITY el sıkışması olmayan bağlantı.
 - `EOF while reading`: yarıda kesilen bağlantı (tarayıcı/port taraması).
-- Bunlar fail-closed davranışın normal parçasıdır; sürerse yalnız gürültüdür.
+- Kaynağı ve hata oranını gerçek bağlantı başarısıyla karşılaştırın; sürekli hatayı otomatik olarak zararsız saymayın.
 
 ## Temel teşhis komutları
 
@@ -23,17 +23,20 @@ ERROR shoes::tcp::tcp_server] <ip>:<port> finished with error:
 systemctl is-active shoes && systemctl show shoes -p NRestarts
 
 # Dinleyici
-ss -ltn | grep 443
+ss -H -ltnp4 'sport = :443'
 
 # Son hatalar (salt okunur)
 journalctl -u shoes --since "-5 min" -o cat | tail -n 20
 
-# Kaynak özeti (60 sn'de bir loglanır): connections/streams/quic/per_ip
+# Kaynak özeti (INFO açıksa 60 sn'de bir): connections/streams/quic/per_ip
 journalctl -u shoes --since "-2 min" -o cat | grep -i resource | tail -n 3
 
-# İzleme script'i (VPS'te, salt okunur)
+# İsteğe bağlı operatör script'i (depoya dahil değil; mevcutsa, onaylı canlı incelemede)
 bash server-monitor.sh 5 12
 ```
+
+Bu komutlar canlı inceleme için ayrıca onay gerektirir. Günlükleri yalnız gizli yerel oturumda inceleyin;
+ham journal çıktısını rapora taşımayın. `ss` çıktısı tek başına TCP kabulü veya tünel sağlığı kanıtı değildir.
 
 ## Günlük düzeyi (marker dosyaları)
 
@@ -67,13 +70,18 @@ bırakılmaz. Ham günlük ve kimlik bilgisi raporlara eklenmez
 
 ## Bellek
 
-- **RSS yüksek kaldı:** glibc arena rezervi olabilir; sızıntı değildir.
-  Doğrulama: aynı stresi tekrarla; RSS artmıyorsa rezervdir.
+- **RSS yüksek kaldı:** allocator rezervi, canlı veri veya sızıntı olabilir.
+  Aynı stresin tekrarında sabit RSS tek başına sızıntıyı dışlamaz; allocator ve canlı tahsisleri ayrıca ölç.
 - **Trim çalışmıyor gibi görünüyor:** koşullar — 5 dk aralık, RSS > 64 MB,
-  aktif bağlantı < 128. Normal kullanım 20-40 bağlantı açar; eşik altında trim
-  yapılmaması **doğru davranıştır**.
-- **Trim'i kanıtlamak:** `perf trace -e madvise` ile tek patlamada
-  `MADV_DONTNEED` çağrıları görülür.
+  aktif bağlantı < 128. Koşullardan biri sağlanmıyorsa trim yapılmaması beklenir;
+  bağlantı sayısından trafik yükü veya sızıntı sonucu çıkarılmaz.
+- **Trim kapsamı:** `malloc_trim` yalnız glibc belleğini hedefler; Linux CLI'ın
+  Rust allocator'ı jemalloc'tır. `MADV_DONTNEED` görmek, jemalloc tamponlarının
+  bu görevle temizlendiğini kanıtlamaz. Canlı izleme ayrıca sahip onayı gerektirir.
+- **jemalloc kapsamı:** politika yalnız GNU/Linux CLI içindir
+  (`src/allocator.rs`); kitaplık/FFI/diğer platform davranışı değişmez.
+  Dolu `_RJEM_MALLOC_CONF` yerleşik varsayılanları geçersiz kılar.
+  Uyarlanabilir RSS eşiğiyle açma/kapama yoktur.
 - **Acil sıfırlama:** onaylı `systemctl restart shoes` (kısa kesinti).
 
 ## Reload ve yapılandırma
@@ -83,8 +91,8 @@ bırakılmaz. Ham günlük ve kimlik bilgisi raporlara eklenmez
   reddedilir; yeniden başlatma gerekir.
 - Canlı birim `--no-reload` çalışır; bu yüzden dosya değişikliği kendiliğinden
   uygulanmaz — bilinçli tercih.
-- `--dry-run` geçersiz yapılandırmada sıfır dışı kod döner; deploy öncesi doğrulama
-  için kullanılabilir.
+- `--dry-run` geçersiz yapılandırmada sıfır dışı kod döner; aday yapılandırmayı
+  deploy öncesi doğrulamak için kullanılabilir. Canlı config `--dry-run`'a verilmez.
 
 ## Üretim profili redleri
 
@@ -94,6 +102,7 @@ bırakılmaz. Ham günlük ve kimlik bilgisi raporlara eklenmez
 - `transport: udp` kullanılmış.
 - REALITY hedefi/SNI `whatsapp.net` değil (alt alan/başka kapak dahil).
 - Opsiyonel VLESS fallback yapılandırılmış.
+- Vision kapalı, VLESS UDP/XUDP kapalı veya birden fazla sunucu/ek TLS hedefi var.
 
 ## TUN
 
@@ -102,11 +111,17 @@ bırakılmaz. Ham günlük ve kimlik bilgisi raporlara eklenmez
 
 ## Deploy sorunları
 
-- **Hash uyuşmazlığı:** dosya aktarımı bozulmuş; yeniden kopyala, hash doğrula.
-- **Sağlık kontrolü başarısız:** script otomatik rollback uygular; `receipt.txt`
-  ve `rollback.bin` bakım dizininde kalır.
+- **Hash uyuşmazlığı:** aktarım bozulmuş veya yanlış eser seçilmiş olabilir; kurulum yapmadan kaynağı doğrula.
+- **Sağlık kontrolü başarısız:** otomatik rollback yoktur (2026-10-16 sahip kararı);
+  operatör doğrulanmış `rollback.bin` ile elle geri döner ve sağlık kabulünü yineler.
+- **SSH kesildi / sonuç bilinmiyor:** tekrar deploy etmeden canlı binary hash'i ve son bakım kaydını karşılaştır.
+  Elle kurtarma da SSH/güç kaybı ve SIGKILL altında garanti değildir.
 - **Unit/config hash'i değişti:** beklenmedik; deploy durdurulmalı ve incelenmeli.
 - **NRestarts > 0:** beklenmedik yeniden başlatma; journal ve kaynak durumuna bak.
+
+Esas adımlar ve süre sınırları [operasyon rehberindedir](operasyon.md).
+Dağıtım yalnız binary değiştirir; unit/config oluşturulmaz veya düzeltilmez.
+Yedek temizliği her zaman ayrı onaylı bakım işlemidir.
 
 ## CPU yükselmesi
 

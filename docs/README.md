@@ -20,6 +20,22 @@ ve sorun giderme.
 | [guvenlik-ve-limitler.md](guvenlik-ve-limitler.md) | Doğrulanan/doğrulanmayan iddialar, bilinen sınırlar |
 | [sorun-giderme.md](sorun-giderme.md) | Sık hatalar, teşhis komutları, ölçüm tuzakları |
 
+## Hangi işlem için nereden başlanır?
+
+| İşlem | Esas kaynak |
+|---|---|
+| Geliştirme ortamı, test ve release hazırlığı | [CONTRIBUTING.md](../CONTRIBUTING.md) |
+| CLI kullanımı | [README.md](../README.md#usage) |
+| YAML alanı / varsayılanı | [CONFIG.md](../CONFIG.md) |
+| Üretim profili şartları / iskeleti | [konfigurasyon.md](konfigurasyon.md) |
+| Dağıtım / sağlık / rollback / yedek saklama | [operasyon.md](operasyon.md) |
+| Güncel kapsam ve ertelenen işler | [kararlar.md](kararlar.md) |
+
+Alan tanımları, test komutları ve deploy adımları kendi esas belgelerinde güncellenir.
+Özet belgeler bunları yeniden çoğaltmaz; ilgili kaynağa bağlanır.
+`report.md`, eski changelog girdileri ve tarihli ölçümler geçmiş kayıttır.
+Tarihsel öneriler güncel davranış veya canlı durum kanıtı sayılmaz.
+
 Depodaki diğer belgeler: [CONFIG.md](../CONFIG.md) (tam YAML referansı),
 [report.md](../report.md) (inceleme ve karar kayıtları),
 [SERVER-FEATURE-DECISIONS.md](../SERVER-FEATURE-DECISIONS.md) (özellik kararları),
@@ -32,10 +48,22 @@ Depodaki diğer belgeler: [CONFIG.md](../CONFIG.md) (tam YAML referansı),
 - REALITY hedefi ve SNI: yalnız `whatsapp.net`.
 - Dinleme: yalnız açık genel IPv4 TCP 443; UDP 443 dinleyicisi yoktur.
 - Kaldırılanlar geri eklenmez: VMess, Trojan, Shadowsocks/ShadowTLS, HTTP/SOCKS.
-- TUN istemcide açık kalır; sahip kuralı olarak bypass kuralı yoktur.
+- TUN açık ve bypass olmaması sahip gereksinimidir; mevcut istisnalar
+  [doğrulama sınırlarında](guvenlik-ve-limitler.md) ayrıca belirtilir.
 - CI çevrimdışıdır, elle çalıştırılır (`workflow_dispatch`) ve VPS'e bağlanmaz.
-- Deploy atomiktir: hazırla → `install` + `mv` → `systemctl restart` → sağlık kontrolü.
-  Her deploy `rollback.bin` bırakır.
+- Dağıtım elle ve atomiktir: hazırla → `install` + `mv` → `systemctl restart` → sınırlı sağlık gözlemi.
+  Her dağıtım `rollback.bin` bırakır; doğrulama başarısızsa operatör elle geri döner.
+- Otomatik dağıtım aracı yoktur (2026-10-16 sahip kararı); adımlar [operasyon.md](operasyon.md) içindedir.
+  Otomatik rollback iddiası yoktur; dağıtım yedekleri otomatik silinmez,
+  temizlik ayrıca onay gerektirir.
+
+## Durum etiketleri
+
+- **Yerelde uygulandı:** kodda bulunur; canlıya dağıtıldığı anlamına gelmez.
+- **Yerelde doğrulandı:** kapsamı ve tarihi belirtilen kontrollerden geçti.
+- **Canlıya dağıtıldı:** onaylı dağıtımın tarihli receipt'i gerekir.
+
+Bu düzenleme ve yerel doğrulamalar canlı doğrulama değildir.
 
 ## Hassas ayrıntılar
 

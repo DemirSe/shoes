@@ -1,5 +1,27 @@
 # Sunucu özellik kararları
 
+## Güncel kaynağa yönlendirme
+
+Bu dosya özellik kararlarını ve önceki uygulama notlarını korur.
+Aşağıdaki canlı durum cümleleri kendi kayıt dönemine aittir; güncel canlı durum son onaylı receipt ile doğrulanır.
+Güncel kapsam: [kararlar](docs/kararlar.md). Çalışma zamanı: [mimari](docs/mimari.md).
+Dağıtım, sağlık ve yedek saklama: [operasyon](docs/operasyon.md).
+
+2026-10-16 manuel dağıtım kararı (2026-10-15 araç kararlarını yürürlükten kaldırır):
+
+- Bakım yükü gereksiz bulundu; yerel deploy script'i ve ona özel çevrimdışı testleri sahip kararıyla kaldırıldı.
+- Dağıtım, sınırlı sağlık gözlemi ve geri dönüş elle yapılır; esas adımlar [operasyon](docs/operasyon.md) içindedir.
+- Otomatik rollback iddiası yoktur; doğrulama başarısızsa operatör elle geri döner.
+- Dağıtım bakım yedekleri otomatik silinmez; temizlik ayrı onaylı bakım işlemidir.
+- Çalışan sürüm kaydı, kullanılabilir rollback binary'si ve gerekli unit yedeği korunur.
+
+2026-10-15 dokümantasyon/deploy aracı kararları (tarihsel; yerel araç 2026-10-16'da kaldırıldı):
+
+- Yerel deploy script'i ve çevrimdışı hata/rollback testleri hazırlandı; canlı çalıştırma ayrıca onay isterdi.
+- Script, kurulum sonrası hatada otomatik binary rollback denemesi başlatıyordu; tamamlanamayan kurtarma açık hata olarak bildirilirdi.
+- Dağıtım bakım yedeklerini silmez; temizlik ayrı onaylı bakım işlemidir.
+- Çalışan sürüm kaydı, kullanılabilir rollback binary'si ve gerekli unit yedeği korunur.
+
 ## Kapsam
 
 Bu dosya sahibin seçimlerini ve istediği kısa değerlendirmeleri kaydeder.
@@ -13,7 +35,8 @@ Bu kayıt dağıtım, staging, commit veya push izni vermez.
 Çoklu UUID desteği yerel koda eklendi; canlı sunucuya dağıtılmadı.
 Sahip, paylaşılan UUID için on cihaz sınırını cihaz yönetimiyle uygulamayı seçti.
 Sunucuda otomatik gerçek cihaz sayımı eklenmedi.
-Çalışma sınırlarının kaynağı [proje talimatlarıdır](AGENTS.md).
+Yayımlanan çalışma sınırlarının kaynağı [kararlar ve kısıtlardır](docs/kararlar.md).
+Yerel `AGENTS.md` bilinçli olarak takipsizdir; yayımlanabilir belge bağlantısı olarak kullanılmaz.
 Mevcut sunucu yönetimi yeterli kalır.
 Bu kayıt dağıtım, staging, commit veya push izni vermez.
 
@@ -229,8 +252,8 @@ Diğer işletim sistemleri için yalnız derleme koruması incelendi.
 Android/Windows/Linux Hiddify sürümleri için ek özellik matrisi yok.
 Mevcut işlev testleri, önerilen ek özelliklerin uyumluluğunu kanıtlamaz.
 
-- [Kaynak araştırması](/home/demir/.pi/agent/sessions/--home-demir-pi-xray-optimized--/subagent-artifacts/outputs/1c7935bc-362b-4cf9-93a9-dda394b0af27/feature-performance-brief.md).
-- [Bağımsız kanıt kontrolü](/home/demir/.pi/agent/sessions/--home-demir-pi-xray-optimized--/subagent-artifacts/outputs/1c7935bc-362b-4cf9-93a9-dda394b0af27/feature-performance-evidence-audit.md).
+- Kaynak araştırması ve bağımsız kanıt kontrolünün ayrıntılı çıktıları yalnız yerel oturum arşivindedir;
+  temiz bir checkout'ta erişilebilir kanıt sayılmaz. Bu belgede özet ve aşağıdaki kamu kaynakları korunur.
 - [Stok Xray VLESS yapılandırması](https://github.com/XTLS/Xray-core/blob/v26.3.27/infra/conf/vless.go).
 - [Stok Xray ham kopyalama ve splice kodu](https://github.com/XTLS/Xray-core/blob/v26.3.27/proxy/proxy.go).
 - [Resmî REALITY seçenekleri](https://github.com/XTLS/Xray-docs-next/blob/main/docs/en/config/transports/reality.md).

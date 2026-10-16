@@ -613,19 +613,8 @@ client_chain:
 
 ## Command Line
 
-```bash
-shoes [OPTIONS] <config.yaml> [config.yaml...]
-
-OPTIONS:
-  -t, --threads NUM    Worker threads (default: CPU count)
-  -d, --dry-run        Parse config and exit
-  --no-reload          Disable hot-reloading
-  --production-profile Enforce this fork's deployment policy
-
-COMMANDS:
-  generate-reality-keypair    Generate Reality X25519 keypair
-  generate-vless-user-id      Generate a random VLESS user ID (UUID v4)
-```
+See [README.md: Usage](README.md#usage) for CLI options and key-generation commands.
+This document is the YAML field reference, not the deployment runbook.
 
 `--dry-run` returns a nonzero status for invalid configuration. Unsupported UDP
 listeners are rejected; UDP/XUDP remain available inside the TCP tunnel.
@@ -634,9 +623,10 @@ listeners are rejected; UDP/XUDP remain available inside the TCP tunnel.
 exactly one explicit public IPv4 TCP 443 listener, exactly `whatsapp.net` for REALITY
 SNI and destination port 443, Vision, VLESS with UDP/XUDP enabled, and no optional
 VLESS fallback or additional TLS targets. It is opt-in to preserve local fixtures.
-The flag must be enabled in a separately approved deployment; this code change
-does not validate or modify the live server profile. Client TUN routing and bypass
-policy remain separate verification tasks.
+The recorded production unit already uses this flag; removing it requires owner approval.
+Source validation is not evidence of the current live state. Client TUN routing and
+bypass policy remain separate verification tasks. See the [production summary](docs/konfigurasyon.md)
+and [deployment runbook](docs/operasyon.md).
 
 ## Tips
 
@@ -664,7 +654,8 @@ openssl x509 -in cert.pem -noout -fingerprint -sha256
 - Use `127.0.0.1` instead of `0.0.0.0` for local-only access
 - Use firewall rules to restrict access
 - Enable client certificate authentication for sensitive services
-- Use Vision with Reality for maximum privacy
+- Keep the required REALITY/Vision profile; this does not guarantee indistinguishability or leak protection.
+  See [verification limits](docs/guvenlik-ve-limitler.md).
 
 ### Performance Tips
 

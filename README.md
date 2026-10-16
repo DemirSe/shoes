@@ -1,11 +1,31 @@
-# shoes
+# shoes (server fork)
 
-shoes is a high-performance proxy server written in Rust.
+This repository is a Linux-focused server fork of [`shoes` 0.3.2](https://github.com/cfal/shoes)
+(Rust proxy server by cfal). It is not Xray-core, and binaries built from this
+tree are not the upstream `shoes` release. The fork serves one deployment
+profile — VLESS + REALITY + Vision over TCP. Stock Xray/Hiddify wire
+compatibility on Android, Windows, and Linux is a requirement, not a claim of
+a completed platform test matrix. See [verification limits](docs/guvenlik-ve-limitler.md).
+
+## Start Here
+
+| Task | Authoritative guide |
+|---|---|
+| Build, test or maintain the fork | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Understand the code and lifecycle | [Architecture](docs/mimari.md) |
+| Look up YAML fields | [CONFIG.md](CONFIG.md) |
+| Understand the restricted server profile | [Production policy](docs/konfigurasyon.md) |
+| Deploy, health-check or roll back | [Operations runbook](docs/operasyon.md) |
+| Find all documentation | [Documentation index](docs/README.md) |
+| Review pending fork changes | [CHANGELOG.md](CHANGELOG.md) |
+
+The source tree, local verification and live deployment are distinct states.
+No documentation example, test result or source change authorizes a production change.
 
 ## Supported Protocols
 
 ### Proxy Protocols
-- **VLESS** (with fallback support)
+- **VLESS** (the optional VLESS fallback is not configured in this fork)
 - **H2MUX** (HTTP/2 multiplexing for VLESS)
 
 ### Transport Protocols
@@ -16,7 +36,9 @@ shoes is a high-performance proxy server written in Rust.
 
 ### TUN/VPN Mode
 - **TUN device support** - Layer 3 VPN for transparent proxying
-- Supported platforms: Linux, Android, iOS
+- Linux-first; TUN/FFI code is retained for unix targets including Android/iOS.
+  Intended client deployments require TUN on with no bypass rules; current
+  verification limits are documented above.
 
 ## Features
 
@@ -26,20 +48,27 @@ shoes is a high-performance proxy server written in Rust.
 - **Rule-based routing**: Route by IP/CIDR or hostname masks
 - **Named PEM certificates**: Define once, reference everywhere
 - **TLS fingerprint authentication**: Certificate pinning for TLS
-- **Hot reloading**: Apply config changes without restart
+- **Hot reloading**: Transactional TCP config replacement; TUN replacement requires restart.
+  The recorded production unit uses `--no-reload`.
 - **Unix socket support**: Bind to Unix domain sockets
+- **Memory (GNU/Linux CLI)**: 60-second jemalloc background decay; `src/memory.rs` trim stays glibc-only
 
 For advanced access control (IP allowlist/blocklists), see [tobaru](https://github.com/cfal/tobaru).
 
 ## Installation
 
-Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
-
-Or install with cargo:
+Build this fork from this source tree. Upstream release binaries and
+`cargo install shoes` do not contain this fork's changes.
+Use the locked offline workflow described in
+[CONTRIBUTING.md](./CONTRIBUTING.md):
 
 ```bash
-cargo install shoes
+CARGO_TARGET_DIR="$HOME/.cache/shoes-target" \
+cargo build -p shoes --bin shoes --release --locked --offline
 ```
+
+Point `CARGO_TARGET_DIR` outside the repository before building; `/tmp` is
+often a small tmpfs, so prefer a directory under your home directory or cache.
 
 ## Usage
 
@@ -48,9 +77,11 @@ shoes [OPTIONS] <config.yaml> [config.yaml...]
 
 OPTIONS:
     -t, --threads NUM    Set the number of worker threads (default: CPU count)
+    -l, --log-file PATH  Log to file (repeatable; "-" means stderr; default: stderr)
     -d, --dry-run        Parse the config and exit
     --no-reload          Disable automatic config reloading on file changes
     --production-profile Enforce the public IPv4:443 whatsapp.net REALITY/Vision profile
+    -V, --version        Print version information and exit
 
 COMMANDS:
     generate-reality-keypair    Generate a new Reality X25519 keypair
@@ -96,109 +127,22 @@ CI requires pre-provisioned offline runners; see [.github/OFFLINE-CI.md](.github
 
 ## Examples
 
-See the [examples](./examples) directory for all examples.
+Use the [example catalog](examples/README.md) for general REALITY, Vision,
+TLS/VLESS and TUN examples. They are illustrative profiles, not production-ready deployments.
+Use the [production skeleton](docs/konfigurasyon.md#üretim-profili-iskeleti-yer-tutucular)
+for this server's stricter requirements and [CONFIG.md](CONFIG.md) for chaining and H2MUX fields.
+Keep real addresses, UUIDs, keys, short IDs and configuration files out of the repository.
 
-### Basic VLESS Server
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: vless
-    user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-    udp_enabled: true
-```
+## Deployment
 
-### VLESS with Vision over TLS
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: tls
-    tls_targets:
-      "vless.example.com":
-        cert: cert.pem
-        key: key.pem
-        vision: true
-        alpn_protocols: ["http/1.1"]
-        protocol:
-          type: vless
-          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-          udp_enabled: true
-```
-
-### Reality Server
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: tls
-    reality_targets:
-      "www.example.com":
-        private_key: "YOUR_BASE64URL_PRIVATE_KEY"
-        short_ids: ["0123456789abcdef", ""]
-        dest: "www.example.com:443"
-        protocol:
-          type: vless
-          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-          udp_enabled: true
-```
-
-### Upstream VLESS Chain with H2MUX
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: vless
-    user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain:
-        address: "server.example.com:443"
-        protocol:
-          type: vless
-          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-          h2mux:
-            max_connections: 4
-            min_streams: 1
-```
-
-### Upstream VLESS Chain
-```yaml
-- address: 0.0.0.0:443
-  protocol:
-    type: vless
-    user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain:
-        address: "server.example.com:443"
-        protocol:
-          type: reality
-          public_key: "SERVER_PUBLIC_KEY"
-          short_id: "0123456789abcdef"
-          sni_hostname: "www.example.com"
-          protocol:
-            type: vless
-            user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-```
-
-### TUN VPN
-```yaml
-- device_name: tun0
-  address: 10.0.0.1
-  netmask: 255.255.255.0
-  mtu: 1500
-  tcp_enabled: true
-  udp_enabled: true
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain:
-        address: "proxy.example.com:443"
-        protocol:
-          type: tls
-          protocol:
-            type: vless
-            user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
-```
+Deployment is manual and owner-approved, for the existing operator's Linux/systemd
+server layout only. Follow the [operations runbook](docs/operasyon.md): verify the
+artifact SHA-256, stage under `/var/lib/shoes-maintenance/<id>/` with a verified
+`rollback.bin`, install to a noncolliding sibling path and atomically `mv`, restart
+the unit, observe bounded health, and revert manually if a check fails.
+The local deployment script and its offline tests were removed on 2026-10-16
+(owner decision). No workflow contacts the VPS. Backup cleanup is a separately
+approved operation; maintenance backups are not pruned automatically.
 
 ## Similar Projects
 
