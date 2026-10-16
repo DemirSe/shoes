@@ -456,36 +456,7 @@ impl AsyncReadSessionMessage for XudpMessageStream {
     ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>> {
         let this = self.get_mut();
 
-        // Return buffered message if available
-        if let Some((data, original_destination, wire_session_id)) = this.incoming_message.take() {
-            if data.len() > buf.remaining() {
-                this.incoming_message = Some((data, original_destination, wire_session_id));
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "buffer too small for incoming message",
-                )));
-            }
-
-            if let Some(session_id) =
-                this.get_or_create_route(wire_session_id, &original_destination)?
-            {
-                let socket_addr = match this
-                    .resolver_cache
-                    .poll_resolve_location(cx, &original_destination)
-                {
-                    Poll::Ready(result) => result?,
-                    Poll::Pending => {
-                        this.incoming_message = Some((data, original_destination, wire_session_id));
-                        return Poll::Pending;
-                    }
-                };
-
-                buf.put_slice(&data);
-                return Poll::Ready(Ok((session_id, socket_addr)));
-            }
-        }
-
-        if this.is_eof {
+        if this.is_eof && this.incoming_message.is_none() {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "EOF reached",
@@ -493,9 +464,59 @@ impl AsyncReadSessionMessage for XudpMessageStream {
         }
 
         loop {
-            // Try to decode a complete frame from the read buffer
-            match this.try_decode_one_frame()? {
+            // Resume DNS without a separate delivery path: immediate and delayed
+            // resolution failures must have the same datagram-local semantics.
+            let message = if let Some(message) = this.incoming_message.take() {
+                Some(message)
+            } else {
+                this.try_decode_one_frame()?
+            };
+            match message {
                 Some((data, destination, wire_session_id)) => {
+                    // Do not resolve new destinations once route admission is
+                    // exhausted. Existing routes remain usable at the limit.
+                    if this.routes.len() >= MAX_XUDP_ROUTES
+                        && !this
+                            .wire_sessions
+                            .get(&wire_session_id)
+                            .is_some_and(|session| session.routes.contains_key(&destination))
+                    {
+                        log::warn!("[XUDP SESSION READ] Dropping datagram at the route limit");
+                        ready!(tokio::task::coop::poll_proceed(cx)).made_progress();
+                        continue;
+                    }
+
+                    let socket_addr =
+                        match this.resolver_cache.poll_resolve_location(cx, &destination) {
+                            Poll::Ready(Ok(addr)) => addr,
+                            Poll::Ready(Err(error)) => {
+                                // DNS failure is not transport EOF. Drop only
+                                // this datagram; keep all wire sessions/routes
+                                // so later packets may retry or reach other peers.
+                                log::debug!(
+                                    "[XUDP SESSION READ] Dropping datagram after DNS failure: {:?}",
+                                    error.kind()
+                                );
+                                // A burst of immediately rejected names must
+                                // yield rather than monopolize the runtime.
+                                ready!(tokio::task::coop::poll_proceed(cx)).made_progress();
+                                continue;
+                            }
+                            Poll::Pending => {
+                                this.incoming_message = Some((data, destination, wire_session_id));
+                                return Poll::Pending;
+                            }
+                        };
+
+                    // Reserve routes only for resolved, deliverable packets.
+                    // Failed names must not consume the bounded route table.
+                    if data.len() > buf.remaining() {
+                        this.incoming_message = Some((data, destination, wire_session_id));
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "buffer too small for incoming message",
+                        )));
+                    }
                     let Some(session_id) =
                         this.get_or_create_route(wire_session_id, &destination)?
                     else {
@@ -505,21 +526,6 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                         );
                         continue;
                     };
-
-                    // Resolve hostname to IP if needed
-                    log::debug!("[XUDP SESSION READ] Resolving destination: {}", destination);
-                    let socket_addr =
-                        match this.resolver_cache.poll_resolve_location(cx, &destination) {
-                            Poll::Ready(Ok(addr)) => addr,
-                            Poll::Ready(Err(e)) => {
-                                return Poll::Ready(Err(e));
-                            }
-                            Poll::Pending => {
-                                // DNS resolution pending - buffer the frame and wait
-                                this.incoming_message = Some((data, destination, wire_session_id));
-                                return Poll::Pending;
-                            }
-                        };
 
                     let resolved_destination = match socket_addr {
                         SocketAddr::V4(addr) => {
@@ -540,16 +546,6 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                         session_id,
                         resolved_destination
                     );
-
-                    // Successfully decoded a frame
-                    if data.len() > buf.remaining() {
-                        // Buffer it with resolved destination for next read
-                        this.incoming_message = Some((data, destination, wire_session_id));
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "buffer too small for incoming message",
-                        )));
-                    }
 
                     buf.put_slice(&data);
                     log::debug!(
@@ -903,12 +899,13 @@ mod tests {
         target: Option<NetLocation>,
         data: Option<&[u8]>,
     ) -> bytes::BytesMut {
+        let network = target.as_ref().map(|_| TargetNetwork::Udp);
         let metadata = FrameMetadata {
             session_id,
             status,
             option,
             target,
-            network: Some(TargetNetwork::Udp),
+            network,
         };
         let mut frame = bytes::BytesMut::new();
         metadata.encode(&mut frame).unwrap();
@@ -918,6 +915,426 @@ mod tests {
             frame.extend_from_slice(data);
         }
         frame
+    }
+
+    #[derive(Debug)]
+    struct FailingResolver {
+        calls: std::sync::atomic::AtomicUsize,
+        failures: usize,
+        pending_once: bool,
+        error_kind: io::ErrorKind,
+    }
+
+    impl crate::resolver::Resolver for FailingResolver {
+        fn resolve_location(
+            &self,
+            location: &NetLocation,
+        ) -> Pin<Box<dyn std::future::Future<Output = io::Result<Vec<SocketAddr>>> + Send>>
+        {
+            let fail = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                < self.failures;
+            let error_kind = self.error_kind;
+            let address = SocketAddr::from(([127, 0, 0, 1], location.port()));
+            let mut pending = self.pending_once;
+            Box::pin(std::future::poll_fn(move |cx| {
+                if pending {
+                    pending = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(if fail {
+                    Err(io::Error::new(error_kind, "injected DNS failure"))
+                } else {
+                    Ok(vec![address])
+                })
+            }))
+        }
+    }
+
+    fn dns_failure_stream(
+        frames: BytesMut,
+        failures: usize,
+        pending_once: bool,
+        error_kind: io::ErrorKind,
+    ) -> (XudpMessageStream, Arc<FailingResolver>) {
+        let resolver = Arc::new(FailingResolver {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            failures,
+            pending_once,
+            error_kind,
+        });
+        let mut stream = XudpMessageStream::new_with_resolver(
+            Box::new(FrameReader {
+                bytes: Bytes::new(),
+                max_chunk: usize::MAX,
+            }),
+            resolver.clone(),
+        );
+        stream.feed_initial_read_data(&frames).unwrap();
+        (stream, resolver)
+    }
+
+    #[test]
+    fn dns_failure_drops_only_the_datagram_not_existing_routes() {
+        let healthy = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 1234);
+        let bad = NetLocation::new(Address::Hostname("failure.test".into()), 53);
+        let mut frames = xudp_frame(
+            11,
+            SessionStatus::New,
+            FrameOption::new().with_data(),
+            Some(healthy.clone()),
+            Some(b"before"),
+        );
+        frames.extend_from_slice(&xudp_frame(
+            11,
+            SessionStatus::Keep,
+            FrameOption::new().with_data(),
+            Some(bad.clone()),
+            Some(b"drop"),
+        ));
+        frames.extend_from_slice(&xudp_frame(
+            11,
+            SessionStatus::Keep,
+            FrameOption::new().with_data(),
+            None,
+            Some(b"after"),
+        ));
+        frames.extend_from_slice(&xudp_frame(
+            22,
+            SessionStatus::New,
+            FrameOption::new().with_data(),
+            Some(NetLocation::new(
+                Address::Ipv6("::1".parse().unwrap()),
+                4321,
+            )),
+            Some(b"other"),
+        ));
+        let (mut stream, _) = dns_failure_stream(frames, 1, false, io::ErrorKind::NotFound);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+        let first = Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf);
+        let Poll::Ready(Ok((route, _))) = first else {
+            panic!("expected first datagram");
+        };
+        buf.clear();
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf),
+            Poll::Ready(Ok((id, _))) if id == route
+        ));
+        assert_eq!(buf.filled(), b"after");
+        assert_eq!(
+            stream.routes.len(),
+            1,
+            "failed DNS must not reserve a route"
+        );
+        assert!(!stream.wire_sessions[&11].routes.contains_key(&bad));
+        assert_eq!(stream.take_closed_session(), None);
+        buf.clear();
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf),
+            Poll::Ready(Ok((_, address))) if address == "[::1]:4321".parse::<SocketAddr>().unwrap()
+        ));
+        assert_eq!(buf.filled(), b"other");
+    }
+
+    #[test]
+    fn pending_dns_failure_and_timeout_preserve_the_following_datagram() {
+        for error_kind in [io::ErrorKind::NotFound, io::ErrorKind::TimedOut] {
+            let mut frames = xudp_frame(
+                33,
+                SessionStatus::New,
+                FrameOption::new().with_data(),
+                Some(NetLocation::new(
+                    Address::Hostname("failure.test".into()),
+                    53,
+                )),
+                Some(b"drop"),
+            );
+            frames.extend_from_slice(&xudp_frame(
+                11,
+                SessionStatus::New,
+                FrameOption::new().with_data(),
+                Some(NetLocation::new(
+                    Address::Ipv4("127.0.0.1".parse().unwrap()),
+                    1234,
+                )),
+                Some(b"after"),
+            ));
+            let (mut stream, _) = dns_failure_stream(frames, 1, true, error_kind);
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut bytes = [0; 64];
+            let mut buf = ReadBuf::new(&mut bytes);
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_read_session_message(&mut cx, &mut buf)
+                    .is_pending()
+            );
+            assert!(stream.incoming_message.is_some());
+            assert!(
+                stream.routes.is_empty(),
+                "pending DNS must not reserve a route"
+            );
+            assert!(matches!(
+                Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf),
+                Poll::Ready(Ok(_))
+            ));
+            assert_eq!(buf.filled(), b"after");
+            assert!(stream.wire_sessions[&33].routes.is_empty());
+            assert_eq!(stream.routes.len(), 1);
+            assert_eq!(stream.take_closed_session(), None);
+        }
+    }
+
+    #[test]
+    fn dns_failure_can_retry_on_the_same_wire_session() {
+        let target = NetLocation::new(Address::Hostname("retry.test".into()), 1234);
+        let mut frames = xudp_frame(
+            11,
+            SessionStatus::New,
+            FrameOption::new().with_data(),
+            Some(target),
+            Some(b"drop"),
+        );
+        frames.extend_from_slice(&xudp_frame(
+            11,
+            SessionStatus::Keep,
+            FrameOption::new().with_data(),
+            None,
+            Some(b"retry"),
+        ));
+        let (mut stream, resolver) = dns_failure_stream(frames, 1, false, io::ErrorKind::NotFound);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf),
+            Poll::Ready(Ok(_))
+        ));
+        assert_eq!(buf.filled(), b"retry");
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(stream.wire_sessions.len(), 1);
+        assert_eq!(stream.routes.len(), 1);
+    }
+
+    #[test]
+    fn full_route_table_skips_new_dns_work_but_keeps_existing_routes() {
+        let healthy = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 1);
+        let mut frames = xudp_frame(
+            22,
+            SessionStatus::New,
+            FrameOption::new().with_data(),
+            Some(NetLocation::new(
+                Address::Hostname("failure.test".into()),
+                53,
+            )),
+            Some(b"drop"),
+        );
+        frames.extend_from_slice(&xudp_frame(
+            11,
+            SessionStatus::Keep,
+            FrameOption::new().with_data(),
+            None,
+            Some(b"after"),
+        ));
+        let (mut stream, resolver) = dns_failure_stream(frames, 1, false, io::ErrorKind::NotFound);
+        stream.start_wire_session(11, healthy);
+        let mut first_route = None;
+        for port in 1..=MAX_XUDP_ROUTES as u16 {
+            let target = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), port);
+            let route = stream.get_or_create_route(11, &target).unwrap();
+            if port == 1 {
+                first_route = route;
+            }
+        }
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf),
+            Poll::Ready(Ok((id, _))) if Some(id) == first_route
+        ));
+        assert_eq!(buf.filled(), b"after");
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(stream.routes.len(), MAX_XUDP_ROUTES);
+    }
+
+    #[tokio::test]
+    async fn repeated_dns_failures_yield_without_exhausting_routes() {
+        tokio::spawn(async {
+            let failures = MAX_XUDP_ROUTES + 32;
+            let mut frames = BytesMut::new();
+            for index in 0..failures {
+                frames.extend_from_slice(&xudp_frame(
+                    11,
+                    if index == 0 {
+                        SessionStatus::New
+                    } else {
+                        SessionStatus::Keep
+                    },
+                    FrameOption::new().with_data(),
+                    Some(NetLocation::new(
+                        Address::Hostname(format!("failure-{index}.test")),
+                        53,
+                    )),
+                    Some(b"drop"),
+                ));
+            }
+            frames.extend_from_slice(&xudp_frame(
+                11,
+                SessionStatus::Keep,
+                FrameOption::new().with_data(),
+                Some(NetLocation::new(
+                    Address::Ipv4("127.0.0.1".parse().unwrap()),
+                    1234,
+                )),
+                Some(b"after"),
+            ));
+            let (mut stream, resolver) =
+                dns_failure_stream(frames, failures, false, io::ErrorKind::NotFound);
+            let mut bytes = [0; 64];
+            let mut buf = ReadBuf::new(&mut bytes);
+            {
+                let waker = noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                assert!(
+                    Pin::new(&mut stream)
+                        .poll_read_session_message(&mut cx, &mut buf)
+                        .is_pending()
+                );
+            }
+            assert!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed) < failures);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                std::future::poll_fn(|cx| {
+                    Pin::new(&mut stream).poll_read_session_message(cx, &mut buf)
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.1, "127.0.0.1:1234".parse::<SocketAddr>().unwrap());
+            assert_eq!(buf.filled(), b"after");
+            assert_eq!(
+                resolver.calls.load(std::sync::atomic::Ordering::Relaxed),
+                failures
+            );
+            assert_eq!(stream.routes.len(), 1);
+            assert_eq!(stream.take_closed_session(), None);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn malformed_metadata_is_not_treated_as_a_dns_failure() {
+        let (mut stream, resolver) = dns_failure_stream(
+            BytesMut::from(&[0, 4, 0, 11, 0xff, 0][..]),
+            0,
+            false,
+            io::ErrorKind::NotFound,
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf),
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(resolver.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn end_with_error_closes_only_its_wire_session() {
+        let target = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 1234);
+        let mut frames = BytesMut::new();
+        for id in [11, 22] {
+            frames.extend_from_slice(&xudp_frame(
+                id,
+                SessionStatus::New,
+                FrameOption::new().with_data(),
+                Some(target.clone()),
+                Some(b"before"),
+            ));
+        }
+        frames.extend_from_slice(&xudp_frame(
+            22,
+            SessionStatus::End,
+            FrameOption::from(FrameOption::ERROR),
+            None,
+            None,
+        ));
+        frames.extend_from_slice(&xudp_frame(
+            11,
+            SessionStatus::Keep,
+            FrameOption::new().with_data(),
+            None,
+            Some(b"after"),
+        ));
+        let (mut stream, _) = dns_failure_stream(frames, 0, false, io::ErrorKind::NotFound);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+        let mut routes = Vec::new();
+        for _ in 0..2 {
+            let Poll::Ready(Ok((route, _))) =
+                Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf)
+            else {
+                panic!("expected initial packet");
+            };
+            routes.push(route);
+            buf.clear();
+        }
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf),
+            Poll::Ready(Ok((id, _))) if id == routes[0]
+        ));
+        assert_eq!(buf.filled(), b"after");
+        assert_eq!(stream.take_closed_session(), Some(routes[1]));
+        assert_eq!(stream.take_closed_session(), None);
+    }
+
+    #[test]
+    fn non_end_error_frames_keep_their_fatal_error_behavior() {
+        let frames = xudp_frame(
+            11,
+            SessionStatus::Keep,
+            FrameOption::from(FrameOption::ERROR),
+            None,
+            None,
+        );
+        let (mut stream, _) = dns_failure_stream(frames, 0, false, io::ErrorKind::NotFound);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = [0; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf),
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::ConnectionReset
+        ));
+    }
+
+    #[tokio::test]
+    async fn transport_eof_is_not_treated_as_a_dns_failure() {
+        let (inner, peer) = tokio::io::duplex(64);
+        drop(peer);
+        let mut stream = XudpMessageStream::new(Box::new(inner));
+        let mut bytes = [0; 64];
+        let mut buf = ReadBuf::new(&mut bytes);
+        let error = std::future::poll_fn(|cx| {
+            Pin::new(&mut stream).poll_read_session_message(cx, &mut buf)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
