@@ -30,7 +30,7 @@ pub struct UnpadResult {
     pub command: Option<UnpadCommand>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum UnpadState {
     /// Initial state: expecting UUID (16 bytes) before first command
     Initial { expected_uuid: [u8; 16] },
@@ -64,12 +64,37 @@ enum UnpadState {
     Done,
 }
 
-#[derive(Debug, Clone)]
+// State is logged during parsing. Never include its UUID or buffered payload.
+impl std::fmt::Debug for UnpadState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Initial { .. } => "Initial",
+            Self::ReadingCommand => "ReadingCommand",
+            Self::ReadingContentLength { .. } => "ReadingContentLength",
+            Self::ReadingPaddingLength { .. } => "ReadingPaddingLength",
+            Self::ReadingContent { .. } => "ReadingContent",
+            Self::ReadingPadding { .. } => "ReadingPadding",
+            Self::Done => "Done",
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct VisionUnpadder {
     state: UnpadState,
     first_block: bool,
     /// Reusable buffer for accumulated content to avoid allocation on every unpad() call
     accumulated_buffer: Vec<u8>,
+}
+
+impl std::fmt::Debug for VisionUnpadder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VisionUnpadder")
+            .field("state", &self.state)
+            .field("first_block", &self.first_block)
+            .field("accumulated_buffer_len", &self.accumulated_buffer.len())
+            .finish()
+    }
 }
 
 impl VisionUnpadder {
@@ -372,6 +397,39 @@ impl VisionUnpadder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_state_never_formats_uuid_or_buffered_payload() {
+        let initial = VisionUnpadder::new([173; 16]);
+        assert_eq!(format!("{:?}", initial.state), "Initial");
+        let states = [
+            UnpadState::ReadingContent {
+                command: UnpadCommand::Continue,
+                partial_content: vec![174; 3],
+                remaining_content_len: 2,
+                padding_len: 1,
+            },
+            UnpadState::ReadingPadding {
+                command: UnpadCommand::Continue,
+                content: vec![175; 3],
+                remaining_padding_len: 1,
+            },
+        ];
+        for (state, label) in states.into_iter().zip(["ReadingContent", "ReadingPadding"]) {
+            let unpadder = VisionUnpadder {
+                state,
+                first_block: true,
+                accumulated_buffer: vec![176; 3],
+            };
+            assert_eq!(format!("{:?}", unpadder.state), label);
+            assert_eq!(
+                format!("{unpadder:?}"),
+                format!(
+                    "VisionUnpadder {{ state: {label}, first_block: true, accumulated_buffer_len: 3 }}"
+                )
+            );
+        }
+    }
 
     #[test]
     fn test_padding_state_basic() {

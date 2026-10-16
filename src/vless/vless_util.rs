@@ -22,11 +22,7 @@ pub async fn parse_addons_from_reader<S: AsyncReadExt + Unpin>(
         .read_slice(stream, addon_length as usize)
         .await?;
 
-    log::debug!(
-        "Parsing addons: length={}, bytes={:?}",
-        addon_length,
-        addon_bytes
-    );
+    log::debug!("Parsing addons: length={}", addon_length);
 
     // Parse protobuf-encoded addons
     // Format: field_tag length data [field_tag length data ...]

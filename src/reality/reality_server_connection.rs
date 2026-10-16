@@ -324,8 +324,8 @@ impl RealityServerConnection {
         let client_public_key = extract_client_public_key(client_hello)?;
 
         log::debug!(
-            "REALITY: ClientHello received, client_random: {:?}",
-            &client_random[..8]
+            "REALITY: ClientHello received ({} random bytes)",
+            client_random.len()
         );
 
         // Perform ECDH to derive auth key

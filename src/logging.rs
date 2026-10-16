@@ -46,6 +46,23 @@ pub struct FileLogWriter {
     file: parking_lot::Mutex<File>,
 }
 
+/// Keep a record on one physical line, including when its message is untrusted.
+/// Preserve printable Unicode, but neutralize controls and Unicode line separators.
+fn file_log_line(formatted: &str) -> String {
+    fn safe(c: char) -> bool {
+        !c.is_control() && c != '\u{2028}' && c != '\u{2029}'
+    }
+
+    let mut line = String::with_capacity(formatted.len() + 1);
+    if formatted.chars().all(safe) {
+        line.push_str(formatted);
+    } else {
+        line.extend(formatted.chars().map(|c| if safe(c) { c } else { '?' }));
+    }
+    line.push('\n');
+    line
+}
+
 impl FileLogWriter {
     pub fn new(path: &str) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -58,8 +75,7 @@ impl FileLogWriter {
 impl LogWriter for FileLogWriter {
     fn write_log(&self, _record: &Record, formatted: &str) {
         let mut guard = self.file.lock();
-        let mut line = formatted.to_string();
-        line.push('\n');
+        let line = file_log_line(formatted);
         let _ = guard.write_all(line.as_bytes());
     }
 
@@ -89,8 +105,7 @@ impl LogWriter for DynamicFileLogWriter {
         if let Some(mutex) = self.file.get() {
             let mut guard = mutex.lock();
             if let Some(ref mut file) = *guard {
-                let mut line = formatted.to_string();
-                line.push('\n');
+                let line = file_log_line(formatted);
                 let _ = file.write_all(line.as_bytes());
             }
         }
@@ -276,6 +291,55 @@ pub fn resolve_directives() -> Vec<Directive> {
 mod tests {
     use super::*;
     use log::Level;
+
+    #[test]
+    fn file_log_lines_preserve_printable_text_and_neutralize_controls() {
+        assert_eq!(file_log_line(""), "\n");
+        assert_eq!(
+            file_log_line("normal UTF-8: bağlantı"),
+            "normal UTF-8: bağlantı\n"
+        );
+        assert_eq!(
+            file_log_line("message\nforged\r\t\0\x1b[31m\x7f\u{0085}\u{2028}\u{2029}"),
+            "message?forged????[31m????\n"
+        );
+    }
+
+    #[test]
+    fn file_writer_keeps_untrusted_messages_on_one_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server.log");
+        let writer = FileLogWriter::new(path.to_str().unwrap()).unwrap();
+        let record = Record::builder().args(format_args!("unused")).build();
+        writer.write_log(&record, "first\nforged\r\x1b[2J");
+        writer.write_log(&record, "second: bağlantı");
+        writer.flush();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "first?forged??[2J\nsecond: bağlantı\n"
+        );
+    }
+
+    #[test]
+    fn dynamic_file_writer_keeps_untrusted_messages_on_one_line() {
+        static FILE: std::sync::OnceLock<parking_lot::Mutex<Option<File>>> =
+            std::sync::OnceLock::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mobile.log");
+        FILE.set(parking_lot::Mutex::new(Some(File::create(&path).unwrap())))
+            .unwrap();
+        let writer = DynamicFileLogWriter::new(&FILE);
+        let record = Record::builder().args(format_args!("unused")).build();
+        writer.write_log(&record, "first\u{2028}forged\u{2029}\u{0085}");
+        writer.write_log(&record, "second: bağlantı");
+        writer.flush();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "first?forged??\nsecond: bağlantı\n"
+        );
+        // Close the file before the temporary directory is removed on Windows.
+        FILE.get().unwrap().lock().take();
+    }
 
     /// Builds a MultiLogger (no writers) from directives for testing matches().
     fn logger_from(mut directives: Vec<Directive>) -> MultiLogger {

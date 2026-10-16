@@ -98,7 +98,7 @@ fn hkdf_expand_label_with_algorithm(
     hkdf_label.push(context.len() as u8);
     hkdf_label.extend_from_slice(context);
 
-    log::debug!("HKDF_LABEL_BYTES: {:02x?}", hkdf_label);
+    log::debug!("HKDF_LABEL_BYTES ({} bytes)", hkdf_label.len());
 
     hkdf_expand(hmac_algorithm, secret, &hkdf_label, length)
 }
@@ -302,8 +302,8 @@ pub fn derive_application_secrets(
         cipher_suite
     );
     log::debug!(
-        "  handshake_hash (with Finished): {:?}",
-        &handshake_hash[..8]
+        "  handshake_hash (with Finished, {} bytes)",
+        handshake_hash.len()
     );
 
     // Client Application Traffic Secret
