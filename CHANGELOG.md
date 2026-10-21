@@ -4,6 +4,19 @@
 
 These are local source changes, not a published release or proof of live deployment.
 
+- Grow eligible Linux splice pipes to a 256 KiB target instead of 512 KiB.
+  Local isolated tests measured about 456/494/780/942 MiB/s for 64/128/256/512 KiB
+  on repeated 16 MiB downloads. The 256 KiB target keeps about 1.67x the 64 KiB
+  speed while leaving roughly twice the per-user pipe-quota connection capacity
+  of 512 KiB. Growth remains best-effort; when the 64 MiB per-user quota is
+  exhausted, new pipes can stay at 8 KiB and connections fall back gracefully.
+  Upload, continuous-stream, latency and mixed six-connection tests showed no
+  material change. Local loopback results are not a WAN speed guarantee.
+- Replace the UDP router's per-poll scan of all sessions with a bounded
+  per-session read-waker queue. Idle remotes are not repolled until their own
+  readiness fires; ready sessions rotate through a FIFO with a bounded burst.
+  Local tests reduced server CPU per verified datagram at 256 held routes to
+  about 0.65x of the previous path, with no measurable one-route regression.
 - Replace outer TCP/Unix per-connection error logs with process-wide, kind-only
   error counts, emitted on failure at most once per 30 seconds. Keep pending
   counts and the rate gate across reloads; no reporting timer or dependency added.

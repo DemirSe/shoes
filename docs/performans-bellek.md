@@ -45,6 +45,39 @@ Ayrıntılı inceleme kayıtları Git geçmişinde (`git log --all -- report.md`
   Bu tarihsel sonuç, güncel jemalloc kullanan CLI'ın Rust tamponlarının temizlendiğini kanıtlamaz.
   Kütüphane ve CLI test hedefleri farklı global allocator kullanır.
 
+## Linux splice pipe politikası (2026-10-21)
+
+- Uygun ham TCP yönünde pipe ilk gerektiğinde oluşturulur; kapasite bir kez
+  **256 KiB** hedefine büyütülmeye çalışılır. Global sysctl değiştirilmez.
+- Hedef, yerel izole karşılaştırmayla seçildi. Tekrarlı 16 MiB indirmede
+  64/128/256/512 KiB hedefleri sırasıyla yaklaşık **456/494/780/942 MiB/s**
+  verdi. 256 KiB, 64 KiB'nin yaklaşık **1,67 katı**; 512 KiB yaklaşık 2,03 katı.
+  4 akışta 256/512 yalnızca %4–5 daha hızlıydı; yükleme, tek sürekli akış ve
+  6 paralel karışık web yükünde fark yoktu.
+- 256 KiB'ın seçilme nedeni kapasite dengesi. Çekirdek, kullanıcı başına pipe
+  sayfalarını `fs.pipe-user-pages-soft` (varsayılan 64 MiB) ile sınırlar.
+  Bu makinede ölçülen üst sınırlar: 64 KiB'de ~1001 pipe (**~500 bağlantı**),
+  128 KiB'de ~500 (~250), 256 KiB'de ~250 (**~125**), 512 KiB'de ~125
+  (**~62**). Bağlantı başına iki pipe varsayılmıştır. 10 cihaz × 6 bağlantı
+  senaryosunda 512 KiB sınıra yaklaşır; 256 KiB iki kat boşluk bırakır.
+- Başlangıç kapasitesi zaten hedefe eşit veya büyükse küçültülmez.
+  Dolayısıyla 256 KiB bir hedef, her kernel için mutlak üst sınır değildir.
+- Büyütme reddedilirse mevcut kapasite kullanılır. Başlangıç kapasitesi okunamazsa
+  büyütme denenmez; güvenli 4096 byte splice sınırı korunur. Başarılı büyütme
+  sonrasında kernel'in bildirdiği gerçek kapasite yeniden okunur.
+- Kota dolduğunda yeni pipe'lar bu makinede **8 KiB** açıldı; 64K/256K/512K'ya
+  büyütme `EPERM` aldı. Bağlantı düşmez ve veri bozulmaz, ancak yeni bağlantılar
+  64 KiB baseline'ın altında kalabilir. Bu yüzden yüksek bağlantı sayısında
+  hedef boyutu seçmeden önce gerçek eşzamanlılık ölçülmelidir.
+- Tipik iki adet 256 KiB pipe, bağlantı başına 512 KiB toplam kapasite demektir;
+  tamamının baştan fiziksel olarak ayrıldığı anlamına gelmez. Pipe çekirdek
+  belleği süreç RSS'ine dahil değildir. Cihaz sayısı TCP bağlantısı sayısı değildir.
+- Küçük soket tamponu koruması, pipe boşaltma sırası, fallback, cooperative iş
+  bütçeleri ve Vision DIRECT/flush kapıları değişmez. Pipe pooling eklenmez.
+- Yerel aktarım sonucu VPS/WAN hız veya uzun süreli kaynak tüketimi garantisi değildir.
+  Gecikme testinde dört boyut pratikte aynıydı; yavaş alıcı/bufferbloat senaryosu
+  ayrıca ölçülmedi.
+
 ## Canlı ölçümler (2026-10-13)
 
 | Ölçüm | Sonuç |

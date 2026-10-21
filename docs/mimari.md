@@ -96,7 +96,12 @@
   - XUDP: **16 384** tel oturumu; nesil-damgalı O(1) amortize tahliye.
 - **UDP yönlendirici**: `IndexMap` + FxHasher; ayrı gönderim/alım tampon havuzları
   (açlık önleme); `DelayQueue` ile O(1) oturum sonlanması; ping zamanlayıcısı
-  `MissedTickBehavior::Skip` (duraklama sonrası tick birikmez).
+  `MissedTickBehavior::Skip` (duraklama sonrası tick birikmez). Okuma tarafı,
+  tüm oturumları her poll'da taramak yerine oturum başına read-waker kuyruğu
+  kullanır; hazır oturumlar sınırlı burst ile FIFO döner.
+- **Linux splice**: uygun ham TCP yönünde pipe ilk gerektiğinde **256 KiB**
+  hedefine büyütülür; büyütme reddedilirse mevcut kapasite korunur. Kullanıcı
+  başına pipe kotası dolduğunda yeni pipe'lar küçük kalabilir; bağlantı düşmez.
 
 ## Bellek yönetimi
 

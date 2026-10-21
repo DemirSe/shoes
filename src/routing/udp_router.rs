@@ -6,6 +6,7 @@
 //! - Zero-copy queuing: read directly into pool buffer, queue if write pending
 //! - DelayQueue for O(1) session expiry (no iteration)
 //! - Work queues for pending writes/flushes/responses (no iteration over all sessions)
+//! - Per-session read wakers queue only remotes that may have data
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
@@ -13,13 +14,15 @@ use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Weak};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
+use futures::task::AtomicWaker;
 use indexmap::IndexMap;
 use log::{debug, warn};
 use lru::LruCache;
+use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tokio::io::ReadBuf;
 use tokio::time::Instant;
@@ -94,6 +97,98 @@ const PING_IDLE_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Session identifier - incrementing counter, never reused
 type SessionKey = usize;
+
+/// At most one ready entry per live session. The same lock protects membership
+/// and cancellation, so a late socket wake cannot resurrect a removed session.
+#[derive(Default)]
+struct RemoteReadQueue {
+    state: Mutex<RemoteReadQueueState>,
+    router_waker: AtomicWaker,
+}
+
+#[derive(Default)]
+struct RemoteReadQueueState {
+    ready: VecDeque<SessionKey>,
+    queued: FxHashMap<SessionKey, bool>,
+}
+
+impl RemoteReadQueue {
+    fn insert(self: &Arc<Self>, id: SessionKey) -> Waker {
+        let mut state = self.state.lock();
+        debug_assert!(!state.queued.contains_key(&id));
+        state.queued.insert(id, true);
+        // A first poll is needed even if no readiness edge has arrived yet.
+        state.ready.push_back(id);
+        drop(state);
+        Waker::from(Arc::new(RemoteReadWake {
+            id,
+            queue: Arc::downgrade(self),
+        }))
+    }
+
+    /// Requeue a live session without scheduling the router. Internal retries
+    /// either made progress or are waiting for the server writer to wake it.
+    fn enqueue(&self, id: SessionKey) -> bool {
+        let mut state = self.state.lock();
+        let Some(queued) = state.queued.get_mut(&id) else {
+            return false;
+        };
+        if *queued {
+            return false;
+        }
+        *queued = true;
+        state.ready.push_back(id);
+        true
+    }
+
+    fn pop(&self) -> Option<SessionKey> {
+        let mut state = self.state.lock();
+        let id = state.ready.pop_front()?;
+        // Clear BEFORE polling: a concurrent or in-poll wake must be allowed
+        // to enqueue the session again, including when the read returns Pending.
+        *state.queued.get_mut(&id).expect("ready session is live") = false;
+        Some(id)
+    }
+
+    fn len(&self) -> usize {
+        self.state.lock().ready.len()
+    }
+
+    fn remove(&self, id: SessionKey) {
+        let mut state = self.state.lock();
+        if state.queued.remove(&id) == Some(true) {
+            state.ready.retain(|queued| *queued != id);
+        }
+    }
+
+    fn clear(&self) {
+        let mut state = self.state.lock();
+        state.ready.clear();
+        state.queued.clear();
+        drop(state);
+        self.router_waker.take();
+    }
+}
+
+struct RemoteReadWake {
+    id: SessionKey,
+    queue: Weak<RemoteReadQueue>,
+}
+
+impl Wake for RemoteReadWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Some(queue) = self.queue.upgrade()
+            && queue.enqueue(self.id)
+        {
+            // Do not wake while holding the queue lock.
+            queue.router_waker.wake();
+        }
+    }
+}
 
 /// Lazy buffer pool for backpressure management.
 ///
@@ -186,6 +281,9 @@ struct RoutingSession {
     /// The remote connection
     remote: Box<dyn AsyncMessageStream>,
 
+    /// Read readiness wakes this session, not an all-session scan.
+    read_waker: Waker,
+
     /// Count of pending writes in remote_write_queue for this session
     in_remote_write_queue: usize,
 
@@ -218,6 +316,7 @@ impl RoutingSession {
         resolved_addr: SocketAddr,
         lookup_key: LookupKey,
         remote: Box<dyn AsyncMessageStream>,
+        read_waker: Waker,
     ) -> Self {
         Self {
             permit: None,
@@ -226,6 +325,7 @@ impl RoutingSession {
             resolved_addr,
             lookup_key,
             remote,
+            read_waker,
             in_remote_write_queue: 0,
             in_remote_flush_queue: false,
             in_server_write_queue: 0,
@@ -471,8 +571,8 @@ pub struct UdpRouter<'a> {
 
     sessions: IndexMap<SessionKey, RoutingSession, FxBuildHasher>,
     next_session_id: SessionKey,
-    /// Round-robin position for fair session polling
-    session_poll_position: usize,
+    /// FIFO of signaled sessions; a bounded burst returns to the back.
+    remote_reads: Arc<RemoteReadQueue>,
     /// Blocked destinations (LRU-bounded)
     blocked: LruCache<NetLocation, ()>,
 
@@ -532,7 +632,7 @@ impl<'a> UdpRouter<'a> {
             session_lookup,
             sessions: IndexMap::with_hasher(FxBuildHasher),
             next_session_id: 0,
-            session_poll_position: 0,
+            remote_reads: Arc::new(RemoteReadQueue::default()),
             blocked: LruCache::new(NonZeroUsize::new(MAX_BLOCKED_ENTRIES).unwrap()),
             pending_creates: Vec::new(),
             startup_bytes: Arc::new(crate::resources::Budget::new(Some(MAX_STARTUP_BYTES))),
@@ -911,7 +1011,12 @@ impl<'a> UdpRouter<'a> {
     /// Returns (made_progress, write_success, exhausted) - exhausted only if reads hit Pending, not pool exhaustion
     #[inline]
     fn poll_read_remotes(&mut self, cx: &mut Context<'_>) -> (bool, bool) {
+        self.remote_reads.router_waker.register(cx.waker());
         if !self.server_write_queue.is_empty() {
+            return (false, false);
+        }
+        let ready_count = self.remote_reads.len();
+        if ready_count == 0 {
             return (false, false);
         }
         // Acquire one buffer upfront - reused across sessions
@@ -923,28 +1028,34 @@ impl<'a> UdpRouter<'a> {
         let mut remote_read_progress = false;
         let mut server_write_progress = false;
 
-        // Read from sessions, using round-robin for fairness
-        let session_count = self.sessions.len();
-
-        for i in 0..session_count {
+        // Visit each initially ready entry at most once in this pass. Bursts
+        // and concurrent wakes append at the back, preserving fair rotation.
+        for _ in 0..ready_count {
             if !self.server_write_queue.is_empty() {
                 break;
             }
-            let idx = (self.session_poll_position + i) % session_count;
-            let Some((&id, session)) = self.sessions.get_index_mut(idx) else {
+            let Some(id) = self.remote_reads.pop() else {
+                break;
+            };
+            let Some(session) = self.sessions.get_mut(&id) else {
                 continue;
             };
 
-            if session.remote_read_eof
-                || session.in_server_write_queue >= MAX_PENDING_SERVER_WRITES_PER_SESSION
-            {
+            if session.remote_read_eof {
+                continue;
+            }
+            if session.in_server_write_queue >= MAX_PENDING_SERVER_WRITES_PER_SESSION {
+                self.remote_reads.enqueue(id);
                 continue;
             }
 
+            let read_waker = session.read_waker.clone();
+            let mut read_cx = Context::from_waker(&read_waker);
+            let mut retry_read = true;
             for _ in session.in_server_write_queue..MAX_PENDING_SERVER_WRITES_PER_SESSION {
                 let mut read_buf = ReadBuf::new(&mut buf);
 
-                match Pin::new(&mut session.remote).poll_read_message(cx, &mut read_buf) {
+                match Pin::new(&mut session.remote).poll_read_message(&mut read_cx, &mut read_buf) {
                     Poll::Ready(Ok(())) => {
                         let len = read_buf.filled().len();
                         debug!(
@@ -953,6 +1064,7 @@ impl<'a> UdpRouter<'a> {
                         );
                         if len == 0 && session.remote.read_message_eof_on_empty() {
                             session.remote_read_eof = true;
+                            retry_read = false;
                             if session.should_remove() {
                                 self.sessions_to_remove.insert(id);
                             }
@@ -996,6 +1108,7 @@ impl<'a> UdpRouter<'a> {
                                     None => {
                                         // Pool exhausted, pool_limited = true but we return
                                         // immediately
+                                        self.remote_reads.enqueue(id);
                                         return (remote_read_progress, server_write_progress);
                                     }
                                 }
@@ -1011,21 +1124,23 @@ impl<'a> UdpRouter<'a> {
                     Poll::Ready(Err(e)) => {
                         debug!("remote read error: {}", e);
                         session.remote_read_eof = true;
+                        retry_read = false;
                         if session.should_remove() {
                             self.sessions_to_remove.insert(id);
                         }
                         break;
                     }
                     Poll::Pending => {
+                        retry_read = false;
                         break;
                     }
                 }
             }
-        }
-
-        // Advance position for fairness across poll calls
-        if session_count > 0 {
-            self.session_poll_position = (self.session_poll_position + 1) % session_count;
+            if retry_read {
+                // A full burst or blocked server write is not evidence that
+                // the socket is empty. Retry without requiring another edge.
+                self.remote_reads.enqueue(id);
+            }
         }
 
         self.server_write_pool.release(buf);
@@ -1145,8 +1260,14 @@ impl<'a> UdpRouter<'a> {
                 };
                 debug_assert!(matches!(pending_key_state.unwrap(), KeyState::Pending));
 
-                let mut session =
-                    RoutingSession::new(destination, session_id, resolved_addr, lookup_key, remote);
+                let mut session = RoutingSession::new(
+                    destination,
+                    session_id,
+                    resolved_addr,
+                    lookup_key,
+                    remote,
+                    self.remote_reads.insert(id),
+                );
                 session.permit = Some(permit);
 
                 // TODO: part of constructor, we now know the id in advance
@@ -1312,6 +1433,7 @@ impl<'a> UdpRouter<'a> {
     #[inline]
     fn take_session(&mut self, id: SessionKey) -> Option<RoutingSession> {
         let mut session = self.sessions.swap_remove(&id)?;
+        self.remote_reads.remove(id);
 
         debug!("Session removed: {}", session.destination);
 
@@ -1426,6 +1548,7 @@ impl<'a> UdpRouter<'a> {
 
 impl Drop for UdpRouter<'_> {
     fn drop(&mut self) {
+        self.remote_reads.clear();
         let bytes = self.startup_bytes.snapshot();
         let slots = self.startup_slots.snapshot();
         debug!(
@@ -1962,6 +2085,7 @@ mod tests {
                 Box::new(RecordingRemote {
                     state: Arc::clone(&state),
                 }),
+                router.remote_reads.insert(0),
             ),
         );
         let SessionLookup::ByDestination(lookup) = &mut router.session_lookup else {
@@ -2072,11 +2196,16 @@ mod tests {
     impl AsyncMessageStream for RecordingRemote {}
 
     type PacketQueue = Arc<Mutex<VecDeque<(NetLocation, Vec<u8>)>>>;
+    type ResponseQueue = Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>;
 
     #[derive(Clone, Default)]
     struct PacketSource {
         packets: PacketQueue,
         closed: Arc<Mutex<VecDeque<MessageSessionId>>>,
+        responses: ResponseQueue,
+        response_ready: Arc<tokio::sync::Notify>,
+        write_blocked: Arc<AtomicBool>,
+        write_waker: Arc<Mutex<Option<Waker>>>,
     }
 
     impl AsyncReadTargetedMessage for PacketSource {
@@ -2113,22 +2242,31 @@ mod tests {
     impl AsyncWriteSourcedMessage for PacketSource {
         fn poll_write_sourced_message(
             self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-            _: &[u8],
-            _: &SocketAddr,
+            cx: &mut Context<'_>,
+            data: &[u8],
+            source: &SocketAddr,
         ) -> Poll<io::Result<()>> {
+            if self.write_blocked.load(Ordering::SeqCst) {
+                *self.write_waker.lock().unwrap() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            self.responses
+                .lock()
+                .unwrap()
+                .push((*source, data.to_vec()));
+            self.response_ready.notify_one();
             Poll::Ready(Ok(()))
         }
     }
     impl AsyncWriteSessionMessage for PacketSource {
         fn poll_write_session_message(
             self: Pin<&mut Self>,
-            _: &mut Context<'_>,
+            cx: &mut Context<'_>,
             _: MessageSessionId,
-            _: &[u8],
-            _: &SocketAddr,
+            data: &[u8],
+            source: &SocketAddr,
         ) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            self.poll_write_sourced_message(cx, data, source)
         }
     }
     impl AsyncFlushMessage for PacketSource {
@@ -2162,6 +2300,398 @@ mod tests {
             Arc::new(NativeResolver::new()),
             false,
         )
+    }
+
+    #[derive(Default)]
+    struct ReadState {
+        packets: Mutex<VecDeque<Vec<u8>>>,
+        waker: Mutex<Option<Waker>>,
+        polls: AtomicUsize,
+        wake_in_poll: AtomicBool,
+    }
+
+    impl ReadState {
+        fn push(&self, data: Vec<u8>) {
+            self.packets.lock().unwrap().push_back(data);
+            let waker = self.waker.lock().unwrap().clone();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+
+    struct ReadRemote(Arc<ReadState>);
+
+    impl AsyncReadMessage for ReadRemote {
+        fn read_message_eof_on_empty(&self) -> bool {
+            false
+        }
+
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.0.polls.fetch_add(1, Ordering::SeqCst);
+            *self.0.waker.lock().unwrap() = Some(cx.waker().clone());
+            if self.0.wake_in_poll.swap(false, Ordering::SeqCst) {
+                cx.waker().wake_by_ref();
+            }
+            match self.0.packets.lock().unwrap().pop_front() {
+                Some(packet) => {
+                    buf.put_slice(&packet);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWriteMessage for ReadRemote {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for ReadRemote {
+        fn poll_flush_message(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for ReadRemote {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for ReadRemote {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for ReadRemote {}
+
+    fn add_read_session(router: &mut UdpRouter<'_>, id: SessionKey, state: Arc<ReadState>) {
+        let destination =
+            NetLocation::from_str(&format!("127.0.0.1:{}", 10_000 + id), None).unwrap();
+        let session = RoutingSession::new(
+            destination.clone(),
+            id as MessageSessionId,
+            destination.to_socket_addr_nonblocking().unwrap(),
+            LookupKey::Destination(destination),
+            Box::new(ReadRemote(state)),
+            router.remote_reads.insert(id),
+        );
+        assert!(router.sessions.insert(id, session).is_none());
+        router.next_session_id = router.next_session_id.max(id + 1);
+    }
+
+    #[derive(Default)]
+    struct RouterWakeCount(AtomicUsize);
+
+    impl Wake for RouterWakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cancellation_racing_with_read_wakes_cannot_recreate_queue_entries() {
+        let queue = Arc::new(RemoteReadQueue::default());
+        for id in 0..64 {
+            let waker = queue.insert(id);
+            assert_eq!(queue.pop(), Some(id));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let other = barrier.clone();
+            let worker = std::thread::spawn(move || {
+                other.wait();
+                for _ in 0..16 {
+                    waker.wake_by_ref();
+                }
+            });
+            barrier.wait();
+            queue.remove(id);
+            worker.join().unwrap();
+            assert_eq!(queue.len(), 0);
+            assert!(queue.state.lock().queued.is_empty());
+        }
+    }
+
+    #[test]
+    fn retained_session_read_wakers_do_not_keep_the_router_queue_alive() {
+        let queue = Arc::new(RemoteReadQueue::default());
+        let weak = Arc::downgrade(&queue);
+        let parent = Arc::new(RouterWakeCount::default());
+        queue.router_waker.register(&Waker::from(parent.clone()));
+        let stale = queue.insert(0);
+        drop(queue);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&parent), 1);
+        stale.wake();
+        assert_eq!(parent.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_remotes_are_not_repolled_until_their_own_read_waker_fires() {
+        let source = PacketSource::default();
+        let mut server = ServerStream::Targeted(Box::new(source.clone()));
+        let mut router = test_router(&mut server);
+        let states: Vec<_> = (0..256).map(|_| Arc::new(ReadState::default())).collect();
+        for (id, state) in states.iter().enumerate() {
+            add_read_session(&mut router, id, state.clone());
+        }
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(router.poll_read_remotes(&mut cx), (false, false));
+        for _ in 0..8 {
+            assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+        }
+        assert!(
+            states
+                .iter()
+                .all(|state| state.polls.load(Ordering::SeqCst) == 1)
+        );
+
+        states[173].push(vec![42]);
+        assert_eq!(router.poll_read_remotes(&mut cx), (true, true));
+        assert_eq!(states[173].polls.load(Ordering::SeqCst), 3);
+        assert!(
+            states
+                .iter()
+                .enumerate()
+                .all(|(id, state)| id == 173 || state.polls.load(Ordering::SeqCst) == 1)
+        );
+        assert_eq!(source.responses.lock().unwrap().len(), 1);
+        assert_eq!(router.remote_reads.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_notifications_deduplicate_and_use_the_latest_router_waker() {
+        let mut server = ServerStream::Targeted(Box::new(PacketSource::default()));
+        let mut router = test_router(&mut server);
+        let state = Arc::new(ReadState::default());
+        add_read_session(&mut router, 0, state.clone());
+        let first = Arc::new(RouterWakeCount::default());
+        let second = Arc::new(RouterWakeCount::default());
+        let first_waker = Waker::from(first.clone());
+        let second_waker = Waker::from(second.clone());
+        router.poll_read_remotes(&mut Context::from_waker(&first_waker));
+        router.poll_read_remotes(&mut Context::from_waker(&second_waker));
+        let stale = state.waker.lock().unwrap().clone().unwrap();
+        for _ in 0..1000 {
+            stale.wake_by_ref();
+        }
+        assert_eq!(router.remote_reads.len(), 1);
+        assert_eq!(first.0.load(Ordering::SeqCst), 0);
+        assert_eq!(second.0.load(Ordering::SeqCst), 1);
+
+        router.cancel_session(0);
+        let replacement = Arc::new(ReadState::default());
+        add_read_session(&mut router, 1, replacement.clone());
+        for _ in 0..1000 {
+            stale.wake_by_ref();
+        }
+        assert_eq!(router.remote_reads.len(), 1);
+        router.poll_read_remotes(&mut Context::from_waker(&second_waker));
+        assert_eq!(replacement.polls.load(Ordering::SeqCst), 1);
+        assert_eq!(router.remote_reads.len(), 0);
+        router.cancel_session(1);
+        assert!(router.remote_reads.state.lock().queued.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_wake_during_pending_is_not_lost() {
+        let source = PacketSource::default();
+        let mut server = ServerStream::Targeted(Box::new(source.clone()));
+        let mut router = test_router(&mut server);
+        let state = Arc::new(ReadState::default());
+        state.wake_in_poll.store(true, Ordering::SeqCst);
+        add_read_session(&mut router, 0, state.clone());
+        let parent = Arc::new(RouterWakeCount::default());
+        let waker = Waker::from(parent.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(router.poll_read_remotes(&mut cx), (false, false));
+        assert_eq!(parent.0.load(Ordering::SeqCst), 1);
+        assert_eq!(router.remote_reads.len(), 1);
+        // No second notification: the in-poll wake must already retain a turn.
+        state.packets.lock().unwrap().push_back(vec![7]);
+        assert_eq!(router.poll_read_remotes(&mut cx), (true, true));
+        assert_eq!(source.responses.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ready_remotes_rotate_bounded_bursts_without_a_new_readiness_edge() {
+        let source = PacketSource::default();
+        let mut server = ServerStream::Targeted(Box::new(source.clone()));
+        let mut router = test_router(&mut server);
+        for id in 0..2 {
+            let state = Arc::new(ReadState::default());
+            for _ in 0..9 {
+                state.packets.lock().unwrap().push_back(vec![id as u8]);
+            }
+            add_read_session(&mut router, id, state);
+        }
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        router.poll_read_remotes(&mut cx);
+        let expected: Vec<_> = [0, 1]
+            .into_iter()
+            .flat_map(|id| std::iter::repeat_n(vec![id], MAX_PENDING_SERVER_WRITES_PER_SESSION))
+            .collect();
+        assert_eq!(
+            source
+                .responses
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, p)| p.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(router.remote_reads.len(), 2);
+        router.poll_read_remotes(&mut cx);
+        router.poll_read_remotes(&mut cx);
+        assert_eq!(source.responses.lock().unwrap().len(), 18);
+        assert_eq!(router.remote_reads.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn server_backpressure_retains_readiness_without_repolling_idle_remotes() {
+        let source = PacketSource::default();
+        let mut server = ServerStream::Targeted(Box::new(source.clone()));
+        let mut router = test_router(&mut server);
+        let first = Arc::new(ReadState::default());
+        let second = Arc::new(ReadState::default());
+        add_read_session(&mut router, 0, first.clone());
+        add_read_session(&mut router, 1, second.clone());
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        router.poll_read_remotes(&mut cx);
+        source.write_blocked.store(true, Ordering::SeqCst);
+        for i in 0..7 {
+            first.push(vec![i]);
+        }
+        second.push(vec![99]);
+        router.poll_read_remotes(&mut cx);
+        let before = (
+            first.polls.load(Ordering::SeqCst),
+            second.polls.load(Ordering::SeqCst),
+        );
+        for _ in 0..8 {
+            assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+        }
+        assert_eq!(
+            (
+                first.polls.load(Ordering::SeqCst),
+                second.polls.load(Ordering::SeqCst)
+            ),
+            before
+        );
+        source.write_blocked.store(false, Ordering::SeqCst);
+        source.write_waker.lock().unwrap().take().unwrap().wake();
+        assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+        let replies = source.responses.lock().unwrap();
+        assert_eq!(replies.len(), 8);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|(_, p)| p != &[99])
+                .map(|(_, p)| p.clone())
+                .collect::<Vec<_>>(),
+            (0..7).map(|i| vec![i]).collect::<Vec<_>>()
+        );
+        assert_eq!(router.remote_reads.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_readiness_survives_both_receive_pool_exhaustion_paths() {
+        for held_count in [SERVER_WRITE_POOL_SIZE, SERVER_WRITE_POOL_SIZE - 1] {
+            let source = PacketSource::default();
+            source.write_blocked.store(true, Ordering::SeqCst);
+            let mut server = ServerStream::Targeted(Box::new(source.clone()));
+            let mut router = test_router(&mut server);
+            let state = Arc::new(ReadState::default());
+            state.packets.lock().unwrap().extend([vec![1], vec![2]]);
+            add_read_session(&mut router, 0, state);
+            let held: Vec<_> = (0..held_count)
+                .map(|_| router.server_write_pool.acquire().unwrap())
+                .collect();
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            router.poll_read_remotes(&mut cx);
+            assert_eq!(router.remote_reads.len(), 1);
+            for buf in held {
+                router.server_write_pool.release(buf);
+            }
+            source.write_blocked.store(false, Ordering::SeqCst);
+            assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+            assert_eq!(source.responses.lock().unwrap().len(), 2);
+            assert_eq!(router.remote_reads.len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_udp_reply_wakes_an_otherwise_idle_router_ipv4_ipv6() {
+        use crate::config::RuleConfig;
+        use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+        for ip in [
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            let peer = tokio::net::UdpSocket::bind(SocketAddr::new(ip, 0))
+                .await
+                .unwrap();
+            let destination = peer.local_addr().unwrap();
+            let source = PacketSource::default();
+            source.packets.lock().unwrap().push_back((
+                NetLocation::from_ip_addr(ip, destination.port()),
+                b"request".to_vec(),
+            ));
+            let observed = source.clone();
+            let task = tokio::spawn(async move {
+                let mut server = ServerStream::Targeted(Box::new(source));
+                let selector =
+                    Arc::new(create_tcp_client_proxy_selector(
+                        vec![RuleConfig::default()],
+                    ));
+                let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+                UdpRouter::new(&mut server, selector, resolver, false).await
+            });
+            let mut packet = [0u8; 32];
+            let (_, origin) =
+                tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut packet))
+                    .await
+                    .expect("initial datagram reaches the loopback target")
+                    .unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            peer.send_to(b"reply", origin).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), observed.response_ready.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                *observed.responses.lock().unwrap(),
+                vec![(destination, b"reply".to_vec())]
+            );
+            task.abort();
+            let _ = task.await;
+        }
     }
 
     fn seed_pending(router: &mut UdpRouter<'_>, key: LookupKey, data: &[u8]) {
@@ -2350,6 +2880,8 @@ mod tests {
             assert_eq!(router.startup_written, 0);
             assert!(router.pending_creates.is_empty());
             assert!(router.remote_write_queue.is_empty());
+            assert_eq!(router.remote_reads.len(), 0);
+            assert!(router.remote_reads.state.lock().queued.is_empty());
             let SessionLookup::BySessionId(lookup) = &router.session_lookup else {
                 unreachable!()
             };
@@ -2424,9 +2956,13 @@ mod tests {
             b"retained",
         );
         finish_setup(&mut router, Arc::new(RemoteState::default()));
+        let stale_read_waker = router.sessions[&0].read_waker.clone();
         tokio::time::advance(Duration::from_secs(SESSION_TIMEOUT_SECS)).await;
         router.process_expired(&mut Context::from_waker(futures::task::noop_waker_ref()));
+        stale_read_waker.wake();
         assert!(router.remote_write_queue.is_empty());
+        assert_eq!(router.remote_reads.len(), 0);
+        assert!(router.remote_reads.state.lock().queued.is_empty());
         assert_eq!(router.startup_slots.snapshot().active, 0);
         assert_eq!(router.startup_bytes.snapshot().active, 0);
     }
@@ -2495,6 +3031,7 @@ mod tests {
                 Box::new(RecordingRemote {
                     state: state.clone(),
                 }),
+                router.remote_reads.insert(0),
             ),
         );
         let SessionLookup::BySessionId(lookup) = &mut router.session_lookup else {
@@ -2610,6 +3147,7 @@ mod tests {
             Box::new(RecordingRemote {
                 state: Arc::clone(&state),
             }),
+            router.remote_reads.insert(0),
         );
         session.expiry_key = Some(
             router
@@ -2640,6 +3178,8 @@ mod tests {
         assert_eq!(router.poll_read_server(&mut cx), (true, true));
         assert!(!router.server_read_eof);
         assert!(router.sessions.is_empty());
+        assert_eq!(router.remote_reads.len(), 0);
+        assert!(router.remote_reads.state.lock().queued.is_empty());
         assert!(router.pending_shutdowns.is_empty());
         assert_eq!(
             *state.writes.lock().unwrap(),

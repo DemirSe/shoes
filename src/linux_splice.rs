@@ -62,6 +62,18 @@ const MAX_INTERRUPTED_RETRIES: usize = 8;
 /// into an empty pipe cannot block on pipe space.
 const FALLBACK_PIPE_CAPACITY: usize = 4096;
 
+/// A bounded per-direction capacity target for eligible TCP relays. The kernel
+/// may deny growth; the original pipe remains usable in that case. Capacity is
+/// not resident memory, but the extra kernel memory under backpressure still
+/// needs to be accounted for separately from userspace RSS.
+///
+/// Measured on the local relay fixture: 64, 128, 256 and 512 KiB targets
+/// reached roughly 456, 494, 780 and 942 MiB/s on the repeated-request
+/// download workload. 256 KiB is kept as the balance: it is about 1.67x the
+/// 64 KiB baseline, while the 512 KiB target roughly halves the number of
+/// connections that can keep a grown pipe under the per-user pipe quota.
+const TARGET_PIPE_CAPACITY: usize = 256 * 1024;
+
 /// A nonblocking, close-on-exec pipe that buffers one relay direction.
 ///
 /// The descriptor pair is owned here and closed on drop, which covers normal
@@ -96,7 +108,7 @@ impl SplicePipe {
         // SAFETY: as above, for the write end of the same new pipe.
         let write = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
 
-        let capacity = pipe_capacity(&read);
+        let capacity = grow_pipe_capacity(&read, TARGET_PIPE_CAPACITY);
         #[cfg(test)]
         test_hooks::record_pipe_allocation();
 
@@ -348,13 +360,47 @@ fn splice_descriptors(source: RawFd, destination: RawFd, len: usize) -> io::Resu
 }
 
 /// Reads the pipe capacity, which bounds one socket-to-pipe splice.
-fn pipe_capacity(read: &OwnedFd) -> usize {
+fn pipe_capacity(read: &OwnedFd) -> Option<usize> {
     // SAFETY: `F_GETPIPE_SZ` only reads one integer from an open descriptor.
     let capacity = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETPIPE_SZ) };
     if capacity > 0 {
-        capacity as usize
+        Some(capacity as usize)
     } else {
-        FALLBACK_PIPE_CAPACITY
+        None
+    }
+}
+
+/// Grow a newly allocated empty pipe at most once, without shrinking a larger
+/// default or making a resize denial fatal. Query the actual size again after
+/// success: the requested size need not be the size accepted by the kernel.
+fn grow_pipe_capacity(read: &OwnedFd, requested: usize) -> usize {
+    let current = pipe_capacity(read);
+    capacity_after_growth(current, requested, || {
+        let requested = libc::c_int::try_from(requested).ok()?;
+        // SAFETY: `F_SETPIPE_SZ` operates on an owned, open pipe descriptor and
+        // takes a positive integer size. No payload is present in this new pipe.
+        let resized = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETPIPE_SZ, requested) };
+        if resized < 0 {
+            None
+        } else {
+            Some(pipe_capacity(read).unwrap_or(FALLBACK_PIPE_CAPACITY))
+        }
+    })
+}
+
+fn capacity_after_growth(
+    current: Option<usize>,
+    requested: usize,
+    resize: impl FnOnce() -> Option<usize>,
+) -> usize {
+    // A failed query must not turn an unknown large pipe into a smaller one.
+    let Some(current) = current else {
+        return FALLBACK_PIPE_CAPACITY;
+    };
+    if current >= requested {
+        current
+    } else {
+        resize().unwrap_or(current)
     }
 }
 
@@ -544,6 +590,63 @@ mod tests {
     use std::io::Write;
     use std::net::{TcpListener, TcpStream as StdTcpStream};
 
+    #[test]
+    fn a_larger_pipe_is_not_shrunk_or_resized_again() {
+        let original = TARGET_PIPE_CAPACITY * 2;
+        assert_eq!(
+            capacity_after_growth(Some(original), TARGET_PIPE_CAPACITY, || panic!(
+                "must not resize"
+            )),
+            original
+        );
+        assert_eq!(
+            capacity_after_growth(Some(TARGET_PIPE_CAPACITY), TARGET_PIPE_CAPACITY, || {
+                panic!("must not resize")
+            }),
+            TARGET_PIPE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn denied_pipe_growth_keeps_the_previous_capacity_after_one_attempt() {
+        let attempts = std::cell::Cell::new(0);
+        let original = 16 * 1024;
+        let capacity = capacity_after_growth(Some(original), TARGET_PIPE_CAPACITY, || {
+            attempts.set(attempts.get() + 1);
+            None
+        });
+        assert_eq!(capacity, original);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn successful_pipe_growth_uses_the_queried_not_requested_capacity() {
+        let original = 16 * 1024;
+        let queried = 64 * 1024;
+        assert_eq!(
+            capacity_after_growth(Some(original), TARGET_PIPE_CAPACITY, || Some(queried)),
+            queried
+        );
+    }
+
+    #[test]
+    fn an_unavailable_post_growth_query_keeps_a_conservative_limit() {
+        assert_eq!(
+            capacity_after_growth(Some(16 * 1024), TARGET_PIPE_CAPACITY, || {
+                Some(FALLBACK_PIPE_CAPACITY)
+            }),
+            FALLBACK_PIPE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn an_unavailable_initial_capacity_query_does_not_resize() {
+        assert_eq!(
+            capacity_after_growth(None, TARGET_PIPE_CAPACITY, || panic!("must not resize")),
+            FALLBACK_PIPE_CAPACITY
+        );
+    }
+
     fn tcp_pair() -> io::Result<(StdTcpStream, StdTcpStream)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
@@ -608,6 +711,30 @@ mod tests {
         Ok(())
     }
 
+    #[ignore = "process-wide counters; runs in an isolated process"]
+    #[test]
+    fn an_unrepresentable_growth_request_keeps_a_usable_pipe() -> io::Result<()> {
+        test_hooks::reset();
+        let pipe = SplicePipe::new()?;
+        let original = pipe_capacity(&pipe.read).expect("kernel pipe capacity");
+        assert_eq!(grow_pipe_capacity(&pipe.read, usize::MAX), original);
+        let expected = [0x5au8; FALLBACK_PIPE_CAPACITY];
+        // SAFETY: the pipe's owned write end is open and `expected` is readable
+        // for its complete length, which fits even the smallest supported pipe.
+        let written = unsafe {
+            libc::write(
+                pipe.write.as_raw_fd(),
+                expected.as_ptr().cast(),
+                expected.len(),
+            )
+        };
+        assert_eq!(written, expected.len() as isize);
+        let mut received = [0u8; FALLBACK_PIPE_CAPACITY];
+        assert_eq!(pipe.read_into(&mut received)?, expected.len());
+        assert_eq!(received, expected);
+        Ok(())
+    }
+
     /// Tests that read the process-global fault injection, the syscall counters,
     /// or `/proc/self/fd`. The default parallel unit run skips them, and the
     /// driver below runs each one in its own single-threaded process, because
@@ -616,6 +743,7 @@ mod tests {
     /// The CI workflow runs `cargo test --workspace --lib --bins` without
     /// `--test-threads=1`, so this list must stay complete.
     const PROCESS_WIDE_TESTS: &[&str] = &[
+        "linux_splice::tests::an_unrepresentable_growth_request_keeps_a_usable_pipe",
         "copy_bidirectional::splice_tests::a_blocked_destination_resumes_after_it_drains",
         "copy_bidirectional::splice_tests::a_failed_socket_buffer_query_keeps_buffered_copying",
         "copy_bidirectional::splice_tests::a_peer_reset_stays_a_real_io_error",
